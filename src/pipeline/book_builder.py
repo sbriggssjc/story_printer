@@ -24,7 +24,12 @@ def _wrap_text(text: str, max_width: float, font: str, font_size: int) -> list[s
     return lines
 
 
-def build_book_pdf(out_path: Path, title: str, pages: list[str]) -> Path:
+def build_book_pdf(
+    out_path: Path,
+    title: str,
+    pages: list[str],
+    subtitle: str | None = None,
+) -> Path:
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -37,7 +42,9 @@ def build_book_pdf(out_path: Path, title: str, pages: list[str]) -> Path:
     c.setFont("Helvetica-Bold", 28)
     c.drawString(1.0 * inch, H - 1.5 * inch, cover_title)
     c.setFont("Helvetica", 14)
-    c.drawString(1.0 * inch, H - 2.0 * inch, "A story told out loud")
+    cover_subtitle = (subtitle or "A story told out loud").strip()
+    if cover_subtitle:
+        c.drawString(1.0 * inch, H - 2.0 * inch, cover_subtitle)
     c.showPage()
 
     for idx, page_text in enumerate(pages, start=1):
