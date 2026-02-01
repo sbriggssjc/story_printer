@@ -31,6 +31,14 @@ def make_book_pdf(title: str, subtitle: str, pages: list[str]) -> Path:
     OUT_BOOKS.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = OUT_BOOKS / f"story_{ts}.pdf"
+    return build_book_pdf(
+        out_path=out_path,
+        title=title,
+        subtitle=subtitle,
+        pages=pages,
+    )
+
+
 def build_book_pdf(
     out_path: Path,
     title: str,
@@ -46,12 +54,10 @@ def build_book_pdf(
     line_height = 18
 
     cover_title = title.strip() or "My Story"
-    cover_subtitle = subtitle.strip() or "A story told out loud"
+    cover_subtitle = (subtitle or "A story told out loud").strip()
     c.setFont("Helvetica-Bold", 28)
     c.drawString(1.0 * inch, H - 1.5 * inch, cover_title)
     c.setFont("Helvetica", 14)
-    c.drawString(1.0 * inch, H - 2.0 * inch, cover_subtitle)
-    cover_subtitle = (subtitle or "A story told out loud").strip()
     if cover_subtitle:
         c.drawString(1.0 * inch, H - 2.0 * inch, cover_subtitle)
     c.showPage()
