@@ -22,6 +22,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib import request
+from urllib.error import HTTPError
 
 from src.pipeline.story_builder import StoryBook, StoryPage, _clean_transcript, _find_name, _infer_title
 
@@ -279,11 +280,13 @@ def _request_openai_story_http(
 
     schema = _story_json_schema(target_pages)
     input_messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
+        {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
+        {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
     ]
     if correction:
-        input_messages.append({"role": "user", "content": correction})
+        input_messages.append(
+            {"role": "user", "content": [{"type": "input_text", "text": correction}]}
+        )
 
     responses_payload = {
         "model": _DEFAULT_MODEL,
@@ -305,9 +308,16 @@ def _request_openai_story_http(
     except Exception as exc:
         print(f"OpenAI HTTP responses call failed: {exc}")
 
+    chat_messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    if correction:
+        chat_messages.append({"role": "user", "content": correction})
+
     chat_payload = {
         "model": _DEFAULT_MODEL,
-        "messages": input_messages,
+        "messages": chat_messages,
         "temperature": _DEFAULT_TEMPERATURE,
         "response_format": {"type": "json_object"},
     }
@@ -336,6 +346,15 @@ def _post_openai_request(url: str, payload: dict[str, Any]) -> dict[str, Any]:
     try:
         with request.urlopen(req, timeout=60) as response:
             body = response.read().decode("utf-8")
+    except HTTPError as exc:
+        err_body = ""
+        try:
+            err_body = exc.read().decode("utf-8")
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"OpenAI HTTP request failed: {exc.code} {exc.reason} :: {err_body[:1200]}"
+        ) from exc
     except Exception as exc:
         raise RuntimeError(f"OpenAI HTTP request failed: {exc}") from exc
     try:
