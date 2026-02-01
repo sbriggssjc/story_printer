@@ -103,6 +103,7 @@ def _build_openai_prompts(cleaned: str, narrator: str | None, target_pages: int)
         "- Page 1: setup + mischief + rising trouble + page-turn hook.\n"
         "- Page 2: big moment + apology + funny resolution + warm ending.\n"
         "- Include 1–3 short dialogue lines TOTAL, using quotation marks ONLY for those lines.\n"
+        "- Use quotation marks only for spoken dialogue. Do not quote signs, thoughts, or emphasis.\n"
         "- Do NOT use quotation marks for emphasis, sound effects, or any other purpose.\n"
         "- Use quotation marks for dialogue only, and include exactly 2 quoted lines total. Do not quote anything else.\n"
         "- Kid-safe, whimsical, humorous, creative expansion.\n"
