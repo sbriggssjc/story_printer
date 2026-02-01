@@ -727,7 +727,7 @@ def _page_expansions(topic: str, name: str, *, stage: str) -> list[str]:
     if stage == "resolution":
         additions.extend(
             [
-                "A chorus of \"It's okay!\" floated through the room, light and sincere.",
+                "A chorus of Its okay! floated through the room, light and sincere.",
                 "They made a new rule: big feelings get big hugs and honest words.",
                 "Someone proposed a celebratory dance, and the floor became a stage.",
                 "A goofy plan turned the problem into a game, and everyone played along.",
