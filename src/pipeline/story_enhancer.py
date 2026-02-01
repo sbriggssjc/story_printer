@@ -763,6 +763,7 @@ def _expand_text_to_range(
     if rng:
         rng.shuffle(candidates)
     for sentence in candidates:
+        sentence = sentence.replace('"', "").replace("“", "").replace("”", "")
         if used and sentence in used:
             continue
         next_text = f"{current} {sentence}"
