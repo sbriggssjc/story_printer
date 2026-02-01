@@ -24,7 +24,7 @@ class Recorder:
         self._q.put(chunk)
         rms = float(np.sqrt(np.mean(np.square(chunk)))) if len(chunk) else 0.0
         self._printed += 1
-        if self._printed % 10 == 0:
+        if self._printed % 40 == 0:
             print(f'   level(rms)={rms:.6f}', end='\\r')
 
     def start(self):
@@ -94,4 +94,3 @@ class Recorder:
 
 def get_default_input_info():
     return sd.query_devices(kind='input')
-

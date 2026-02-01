@@ -11,8 +11,8 @@ from src.pipeline.storyboarder import make_stub_storyboard
 @dataclass
 class StoryBook:
     title: str
-    subtitle: str
-    pages: list[str]
+    subtitle: str | None
+    pages: list[object]
 
 
 def guess_title_from_transcript(t: str) -> str:
@@ -30,53 +30,30 @@ def _clean_transcript(t: str) -> str:
     return t
 
 
-def _fallback_story(transcript: str) -> StoryBook:
-    """
-    No-API fallback: expands transcript into a simple multi-page kids story.
-    Deterministic and safe to run offline.
-    """
-    t = _clean_transcript(transcript)
+def _split_transcript(transcript: str, max_chars: int = 1100) -> list[str]:
+    text = _clean_transcript(transcript)
+    if not text:
+        return ["(No story text captured.)"]
 
-    # Naive title inference
-    title = "My Story"
-    if "pizza" in t.lower():
-        title = "The Pizza Crust Mystery"
-    elif "monster" in t.lower():
-        title = "The Friendly Monster Surprise"
-
-    subtitle = "A story told out loud"
-
-    # Expand into a simple narrative (lightly)
-    base = (
-        f"Once upon a time, there was a kid named Claire.\n\n"
-        f"One day, something small felt like a big deal: {t}\n\n"
-        f"At first, Claire felt nervous. What if Dad found out?\n\n"
-        f"But then Claire remembered something important: telling the truth is braver than hiding.\n\n"
-        f"So Claire took a deep breath and decided to fix it.\n\n"
-        f"In the end, the problem got smaller, the lesson got bigger, and everyone felt better.\n\n"
-        f"The end."
-    )
-
-    # Paginate: ~500 chars/page is a decent “picture book” feel
+    sentences = re.split(r"(?<=[.!?])\s+", text)
     chunks: List[str] = []
     buf: List[str] = []
     cur = 0
-    for para in base.split("\n\n"):
-        para = para.strip()
-        if not para:
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
             continue
-        add_len = len(para) + (2 if buf else 0)
-        if cur + add_len > 520 and buf:
-            chunks.append("\n\n".join(buf))
-            buf = [para]
-            cur = len(para)
+        add_len = len(sentence) + (1 if buf else 0)
+        if cur + add_len > max_chars and buf:
+            chunks.append(" ".join(buf))
+            buf = [sentence]
+            cur = len(sentence)
         else:
-            buf.append(para)
+            buf.append(sentence)
             cur += add_len
     if buf:
-        chunks.append("\n\n".join(buf))
-
-    return StoryBook(title=title, subtitle=subtitle, pages=chunks)
+        chunks.append(" ".join(buf))
+    return chunks or ["(No story text captured.)"]
 
 
 def _openai_story(transcript: str) -> Optional[StoryBook]:
@@ -178,4 +155,8 @@ def build_storybook(transcript: str, pages: list[str] | None = None) -> StoryBoo
     book = _openai_story(transcript)
     if book:
         return book
-    return _fallback_story(transcript)
+    return StoryBook(
+        title=guess_title_from_transcript(transcript),
+        subtitle="A story told out loud",
+        pages=_split_transcript(transcript),
+    )
