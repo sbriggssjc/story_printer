@@ -5,10 +5,17 @@ from dataclasses import dataclass
 
 
 @dataclass
+class StoryPage:
+    text: str
+    illustration_prompt: str
+    illustration_path: str | None = None
+
+
+@dataclass
 class StoryBook:
     title: str
     subtitle: str
-    pages: list[str]
+    pages: list[StoryPage]
     narrator: str | None = None
 
 
@@ -157,7 +164,18 @@ def _chunk_transcript(transcript: str, min_chars: int = 450, max_chars: int = 90
     return chunks
 
 
-def build_storybook(transcript: str, pages: list[str] | None = None) -> StoryBook:
+def _coerce_pages(pages: list[str] | list[StoryPage]) -> list[StoryPage]:
+    if not pages:
+        return []
+    if isinstance(pages[0], StoryPage):
+        return list(pages)
+    return [StoryPage(text=page, illustration_prompt="") for page in pages]
+
+
+def build_storybook(
+    transcript: str,
+    pages: list[str] | list[StoryPage] | None = None,
+) -> StoryBook:
     cleaned = _clean_transcript(transcript)
     narrator = _find_name(cleaned) if cleaned else None
 
@@ -165,14 +183,16 @@ def build_storybook(transcript: str, pages: list[str] | None = None) -> StoryBoo
         return StoryBook(
             title=_infer_title(cleaned) if cleaned else "My Story",
             subtitle="A story told out loud",
-            pages=pages,
+            pages=_coerce_pages(pages),
             narrator=narrator,
         )
 
     if not cleaned:
         raise ValueError("Empty transcript")
 
-    derived_pages = _chunk_transcript(cleaned)
+    derived_pages = [
+        StoryPage(text=page, illustration_prompt="") for page in _chunk_transcript(cleaned)
+    ]
     return StoryBook(
         title=_infer_title(cleaned),
         subtitle="A story told out loud",
