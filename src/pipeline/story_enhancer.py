@@ -128,8 +128,9 @@ def _extract_fidelity_keywords(cleaned: str) -> list[str]:
     return must[:4]
 
 
-def _fails_fidelity(pages_text: str, must_keywords: list[str]) -> list[str]:
+def _fails_fidelity(pages_text: str, must_keywords: list[str]) -> tuple[list[str], list[str]]:
     reasons = []
+    banned_phrases = []
     low = pages_text.lower()
     for k in must_keywords:
         if k not in low:
@@ -137,7 +138,8 @@ def _fails_fidelity(pages_text: str, must_keywords: list[str]) -> list[str]:
     for phrase in _BANNED_PHRASES:
         if phrase.lower() in low:
             reasons.append(f"contains banned filler phrase: {phrase}")
-    return reasons
+            banned_phrases.append(phrase)
+    return reasons, banned_phrases
 
 def enhance_to_storybook(transcript: str, *, target_pages: int = 2) -> StoryBook:
     cleaned = _clean_transcript(transcript)
@@ -348,14 +350,22 @@ def _openai_storybook(
             ]
         )
         must = _extract_fidelity_keywords(cleaned)
-        fidelity_reasons = _fails_fidelity(all_text, must)
+        fidelity_reasons, banned_phrases = _fails_fidelity(all_text, must)
         if fidelity_reasons:
             print(f"Fidelity failed: {', '.join(fidelity_reasons)}")
             if attempt == 0:
+                retry_instruction = ""
+                if banned_phrases:
+                    retry_instruction = (
+                        "\nDo not use any of these phrases: "
+                        + "; ".join(banned_phrases)
+                        + ". Replace them with fresh, specific detail from the transcript."
+                    )
                 user_prompt = (
-                    f"{user_prompt}\n\nFidelity issues:\n- "
+                    f"{user_prompt}\n\nIssues:\n- "
                     + "\n- ".join(fidelity_reasons)
                     + "\n\nRewrite while keeping the transcript’s core events EXACT."
+                    + retry_instruction
                 )
                 continue
             return None
