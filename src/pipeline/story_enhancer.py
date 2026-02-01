@@ -188,30 +188,20 @@ def _openai_storybook(
 
         data = _parse_json(content)
         pages = _build_pages_from_data(data, target_pages)
-        if pages:
-            topic = _infer_topic(cleaned)
-            name = narrator or "A young storyteller"
-            # Enforce 1–3 dialogue lines TOTAL across the whole story (not per-page).
-            remaining_dialogue = 3
-            total_dialogue = 0
-            for page in pages:
-                page.text = _limit_dialogue_lines(page.text, max_lines=remaining_dialogue)
-                used_here = _count_dialogue_lines(page.text)
-                total_dialogue += used_here
-                remaining_dialogue = max(0, remaining_dialogue - used_here)
+        if not pages:
+            print("OpenAI enhancement failed: unable to parse pages.")
+            return None
 
-            # If the model returned zero dialogue, add one short line at the end.
-            if total_dialogue < 1 and pages:
-                pages[-1].text = _ensure_dialogue_present(pages[-1].text)
+        # Post-process pages BEFORE validation so we validate the final text that will be printed
+        for page in pages:
+            page.text = _pad_text_to_min_words(page.text, min_words=_MIN_WORDS_PER_PAGE)
+            page.text = _limit_dialogue_lines(page.text, max_lines=3)
 
-            # Pad AFTER dialogue normalization so we don't reintroduce extra quotes.
-            for page in pages:
-                page.text = _pad_to_min_words(page.text, _MIN_WORDS_PER_PAGE, topic, name)
-            data["pages"] = [
-                {"text": page.text, "illustration_prompt": page.illustration_prompt} for page in pages
-            ]
+        total_dialogue = sum(_count_dialogue_lines(page.text) for page in pages)
+        if total_dialogue < 1:
+            pages[-1].text = _ensure_dialogue_present(pages[-1].text)
 
-        valid, reasons = _validate_story_data(data, target_pages)
+        valid, reasons = _validate_story_pages(pages, target_pages)
         if not valid:
             print(f"Validation failed: {', '.join(reasons)}")
             if attempt == 0:
@@ -221,10 +211,6 @@ def _openai_storybook(
                 )
                 continue
             print(f"OpenAI enhancement failed: invalid output ({'; '.join(reasons)}).")
-            return None
-
-        if not pages:
-            print("OpenAI enhancement failed: unable to parse pages.")
             return None
 
         return StoryBook(
@@ -579,6 +565,39 @@ def _validate_story_data(data: Any, target_pages: int) -> tuple[bool, list[str]]
     return (len(reasons) == 0, reasons)
 
 
+def _validate_story_pages(pages: list[StoryPage], target_pages: int) -> tuple[bool, list[str]]:
+    if not isinstance(pages, list) or len(pages) != target_pages:
+        return False, [
+            f"expected {target_pages} pages but got {len(pages) if isinstance(pages, list) else 'non-list'}"
+        ]
+
+    reasons: list[str] = []
+    total_dialogue = 0
+
+    for index, page in enumerate(pages, start=1):
+        text = (page.text or "").strip()
+        prompt = (page.illustration_prompt or "").strip()
+
+        if not text:
+            reasons.append(f"page {index} missing text")
+            continue
+        if not prompt:
+            reasons.append(f"page {index} missing illustration_prompt")
+
+        wc = _word_count(text)
+        if wc < _MIN_WORDS_PER_PAGE or wc > _MAX_WORDS_PER_PAGE:
+            reasons.append(
+                f"page {index} word count {wc} outside {_MIN_WORDS_PER_PAGE}-{_MAX_WORDS_PER_PAGE}"
+            )
+
+        total_dialogue += _count_dialogue_lines(text)
+
+    if total_dialogue < 1 or total_dialogue > 3:
+        reasons.append(f"dialogue lines counted {total_dialogue} outside 1-3")
+
+    return (len(reasons) == 0, reasons)
+
+
 def _build_pages_from_data(data: dict[str, Any], target_pages: int) -> list[StoryPage]:
     pages: list[StoryPage] = []
     raw_pages = data.get("pages")
@@ -860,6 +879,18 @@ def _pad_to_min_words(text: str, target_min: int, topic: str, name: str) -> str:
 
     additions = _page_expansions(topic, name, stage="resolution")
     return _expand_text_to_range(text, target_min, _MAX_WORDS_PER_PAGE, additions)
+
+
+def _pad_text_to_min_words(text: str, min_words: int) -> str:
+    """
+    If text is under min_words, append neutral expansions until it meets min.
+    """
+    if _word_count(text) >= min_words:
+        return text
+    topic = _infer_topic(text)
+    name = "A young storyteller"
+    additions = _page_expansions(topic, name, stage="resolution")
+    return _expand_text_to_range(text, min_words, _MAX_WORDS_PER_PAGE, additions)
 
 
 def _maybe_generate_images(story: StoryBook) -> None:
