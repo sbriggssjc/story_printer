@@ -10,9 +10,16 @@ def make_book_pdf(
     title: str,
     subtitle: str,
     pages: list[str],
+    narrator: str | None = None,
     out_dir: Path = Path("out/books"),
 ) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = out_dir / f"story_{timestamp}.pdf"
-    return render_story_pdf(title=title, subtitle=subtitle, pages=pages, out_pdf=out_path)
+    return render_story_pdf(
+        title=title,
+        subtitle=subtitle,
+        pages=pages,
+        narrator=narrator,
+        out_pdf=out_path,
+    )
