@@ -3,7 +3,10 @@ Environment variables:
 - STORY_ENHANCE_MODE: set to "openai" to use OpenAI for story enhancement.
 - STORY_IMAGE_MODE: set to "openai" to generate images with OpenAI.
 - OPENAI_API_KEY: required for OpenAI modes.
-- STORY_TARGET_WORDS_TOTAL: total word count target (default: 750).
+- STORY_MODEL: OpenAI model for story enhancement (default: "gpt-4o-mini").
+- STORY_TEMPERATURE: OpenAI sampling temperature (default: "0.8").
+- STORY_TARGET_PAGES: number of pages to generate (default: "2").
+- STORY_WORDS_PER_PAGE: word count target per page (default: "260").
 - STORY_STYLE: story tone/style (default: "whimsical, funny, heartwarming").
 """
 
@@ -21,8 +24,13 @@ from urllib import request
 
 from src.pipeline.story_builder import StoryBook, StoryPage, _clean_transcript, _find_name, _infer_title
 
-_DEFAULT_TARGET_WORDS = int(os.getenv("STORY_TARGET_WORDS_TOTAL", "750"))
+_DEFAULT_MODEL = os.getenv("STORY_MODEL", "gpt-4o-mini")
+_DEFAULT_TEMPERATURE = float(os.getenv("STORY_TEMPERATURE", "0.8"))
+_DEFAULT_TARGET_PAGES = int(os.getenv("STORY_TARGET_PAGES", "2"))
+_DEFAULT_WORDS_PER_PAGE = int(os.getenv("STORY_WORDS_PER_PAGE", "260"))
 _DEFAULT_STYLE = os.getenv("STORY_STYLE", "whimsical, funny, heartwarming")
+_MIN_WORDS_PER_PAGE = max(200, _DEFAULT_WORDS_PER_PAGE - 60)
+_MAX_WORDS_PER_PAGE = min(320, _DEFAULT_WORDS_PER_PAGE + 60)
 
 
 def enhance_to_storybook(transcript: str, *, target_pages: int = 2) -> StoryBook:
@@ -30,8 +38,10 @@ def enhance_to_storybook(transcript: str, *, target_pages: int = 2) -> StoryBook
     narrator = _find_name(cleaned) if cleaned else None
     title = _infer_title(cleaned) if cleaned else "My Story"
     subtitle = "A story told out loud"
+    target_pages = target_pages or _DEFAULT_TARGET_PAGES
 
-    if _use_openai_story_mode():
+    if _is_openai_story_requested():
+        print("STORY_ENHANCE_MODE=openai detected")
         openai_story = _openai_storybook(cleaned, title, narrator, target_pages)
         if openai_story:
             _maybe_generate_images(openai_story)
@@ -44,6 +54,10 @@ def enhance_to_storybook(transcript: str, *, target_pages: int = 2) -> StoryBook
 
 def _use_openai_story_mode() -> bool:
     return os.getenv("STORY_ENHANCE_MODE", "").lower() == "openai" and bool(os.getenv("OPENAI_API_KEY"))
+
+
+def _is_openai_story_requested() -> bool:
+    return os.getenv("STORY_ENHANCE_MODE", "").lower() == "openai"
 
 
 def _use_openai_image_mode() -> bool:
@@ -67,20 +81,38 @@ def _openai_storybook(
     narrator: str | None,
     target_pages: int,
 ) -> StoryBook | None:
+    if not os.getenv("OPENAI_API_KEY"):
+        print("OpenAI enhancement skipped: OPENAI_API_KEY not set.")
+        return None
     client = _get_openai_client()
     if not client:
+        print("OpenAI enhancement skipped: openai package not available.")
         return None
 
-    words_total = _DEFAULT_TARGET_WORDS
+    print("OpenAI package available: yes")
+    use_responses = hasattr(client, "responses")
+    endpoint = "responses" if use_responses else "chat.completions"
+    print(f"OpenAI endpoint: {endpoint}")
+    print(f"OpenAI model: {_DEFAULT_MODEL}")
+
     system_prompt = (
-        "You are a children's story editor. "
-        "Return ONLY strict JSON with a title, subtitle, narrator (optional), "
-        "and exactly two pages. Each page must include text and illustration_prompt. "
-        "Keep the story kid-safe, creative, and coherent."
+        "You are a children's picture-book author and editor. "
+        "Expand the transcript into a vivid, whimsical two-page story. "
+        "Return ONLY strict JSON that follows the schema exactly."
     )
     user_prompt = (
         "TRANSCRIPT:\n"
         f"{cleaned or 'Empty transcript.'}\n\n"
+        f"NARRATOR: {narrator or 'none'}\n\n"
+        "Story requirements:\n"
+        "- Two pages only.\n"
+        "- Page 1: setup + mischief + rising trouble + page-turn hook.\n"
+        "- Page 2: big moment + apology + funny resolution + warm ending.\n"
+        "- 1–3 short lines of dialogue across the story.\n"
+        "- Kid-safe, whimsical, funny, creative, sensory details.\n"
+        "- Keep names consistent; use narrator if provided.\n"
+        f"- About {_MIN_WORDS_PER_PAGE}–{_MAX_WORDS_PER_PAGE} words per page.\n"
+        "- Each page must include a strong illustration_prompt in consistent picture-book style.\n\n"
         "OUTPUT JSON schema:\n"
         "{"
         '"title": string, '
@@ -91,40 +123,145 @@ def _openai_storybook(
         "]"
         "}\n\n"
         f"Write exactly {target_pages} pages. "
-        f"Target total length {words_total} words across both pages. "
         f"Style: {_DEFAULT_STYLE}."
     )
 
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.7,
+    for attempt in range(2):
+        correction = ""
+        if attempt == 1:
+            correction = (
+                "Fix the previous response to match the JSON schema exactly and meet all requirements."
+            )
+        try:
+            content = _request_openai_story(
+                client,
+                system_prompt,
+                user_prompt,
+                correction,
+                use_responses,
+                target_pages,
+            )
+        except Exception as exc:
+            print(f"OpenAI enhancement failed: {exc}")
+            return None
+
+        if not content:
+            print("OpenAI enhancement failed: empty response.")
+            return None
+
+        data = _parse_json(content)
+        valid, reasons = _validate_story_data(data, target_pages)
+        if not valid:
+            if attempt == 0:
+                user_prompt = f"{user_prompt}\n\nPrevious response:\n{content}\n\nIssues:\n- " + "\n- ".join(reasons)
+                continue
+            print(f"OpenAI enhancement failed: invalid output ({'; '.join(reasons)}).")
+            return None
+
+        pages = _build_pages_from_data(data, target_pages)
+        if not pages:
+            print("OpenAI enhancement failed: unable to parse pages.")
+            return None
+
+        return StoryBook(
+            title=(data.get("title") or title).strip() or title,
+            subtitle=(data.get("subtitle") or "A story told out loud").strip()
+            or "A story told out loud",
+            pages=pages,
+            narrator=(data.get("narrator") or narrator),
         )
-    except Exception:
-        return None
 
-    content = response.choices[0].message.content if response.choices else ""
-    if not content:
-        return None
+    return None
 
-    data = _parse_json(content)
-    if not isinstance(data, dict):
-        return None
 
-    pages = _normalize_pages(data.get("pages"), cleaned, target_pages)
-    if not pages:
-        return None
+def _request_openai_story(
+    client,
+    system_prompt: str,
+    user_prompt: str,
+    correction: str,
+    use_responses: bool,
+    target_pages: int,
+) -> str:
+    if use_responses:
+        schema = _story_json_schema(target_pages)
+        input_messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        if correction:
+            input_messages.append({"role": "user", "content": correction})
+        response = client.responses.create(
+            model=_DEFAULT_MODEL,
+            input=input_messages,
+            temperature=_DEFAULT_TEMPERATURE,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "storybook",
+                    "schema": schema,
+                    "strict": True,
+                },
+            },
+        )
+        return _extract_response_text(response)
 
-    return StoryBook(
-        title=(data.get("title") or title).strip() or title,
-        subtitle=(data.get("subtitle") or "A story told out loud").strip() or "A story told out loud",
-        pages=pages,
-        narrator=(data.get("narrator") or narrator),
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    if correction:
+        messages.append({"role": "user", "content": correction})
+    response = client.chat.completions.create(
+        model=_DEFAULT_MODEL,
+        messages=messages,
+        temperature=_DEFAULT_TEMPERATURE,
+        response_format={"type": "json_object"},
     )
+    return response.choices[0].message.content if response.choices else ""
+
+
+def _story_json_schema(target_pages: int) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "subtitle": {"type": "string"},
+            "narrator": {"type": ["string", "null"]},
+            "pages": {
+                "type": "array",
+                "minItems": target_pages,
+                "maxItems": target_pages,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"},
+                        "illustration_prompt": {"type": "string"},
+                    },
+                    "required": ["text", "illustration_prompt"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["title", "subtitle", "pages"],
+        "additionalProperties": False,
+    }
+
+
+def _extract_response_text(response: Any) -> str:
+    text = getattr(response, "output_text", None)
+    if text:
+        return text
+    output = getattr(response, "output", None)
+    if isinstance(output, list):
+        for item in output:
+            content = getattr(item, "content", None)
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                text_part = getattr(part, "text", None)
+                if text_part:
+                    return text_part
+    return ""
 
 
 def _parse_json(content: str) -> Any:
@@ -135,47 +272,73 @@ def _parse_json(content: str) -> Any:
     try:
         return json.loads(trimmed)
     except json.JSONDecodeError:
+        extracted = _extract_json_block(trimmed)
+        if extracted:
+            return extracted
+    return None
+
+
+def _extract_json_block(text: str) -> Any:
+    start = text.find("{")
+    if start == -1:
         return None
+    depth = 0
+    for index in range(start, len(text)):
+        char = text[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                snippet = text[start : index + 1]
+                try:
+                    return json.loads(snippet)
+                except json.JSONDecodeError:
+                    return None
+    return None
 
 
-def _normalize_pages(raw_pages: Any, cleaned: str, target_pages: int) -> list[StoryPage]:
+def _validate_story_data(data: Any, target_pages: int) -> tuple[bool, list[str]]:
+    if not isinstance(data, dict):
+        return False, ["response is not a JSON object"]
+    pages = data.get("pages")
+    if not isinstance(pages, list):
+        return False, ["pages must be a list"]
+    if len(pages) != target_pages:
+        return False, [f"expected {target_pages} pages but got {len(pages)}"]
+    reasons: list[str] = []
+    for index, page in enumerate(pages, start=1):
+        if not isinstance(page, dict):
+            reasons.append(f"page {index} is not an object")
+            continue
+        text = (page.get("text") or "").strip()
+        prompt = (page.get("illustration_prompt") or "").strip()
+        if not text:
+            reasons.append(f"page {index} missing text")
+            continue
+        if not prompt:
+            reasons.append(f"page {index} missing illustration_prompt")
+        word_count = _word_count(text)
+        if word_count < _MIN_WORDS_PER_PAGE or word_count > _MAX_WORDS_PER_PAGE:
+            reasons.append(
+                f"page {index} word count {word_count} outside {_MIN_WORDS_PER_PAGE}-{_MAX_WORDS_PER_PAGE}"
+            )
+    return (len(reasons) == 0, reasons)
+
+
+def _build_pages_from_data(data: dict[str, Any], target_pages: int) -> list[StoryPage]:
     pages: list[StoryPage] = []
-    if isinstance(raw_pages, list):
-        for page in raw_pages:
-            if not isinstance(page, dict):
-                continue
-            text = (page.get("text") or "").strip()
-            prompt = (page.get("illustration_prompt") or "").strip()
-            if text:
-                pages.append(StoryPage(text=text, illustration_prompt=prompt or "Whimsical storybook illustration."))
-
-    if len(pages) >= target_pages:
-        return pages[:target_pages]
-
-    if len(pages) == 1:
-        split_pages = _split_story_text(pages[0].text, target_pages)
-        if split_pages:
-            first_prompt = pages[0].illustration_prompt
-            pages = [
-                StoryPage(text=split_pages[0], illustration_prompt=first_prompt),
-                StoryPage(text=split_pages[1], illustration_prompt="A joyful resolution scene."),
-            ]
-
-    while len(pages) < target_pages:
-        filler_text = cleaned or "A warm, gentle moment fills the page."
-        pages.append(StoryPage(text=filler_text, illustration_prompt="A friendly scene in a cozy setting."))
-
-    return pages[:target_pages]
-
-
-def _split_story_text(text: str, target_pages: int) -> list[str]:
-    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
-    if len(sentences) < target_pages:
-        midpoint = max(1, len(text) // 2)
-        return [text[:midpoint].strip(), text[midpoint:].strip()]
-
-    midpoint = len(sentences) // 2
-    return [" ".join(sentences[:midpoint]), " ".join(sentences[midpoint:])]
+    raw_pages = data.get("pages")
+    if not isinstance(raw_pages, list):
+        return pages
+    for page in raw_pages[:target_pages]:
+        if not isinstance(page, dict):
+            continue
+        text = (page.get("text") or "").strip()
+        prompt = (page.get("illustration_prompt") or "").strip()
+        if text and prompt:
+            pages.append(StoryPage(text=text, illustration_prompt=prompt))
+    return pages
 
 
 def _local_storybook(
@@ -186,44 +349,51 @@ def _local_storybook(
 ) -> StoryBook:
     topic = _infer_topic(cleaned)
     name = narrator or "A young storyteller"
-    total_words = _DEFAULT_TARGET_WORDS
-    page1_target = int(total_words * 0.55)
-    page2_target = total_words - page1_target
+    snippet = _snippet_from_transcript(cleaned)
 
     page1 = (
-        f"On a bright afternoon, {name} felt a tiny spark of curiosity about {topic}. "
-        f"The day started with a giggle and a whisper of adventure, "
-        f"and soon a playful idea bubbled up: {cleaned or 'a surprising little secret'}. "
-        "At first it seemed like a quick, harmless choice, but the world around them began to feel a little "
-        "different—like the air was holding its breath. "
-        "Friends noticed, a gentle worry flickered, and a silly misunderstanding grew into a big, bouncy problem. "
-        "Even the smallest decision can turn into a story when imagination runs wild."
+        f"On a bright afternoon, {name} felt a fizz of curiosity about {topic}. "
+        f"The day began with a giggle and a whisper of adventure, and soon a playful idea popped up: {snippet}. "
+        "At first it seemed small and sneaky, like hiding a secret in a pocket, but the air started to buzz. "
+        f"\"Should we tell?\" someone asked, and {name} just grinned, watching the trouble wobble bigger. "
+        "A silly misunderstanding bounced from friend to friend, and even the pets looked suspicious. "
+        "By the time the sun slid behind a cloud, the mix-up had become a swirl of whispers and wide eyes."
     )
-    page1 = _ensure_word_count(page1, page1_target)
+    page1 = _expand_text_to_range(
+        page1,
+        _MIN_WORDS_PER_PAGE,
+        _MAX_WORDS_PER_PAGE,
+        _page_expansions(topic, name, stage="setup"),
+    )
 
     page2 = (
-        "With a deep breath and a brave heart, the truth tumbled out. "
-        "Everyone paused, then smiled, because honesty made the room feel lighter. "
-        f"Together they fixed the mix-up, turning {topic} into a shared joke and a brand-new game. "
-        "They learned that apologies are like warm blankets: cozy, kind, and strong. "
-        "By the end, laughter danced through the room, and the adventure settled into a happy ending "
-        "with a gentle promise to choose kindness next time."
+        "With a deep breath and a brave heart, the truth finally tumbled out. "
+        f"\"I did it,\" {name} said, and the room froze for one tiny second before melting into relieved smiles. "
+        f"Together they turned the problem into a plan, transforming {topic} into a funny, shared solution. "
+        "There was an apology that sounded like a warm hug and a giggle that sounded like bells. "
+        "Everyone joined in to fix the mix-up, and the story swung toward a cozy, happy ending. "
+        "By bedtime, the adventure felt like a secret handshake—silly, sweet, and sure to be remembered."
     )
-    page2 = _ensure_word_count(page2, page2_target)
+    page2 = _expand_text_to_range(
+        page2,
+        _MIN_WORDS_PER_PAGE,
+        _MAX_WORDS_PER_PAGE,
+        _page_expansions(topic, name, stage="resolution"),
+    )
 
     pages = [
         StoryPage(
             text=page1,
             illustration_prompt=(
                 f"A whimsical storybook scene of {name} discovering {topic}, "
-                "with bright colors, cozy surroundings, and a playful hint of mischief."
+                "with bright colors, cozy surroundings, gentle watercolor textures, and a playful hint of mischief."
             ),
         ),
         StoryPage(
             text=page2,
             illustration_prompt=(
                 f"A warm, joyful illustration of friends making amends around {topic}, "
-                "smiling and laughing in a cozy setting with gentle, friendly colors."
+                "smiling and laughing in a cozy setting with gentle, friendly colors and soft light."
             ),
         ),
     ]
@@ -255,28 +425,97 @@ def _infer_topic(cleaned: str) -> str:
             return f"the {word.lower()}"
     return "a small surprise"
 
+def _snippet_from_transcript(cleaned: str, max_words: int = 16) -> str:
+    if not cleaned:
+        return "a surprising little secret"
+    words = re.findall(r"[A-Za-z']+", cleaned)
+    if not words:
+        return "a surprising little secret"
+    snippet = " ".join(words[:max_words])
+    return snippet.rstrip(".") + "."
 
-def _ensure_word_count(text: str, target_words: int) -> str:
-    sentences = [
-        "The sunlight seemed to smile along.",
-        "Tiny footsteps pattered with excitement.",
-        "A curious breeze whispered secrets.",
-        "Every friend had a helpful idea.",
-        "Kindness made the moment shine.",
-        "The room felt warmer with each laugh.",
-        "Imagination added sparkle to the day.",
-        "A gentle giggle bubbled up again.",
+
+def _page_expansions(topic: str, name: str, *, stage: str) -> list[str]:
+    additions = [
+        f"The hallway smelled like crayons and toast, and {name} could hear sneakers squeaking nearby.",
+        "A breeze bumped the curtains, as if the room itself was leaning in to listen.",
+        "Someone whispered a guess, and another friend gasped, suddenly certain they knew the truth.",
+        "The air felt fizzy, like soda bubbles popping with every new idea.",
+        "A tiny pet or plush toy seemed to watch the drama with wide, button eyes.",
+        "Even the clock sounded excited, ticking a little faster than usual.",
     ]
-    words = text.split()
-    index = 0
-    while len(words) < target_words and index < len(sentences):
-        text = f"{text} {sentences[index]}"
-        words = text.split()
-        index += 1
-    while len(words) < target_words:
-        text = f"{text} Kind hearts made the adventure better."
-        words = text.split()
-    return text
+
+    topic_lower = topic.lower()
+    if "pizza" in topic_lower:
+        additions.extend(
+            [
+                "The scent of warm cheese drifted by, making every tummy rumble a little louder.",
+                "A pretend pizza monster was blamed, complete with silly growls and dramatic arm waves.",
+                "Someone suggested leaving a trail of crust crumbs as a clue.",
+            ]
+        )
+    if "monster" in topic_lower:
+        additions.extend(
+            [
+                "Shadows wiggled on the wall, perfect for a make-believe monster dance.",
+                "They drew a friendly monster map with sparkly stickers and bold arrows.",
+            ]
+        )
+    if "dragon" in topic_lower:
+        additions.extend(
+            [
+                "A dragon made of chalk doodles puffed pretend smoke across the sidewalk.",
+                "They practiced brave knight poses and gentle dragon bows.",
+            ]
+        )
+
+    if stage == "resolution":
+        additions.extend(
+            [
+                "A chorus of \"It's okay!\" floated through the room, light and sincere.",
+                "They made a new rule: big feelings get big hugs and honest words.",
+                "Someone proposed a celebratory dance, and the floor became a stage.",
+            ]
+        )
+    else:
+        additions.extend(
+            [
+                "A whispered plan formed, and everyone leaned in close to hear it.",
+                "The mix-up began to wobble like a wiggly jelly, getting bigger with each retelling.",
+                "They tiptoed around the problem, hoping it would magically shrink.",
+            ]
+        )
+
+    return additions
+
+
+def _expand_text_to_range(
+    text: str,
+    target_min: int,
+    target_max: int,
+    additions: list[str],
+) -> str:
+    used: set[str] = set()
+    current = text
+    current_words = _word_count(current)
+    for sentence in additions:
+        if sentence in used:
+            continue
+        next_text = f"{current} {sentence}"
+        next_words = _word_count(next_text)
+        if next_words > target_max and current_words >= target_min:
+            break
+        if next_words <= target_max or current_words < target_min:
+            current = next_text
+            current_words = next_words
+            used.add(sentence)
+        if current_words >= target_min:
+            break
+    return current
+
+
+def _word_count(text: str) -> int:
+    return len(re.findall(r"[A-Za-z']+", text))
 
 
 def _maybe_generate_images(story: StoryBook) -> None:
