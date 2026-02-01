@@ -178,7 +178,7 @@ def render_story_pdf(
         font_size = max_font
         while font_size >= min_font:
             line_height = font_size * 1.4
-            paragraph_spacing = line_height * 0.6
+            paragraph_spacing = line_height * 0.45
             lines = _wrap_paragraphs(page.text, max_width, body_font, font_size)
             total_height = 0.0
             for line in lines:
@@ -189,7 +189,7 @@ def render_story_pdf(
 
         canvas_pdf.setFont(body_font, font_size)
         line_height = font_size * 1.4
-        paragraph_spacing = line_height * 0.6
+        paragraph_spacing = line_height * 0.45
         lines = _wrap_paragraphs(page.text, max_width, body_font, font_size)
         y_cursor = text_top
         for line in lines:
@@ -206,7 +206,7 @@ def render_story_pdf(
         illustration_bottom = illustration_top - illustration_height
         draw_illustration_box(page, margin, illustration_bottom, max_width, illustration_height)
 
-        text_top = illustration_bottom - (margin * 0.4)
+        text_top = illustration_bottom - (margin * 0.25)
         draw_story_text(page, text_top)
         finish_story_page()
 
