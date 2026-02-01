@@ -370,7 +370,6 @@ def _request_openai_story_http(
         "model": _DEFAULT_MODEL,
         "messages": chat_messages,
         "temperature": _DEFAULT_TEMPERATURE,
-        "response_format": {"type": "json_object"},
     }
     response_data = _post_openai_request(
         "https://api.openai.com/v1/chat/completions",
