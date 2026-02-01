@@ -6,9 +6,18 @@ from pathlib import Path
 
 
 def transcribe_audio(path: str) -> str:
-    p = Path(path)
+    p = Path(os.path.expandvars(os.path.expanduser(path))).resolve()
     if not p.exists():
-        raise FileNotFoundError(path)
+        cwd = Path.cwd().resolve()
+        wavs = list(cwd.glob("*.wav"))
+        msg = (
+            f"Audio file not found.\n"
+            f"  provided: {path}\n"
+            f"  resolved: {p}\n"
+            f"  cwd:      {cwd}\n"
+            f"  wavs in cwd: {[w.name for w in wavs]}\n"
+        )
+        raise FileNotFoundError(msg)
 
     if importlib.util.find_spec("openai") is None:
         raise RuntimeError("openai package not installed")
