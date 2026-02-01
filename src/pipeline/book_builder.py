@@ -4,12 +4,13 @@ from datetime import datetime
 from pathlib import Path
 
 from src.pipeline.pdf_builder import render_story_pdf
+from src.pipeline.story_builder import StoryPage
 
 
 def make_book_pdf(
     title: str,
     subtitle: str,
-    pages: list[str],
+    pages: list[str] | list[StoryPage],
     narrator: str | None = None,
     out_dir: Path = Path("out/books"),
 ) -> Path:
