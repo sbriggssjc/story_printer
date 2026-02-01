@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from src.pipeline.pdf_builder import make_book_pdf
+from src.pipeline.book_builder import make_book_pdf
 from src.pipeline.story_builder import build_storybook
 
 
