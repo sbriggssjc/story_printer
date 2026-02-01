@@ -34,6 +34,72 @@ _DEFAULT_STYLE = os.getenv("STORY_STYLE", "whimsical, funny, heartwarming")
 _MIN_WORDS_PER_PAGE = max(240, _DEFAULT_WORDS_PER_PAGE - 40)
 _MAX_WORDS_PER_PAGE = min(320, _DEFAULT_WORDS_PER_PAGE + 40)
 
+# --- Anti-boilerplate / faithfulness guards ---
+
+# Sentences we NEVER want in OpenAI output (these are showing up verbatim in your PDFs)
+_BLOCKLIST_SENTENCES = {
+    "The hallway smelled like crayons and toast, and Claire could hear sneakers squeaking nearby.",
+    "A breeze bumped the curtains, as if the room itself was leaning in to listen.",
+    "Someone whispered a guess, and another friend gasped, suddenly certain they knew the truth.",
+    "Sunlight puddled on the floor like warm butter, making the room glow.",
+    "The air felt fizzy, like soda bubbles popping with every new idea.",
+    "Even the clock sounded excited, ticking a little faster than usual.",
+}
+
+
+def _split_sentences_for_dedupe(text: str) -> list[str]:
+    if not text:
+        return []
+    flat = re.sub(r"\s+", " ", text.strip())
+    sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", flat) if s.strip()]
+    return sents
+
+
+def _find_blocklisted_sentences(text: str) -> list[str]:
+    sents = set(_split_sentences_for_dedupe(text))
+    hits = [s for s in _BLOCKLIST_SENTENCES if s in sents]
+    return hits
+
+
+def _find_duplicate_sentences_across_pages(page_texts: list[str]) -> list[str]:
+    # Return sentences (>= ~8 words) that appear on 2+ pages verbatim
+    seen: dict[str, int] = {}
+    dupes: set[str] = set()
+    for t in page_texts:
+        for s in _split_sentences_for_dedupe(t):
+            if len(re.findall(r"[A-Za-z']+", s)) < 8:
+                continue
+            key = s
+            seen[key] = seen.get(key, 0) + 1
+            if seen[key] >= 2:
+                dupes.add(s)
+    return sorted(dupes)
+
+
+def _infer_required_terms(cleaned_transcript: str) -> list[str]:
+    """Lightweight anchor terms derived from the transcript."""
+    lower = (cleaned_transcript or "").lower()
+    required: list[str] = []
+    # Hard anchors for your current use case; safe + simple
+    if "pizza" in lower:
+        required.extend(["pizza", "crust"])
+    if "monster" in lower:
+        required.append("monster")
+    # If transcript implies apology/laughter
+    if "sorry" in lower or "apolog" in lower:
+        required.append("sorry")
+    if "laugh" in lower or "giggl" in lower:
+        required.append("laug")
+    return sorted(set(required))
+
+
+def _missing_required_terms(page_texts: list[str], required_terms: list[str]) -> list[str]:
+    blob = " ".join(page_texts).lower()
+    missing = []
+    for term in required_terms:
+        if term not in blob:
+            missing.append(term)
+    return missing
 
 def enhance_to_storybook(transcript: str, *, target_pages: int = 2) -> StoryBook:
     cleaned = _clean_transcript(transcript)
@@ -102,10 +168,10 @@ def _build_openai_prompts(cleaned: str, narrator: str | None, target_pages: int)
         f"- Exactly {target_pages} pages.\n"
         "- Page 1: setup + mischief + rising trouble + page-turn hook.\n"
         "- Page 2: big moment + apology + funny resolution + warm ending.\n"
-        "- Include 1–3 short dialogue lines TOTAL, using quotation marks ONLY for those lines.\n"
+        '- Include EXACTLY 2 lines of dialogue total, each enclosed in straight double-quotes like "...".\n'
+        "- The two dialogue lines must be short (<= 12 words each) and must appear in the story text.\n"
         "- Use quotation marks only for spoken dialogue. Do not quote signs, thoughts, or emphasis.\n"
         "- Do NOT use quotation marks for emphasis, sound effects, or any other purpose.\n"
-        "- Use quotation marks for dialogue only, and include exactly 2 quoted lines total. Do not quote anything else.\n"
         "- Kid-safe, whimsical, humorous, creative expansion.\n"
         "- Include sensory details and an emotional arc.\n"
         "- Avoid repeating filler sentences or stock phrases.\n"
@@ -123,6 +189,20 @@ def _build_openai_prompts(cleaned: str, narrator: str | None, target_pages: int)
         "]"
         "}\n\n"
         f"Style: {_DEFAULT_STYLE}."
+    )
+    required_terms = _infer_required_terms(cleaned)
+    if required_terms:
+        user_prompt += (
+            "\nFaithfulness requirements (must include these exact terms somewhere in the story):\n"
+            + "- " + ", ".join(required_terms) + "\n"
+        )
+    user_prompt += (
+        "\nHard bans:\n"
+        "- Do NOT use any generic boilerplate sensory sentences.\n"
+        "- Do NOT repeat any sentence verbatim across pages.\n"
+        "- Do NOT include these sentences (exactly as written):\n"
+        + "\n".join([f"  - {s}" for s in sorted(_BLOCKLIST_SENTENCES)])
+        + "\n"
     )
     return system_prompt, user_prompt
 
@@ -195,19 +275,22 @@ def _openai_storybook(
         # Post-process pages BEFORE validation so we validate the final text that will be printed
         for page in pages:
             page.text = _pad_text_to_min_words(page.text, min_words=_MIN_WORDS_PER_PAGE)
-            page.text = _limit_dialogue_lines(page.text, max_lines=3)
+            page.text = _limit_dialogue_lines(page.text, max_lines=2)
 
         total_dialogue = sum(_count_dialogue_lines(page.text) for page in pages)
-        if total_dialogue < 1:
-            pages[-1].text = _ensure_dialogue_present(pages[-1].text)
+        if total_dialogue < 2:
+            pages[-1].text = _ensure_dialogue_count(pages[-1].text, target_lines=2)
 
+        os.environ["__STORY_CLEANED_TRANSCRIPT__"] = cleaned or ""
         valid, reasons = _validate_story_pages(pages, target_pages)
         if not valid:
             print(f"Validation failed: {', '.join(reasons)}")
             if attempt == 0:
                 user_prompt = (
-                    f"{user_prompt}\n\nPrevious response:\n{content}\n\nIssues:\n- "
-                    + "\n- ".join(reasons)
+                    f"{user_prompt}\n\n"
+                    "Your previous attempt failed validation. Fix ALL issues below:\n"
+                    "- " + "\n- ".join(reasons) + "\n\n"
+                    "Rewrite from scratch. Do NOT reuse any sentences from the previous attempt.\n"
                 )
                 continue
             print(f"OpenAI enhancement failed: invalid output ({'; '.join(reasons)}).")
@@ -543,6 +626,7 @@ def _validate_story_data(data: Any, target_pages: int) -> tuple[bool, list[str]]
         return False, [f"expected {target_pages} pages but got {len(pages)}"]
     reasons: list[str] = []
     total_dialogue = 0
+    page_texts: list[str] = []
     for index, page in enumerate(pages, start=1):
         if not isinstance(page, dict):
             reasons.append(f"page {index} is not an object")
@@ -560,8 +644,24 @@ def _validate_story_data(data: Any, target_pages: int) -> tuple[bool, list[str]]
                 f"page {index} word count {word_count} outside {_MIN_WORDS_PER_PAGE}-{_MAX_WORDS_PER_PAGE}"
             )
         total_dialogue += _count_dialogue_lines(text)
-    if total_dialogue < 1 or total_dialogue > 3:
-        reasons.append(f"dialogue lines counted {total_dialogue} outside 1-3")
+        page_texts.append(text)
+
+    for i, t in enumerate(page_texts, start=1):
+        hits = _find_blocklisted_sentences(t)
+        if hits:
+            reasons.append(f"page {i} contains boilerplate sentence(s): {hits[:2]}")
+
+    dupes = _find_duplicate_sentences_across_pages(page_texts)
+    if dupes:
+        reasons.append(f"repeated sentence across pages: {dupes[0]}")
+
+    required_terms = _infer_required_terms(os.getenv("__STORY_CLEANED_TRANSCRIPT__", "") or "")
+    missing = _missing_required_terms(page_texts, required_terms) if required_terms else []
+    if missing:
+        reasons.append(f"missing required transcript term(s): {missing}")
+
+    if total_dialogue != 2:
+        reasons.append(f"dialogue lines counted {total_dialogue} but expected exactly 2")
     return (len(reasons) == 0, reasons)
 
 
@@ -573,6 +673,7 @@ def _validate_story_pages(pages: list[StoryPage], target_pages: int) -> tuple[bo
 
     reasons: list[str] = []
     total_dialogue = 0
+    page_texts: list[str] = []
 
     for index, page in enumerate(pages, start=1):
         text = (page.text or "").strip()
@@ -591,9 +692,24 @@ def _validate_story_pages(pages: list[StoryPage], target_pages: int) -> tuple[bo
             )
 
         total_dialogue += _count_dialogue_lines(text)
+        page_texts.append(text)
 
-    if total_dialogue < 1 or total_dialogue > 3:
-        reasons.append(f"dialogue lines counted {total_dialogue} outside 1-3")
+    for i, t in enumerate(page_texts, start=1):
+        hits = _find_blocklisted_sentences(t)
+        if hits:
+            reasons.append(f"page {i} contains boilerplate sentence(s): {hits[:2]}")
+
+    dupes = _find_duplicate_sentences_across_pages(page_texts)
+    if dupes:
+        reasons.append(f"repeated sentence across pages: {dupes[0]}")
+
+    required_terms = _infer_required_terms(os.getenv("__STORY_CLEANED_TRANSCRIPT__", "") or "")
+    missing = _missing_required_terms(page_texts, required_terms) if required_terms else []
+    if missing:
+        reasons.append(f"missing required transcript term(s): {missing}")
+
+    if total_dialogue != 2:
+        reasons.append(f"dialogue lines counted {total_dialogue} but expected exactly 2")
 
     return (len(reasons) == 0, reasons)
 
@@ -860,14 +976,21 @@ def _limit_dialogue_lines(text: str, max_lines: int = 3) -> str:
     return "".join(out)
 
 
-def _ensure_dialogue_present(text: str) -> str:
+def _ensure_dialogue_count(text: str, target_lines: int = 2) -> str:
     """
-    If the text has zero quoted dialogue, inject exactly one short line.
+    Ensure the text includes exactly target_lines of quoted dialogue by appending short lines.
     """
-    if _count_dialogue_lines(text) >= 1:
+    current = _count_dialogue_lines(text)
+    if current >= target_lines:
         return text
 
-    return text.rstrip() + ' "Uh-oh," Claire whispered.'
+    additions = [
+        '"We can fix it," she said.',
+        '"That was silly," he laughed.',
+    ]
+    needed = target_lines - current
+    extra = " ".join(additions[:needed])
+    return f"{text.rstrip()} {extra}".strip()
 
 
 def _pad_to_min_words(text: str, target_min: int, topic: str, name: str) -> str:
