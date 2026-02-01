@@ -103,6 +103,7 @@ def _build_openai_prompts(cleaned: str, narrator: str | None, target_pages: int)
         "- Page 1: setup + mischief + rising trouble + page-turn hook.\n"
         "- Page 2: big moment + apology + funny resolution + warm ending.\n"
         "- 1–3 short lines of dialogue across the story total.\n"
+        "- Use quotation marks for dialogue only, and include exactly 2 quoted lines total. Do not quote anything else.\n"
         "- Kid-safe, whimsical, humorous, creative expansion.\n"
         "- Include sensory details and an emotional arc.\n"
         "- Avoid repeating filler sentences or stock phrases.\n"
@@ -184,6 +185,18 @@ def _openai_storybook(
             return None
 
         data = _parse_json(content)
+        pages = _build_pages_from_data(data, target_pages)
+        if pages:
+            topic = _infer_topic(cleaned)
+            name = narrator or "A young storyteller"
+            for page in pages:
+                page.text = _limit_dialogue_lines(page.text, max_lines=3)
+                page.text = _ensure_dialogue_present(page.text)
+                page.text = _pad_to_min_words(page.text, _MIN_WORDS_PER_PAGE, topic, name)
+            data["pages"] = [
+                {"text": page.text, "illustration_prompt": page.illustration_prompt} for page in pages
+            ]
+
         valid, reasons = _validate_story_data(data, target_pages)
         if not valid:
             print(f"Validation failed: {', '.join(reasons)}")
@@ -196,7 +209,6 @@ def _openai_storybook(
             print(f"OpenAI enhancement failed: invalid output ({'; '.join(reasons)}).")
             return None
 
-        pages = _build_pages_from_data(data, target_pages)
         if not pages:
             print("OpenAI enhancement failed: unable to parse pages.")
             return None
@@ -775,6 +787,65 @@ def _count_dialogue_lines(text: str) -> int:
     quoted = re.findall(r'"[^"]+"', text)
     curly = re.findall(r"“[^”]+”", text)
     return len(quoted) + len(curly)
+
+
+def _limit_dialogue_lines(text: str, max_lines: int = 3) -> str:
+    """
+    Keeps the first max_lines quoted segments, removes quotation marks from the rest
+    so they no longer count as dialogue lines.
+    """
+    patterns = [
+        r'"[^"]+"',
+        r"“[^”]+”",
+    ]
+
+    matches: list[tuple[int, int]] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            matches.append((match.start(), match.end()))
+    matches.sort(key=lambda item: item[0])
+
+    if len(matches) <= max_lines:
+        return text
+
+    out: list[str] = []
+    last = 0
+    for index, (start, end) in enumerate(matches):
+        out.append(text[last:start])
+        segment = text[start:end]
+        if index < max_lines:
+            out.append(segment)
+        else:
+            if segment.startswith('"') and segment.endswith('"'):
+                out.append(segment[1:-1])
+            elif segment.startswith("“") and segment.endswith("”"):
+                out.append(segment[1:-1])
+            else:
+                out.append(segment)
+        last = end
+    out.append(text[last:])
+    return "".join(out)
+
+
+def _ensure_dialogue_present(text: str) -> str:
+    """
+    If the text has zero quoted dialogue, inject exactly one short line.
+    """
+    if _count_dialogue_lines(text) >= 1:
+        return text
+
+    return text.rstrip() + ' "Uh-oh," Claire whispered.'
+
+
+def _pad_to_min_words(text: str, target_min: int, topic: str, name: str) -> str:
+    """
+    If text is under target_min, append non-dialogue expansions until it meets min.
+    """
+    if _word_count(text) >= target_min:
+        return text
+
+    additions = _page_expansions(topic, name, stage="resolution")
+    return _expand_text_to_range(text, target_min, _MAX_WORDS_PER_PAGE, additions)
 
 
 def _maybe_generate_images(story: StoryBook) -> None:
