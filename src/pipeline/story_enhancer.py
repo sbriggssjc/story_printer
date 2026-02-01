@@ -232,14 +232,15 @@ def _request_openai_story(
             model=_DEFAULT_MODEL,
             input=input_messages,
             temperature=_DEFAULT_TEMPERATURE,
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
+            text={
+                "format": {
+                    "type": "json_schema",
                     "name": "storybook",
                     "schema": schema,
                     "strict": True,
-                },
+                }
             },
+            max_output_tokens=2200,
         )
         return _extract_response_text(response)
 
@@ -254,6 +255,7 @@ def _request_openai_story(
         messages=messages,
         temperature=_DEFAULT_TEMPERATURE,
         response_format={"type": "json_object"},
+        max_tokens=2200,
     )
     return response.choices[0].message.content if response.choices else ""
 
@@ -296,10 +298,15 @@ def _request_openai_story_http(
         "model": _DEFAULT_MODEL,
         "input": input_messages,
         "temperature": _DEFAULT_TEMPERATURE,
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {"name": "storybook", "schema": schema, "strict": True},
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "storybook",
+                "schema": schema,
+                "strict": True,
+            }
         },
+        "max_output_tokens": 2200,
     }
     try:
         response_data = _post_openai_request(
