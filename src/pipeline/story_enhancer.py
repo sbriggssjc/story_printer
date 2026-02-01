@@ -190,9 +190,21 @@ def _openai_storybook(
         if pages:
             topic = _infer_topic(cleaned)
             name = narrator or "A young storyteller"
+            # Enforce 1–3 dialogue lines TOTAL across the whole story (not per-page).
+            remaining_dialogue = 3
+            total_dialogue = 0
             for page in pages:
-                page.text = _limit_dialogue_lines(page.text, max_lines=3)
-                page.text = _ensure_dialogue_present(page.text)
+                page.text = _limit_dialogue_lines(page.text, max_lines=remaining_dialogue)
+                used_here = _count_dialogue_lines(page.text)
+                total_dialogue += used_here
+                remaining_dialogue = max(0, remaining_dialogue - used_here)
+
+            # If the model returned zero dialogue, add one short line at the end.
+            if total_dialogue < 1 and pages:
+                pages[-1].text = _ensure_dialogue_present(pages[-1].text)
+
+            # Pad AFTER dialogue normalization so we don't reintroduce extra quotes.
+            for page in pages:
                 page.text = _pad_to_min_words(page.text, _MIN_WORDS_PER_PAGE, topic, name)
             data["pages"] = [
                 {"text": page.text, "illustration_prompt": page.illustration_prompt} for page in pages
