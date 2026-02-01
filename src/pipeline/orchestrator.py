@@ -1,26 +1,63 @@
 ﻿from pathlib import Path
 from datetime import datetime
-from src.pipeline.storyboarder import make_stub_storyboard
-from src.pipeline.image_gen import generate_placeholder_image
-from src.pipeline.pdf_builder import build_pdf
 
-OUT = Path('out')
-BOOKS = OUT / 'books'
-DEBUG = OUT / 'debug'
+from src.pipeline.book_builder import build_book_pdf
+
+OUT_BOOKS = Path("out") / "books"
 
 def run_once(transcript: str) -> Path:
-    story = make_stub_storyboard(transcript)
+    transcript = (transcript or "").strip()
 
-    image_paths_by_page = {}
-    for page in story.pages:
-        paths = []
-        for i, panel in enumerate(page.panels, start=1):
-            img_path = DEBUG / f'page{page.page}_panel{i}.png'
-            generate_placeholder_image(panel.image_prompt, img_path)
-            paths.append(img_path)
-        image_paths_by_page[page.page] = paths
+    if transcript:
+        story_title = guess_title_from_transcript(transcript)
+        pages = pages_from_transcript(transcript, max_pages=6)
+    else:
+        story_title = "The Amazing Story"
+        pages = [
+            "Once upon a time, a kid had a big idea.",
+            "Then something surprising popped up!",
+            "They decided to be brave and try.",
+            "A silly problem got in the way.",
+            "But teamwork made it easy.",
+            "And that’s how the adventure ended happily.",
+        ]
 
-    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    out_pdf = BOOKS / f'story_{ts}.pdf'
-    build_pdf(story, image_paths_by_page, out_pdf)
+    OUT_BOOKS.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_pdf = OUT_BOOKS / f"story_{ts}.pdf"
+
+    build_book_pdf(
+        out_path=out_pdf,
+        title=story_title,
+        pages=pages,
+    )
     return out_pdf
+
+def guess_title_from_transcript(t: str) -> str:
+    low = t.lower()
+    if "pizza" in low:
+        return "The Pizza Crust Mystery"
+    if "monster" in low:
+        return "The Surprise Monster"
+    return "My Awesome Story"
+
+def pages_from_transcript(t: str, max_pages: int = 6):
+    import re
+
+    sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", t) if s.strip()]
+    if not sents:
+        return ["(No story text captured.)"]
+
+    chunks = []
+    cur = []
+    for s in sents:
+        cur.append(s)
+        if len(cur) >= 2:
+            chunks.append(" ".join(cur))
+            cur = []
+        if len(chunks) >= max_pages:
+            break
+    if cur and len(chunks) < max_pages:
+        chunks.append(" ".join(cur))
+
+    return chunks[:max_pages]
