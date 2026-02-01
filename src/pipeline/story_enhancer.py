@@ -786,9 +786,8 @@ def _word_count(text: str) -> int:
 
 
 def _count_dialogue_lines(text: str) -> int:
-    quoted = re.findall(r'"[^"]+"', text)
-    curly = re.findall(r"“[^”]+”", text)
-    return len(quoted) + len(curly)
+    sentence_start = re.compile(r'(^|[.!?]\s+|\n\s*)(["“])')
+    return sum(1 for _ in sentence_start.finditer(text))
 
 
 def _limit_dialogue_lines(text: str, max_lines: int = 3) -> str:
