@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from src.pipeline.book_builder import make_book_pdf
@@ -9,7 +10,8 @@ def run_once(transcript: str, pages: list[str] | None = None) -> Path:
     if pages:
         book = build_storybook(transcript, pages=pages)
     else:
-        book = enhance_to_storybook(transcript, target_pages=2)
+        target_pages = int(os.getenv("STORY_TARGET_PAGES", "2"))
+        book = enhance_to_storybook(transcript, target_pages=target_pages)
 
     return make_book_pdf(
         title=book.title,

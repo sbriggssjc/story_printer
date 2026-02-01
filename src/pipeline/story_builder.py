@@ -55,12 +55,19 @@ def _clean_transcript(transcript: str) -> str:
         return ""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[\t ]+", " ", text)
+    text = re.sub(r"\[(?:inaudible|noise|music|laughs?|crosstalk)\]", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+([,;:.!?])", r"\1", text)
+    text = re.sub(r"([,;:.!?])([^\s])", r"\1 \2", text)
+    text = re.sub(r"([.!?]){2,}", r"\1", text)
     text = re.sub(r"\n\s*\n", "\n\n", text)
     paragraphs = []
     for part in text.split("\n\n"):
         collapsed = re.sub(r"\s+", " ", part.replace("\n", " ")).strip()
-        if collapsed:
-            paragraphs.append(collapsed)
+        if not collapsed:
+            continue
+        if not re.search(r"[.!?]$", collapsed):
+            collapsed = f"{collapsed}."
+        paragraphs.append(collapsed)
     return "\n\n".join(paragraphs).strip()
 
 
