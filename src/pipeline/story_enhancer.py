@@ -46,6 +46,13 @@ _BLOCKLIST_SENTENCES = {
     "Even the clock sounded excited, ticking a little faster than usual.",
 }
 
+_BANNED_PHRASES = [
+    "The hallway smelled like crayons and toast",
+    "Sunlight puddled on the floor like warm butter",
+    "the room itself was leaning in to listen",
+    "Even the clock sounded excited",
+]
+
 
 def _split_sentences_for_dedupe(text: str) -> list[str]:
     if not text:
@@ -100,6 +107,29 @@ def _missing_required_terms(page_texts: list[str], required_terms: list[str]) ->
         if term not in blob:
             missing.append(term)
     return missing
+
+
+def _extract_fidelity_keywords(cleaned: str) -> list[str]:
+    # small, pragmatic: keep the “story spine”
+    lowered = (cleaned or "").lower()
+    must = []
+    for k in ["pizza", "crust", "monster", "apolog", "laugh"]:
+        if k in lowered:
+            must.append(k)
+    # if transcript is tiny, at least demand 2 anchors
+    return must[:4]
+
+
+def _fails_fidelity(pages_text: str, must_keywords: list[str]) -> list[str]:
+    reasons = []
+    low = pages_text.lower()
+    for k in must_keywords:
+        if k not in low:
+            reasons.append(f"missing keyword: {k}")
+    for phrase in _BANNED_PHRASES:
+        if phrase.lower() in low:
+            reasons.append(f"contains banned filler phrase: {phrase}")
+    return reasons
 
 def enhance_to_storybook(transcript: str, *, target_pages: int = 2) -> StoryBook:
     cleaned = _clean_transcript(transcript)
@@ -161,14 +191,19 @@ def _build_openai_prompts(cleaned: str, narrator: str | None, target_pages: int)
         "8) Warm ending with emotional lift.\n"
     )
     user_prompt = (
-        "TRANSCRIPT (idea source only, do NOT copy sentences verbatim):\n"
+        "TRANSCRIPT (core plot MUST be preserved; you may rephrase sentences, but do not invent new major events):\n"
         f"{cleaned or 'Empty transcript.'}\n\n"
+        "Non-negotiable story anchors (must appear clearly):\n"
+        "- Claire hides the pizza crust.\n"
+        "- A pizza monster shows up (real or pretend is fine).\n"
+        "- Claire apologizes.\n"
+        "- Everyone laughs / warm resolution.\n\n"
         f"NARRATOR (keep name if present): {narrator or 'none'}\n\n"
         "Story requirements:\n"
         f"- Exactly {target_pages} pages.\n"
         "- Page 1: setup + mischief + rising trouble + page-turn hook.\n"
         "- Page 2: big moment + apology + funny resolution + warm ending.\n"
-        '- Include EXACTLY 2 lines of dialogue total, each enclosed in straight double-quotes like "...".\n'
+        '- Exactly 2 lines of dialogue total, both MUST be in quotes.\n'
         "- The two dialogue lines must be short (<= 12 words each) and must appear in the story text.\n"
         "- Use quotation marks only for spoken dialogue. Do not quote signs, thoughts, or emphasis.\n"
         "- Do NOT use quotation marks for emphasis, sound effects, or any other purpose.\n"
@@ -294,6 +329,26 @@ def _openai_storybook(
                 )
                 continue
             print(f"OpenAI enhancement failed: invalid output ({'; '.join(reasons)}).")
+            return None
+
+        all_text = " ".join(
+            [
+                (p.get("text") or "")
+                for p in (data.get("pages") or [])
+                if isinstance(p, dict)
+            ]
+        )
+        must = _extract_fidelity_keywords(cleaned)
+        fidelity_reasons = _fails_fidelity(all_text, must)
+        if fidelity_reasons:
+            print(f"Fidelity failed: {', '.join(fidelity_reasons)}")
+            if attempt == 0:
+                user_prompt = (
+                    f"{user_prompt}\n\nFidelity issues:\n- "
+                    + "\n- ".join(fidelity_reasons)
+                    + "\n\nRewrite while keeping the transcript’s core events EXACT."
+                )
+                continue
             return None
 
         return StoryBook(
