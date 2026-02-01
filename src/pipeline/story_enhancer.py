@@ -220,6 +220,43 @@ def _request_openai_story(
     use_responses: bool,
     target_pages: int,
 ) -> str:
+    # Prefer Responses API (SDK) when available
+    if use_responses and hasattr(client.responses, "parse"):
+        schema = _story_json_schema(target_pages)
+
+        input_messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        if correction:
+            input_messages.append({"role": "user", "content": correction})
+
+        # NOTE: responses.parse enforces the schema and returns parsed output
+        result = client.responses.parse(
+            model=_DEFAULT_MODEL,
+            input=input_messages,
+            temperature=_DEFAULT_TEMPERATURE,
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "storybook",
+                    "schema": schema,
+                    "strict": True,
+                }
+            },
+            max_output_tokens=2600,
+        )
+
+        # result.output_parsed is the parsed JSON object (dict)
+        # But our caller expects raw JSON text (string), so serialize it.
+        parsed = getattr(result, "output_parsed", None)
+        if parsed is not None:
+            return json.dumps(parsed)
+
+        # Fallback if output_parsed isn't present for some reason
+        return _extract_response_text(result)
+
+    # If parse isn't available, use Responses.create with text.format
     if use_responses:
         schema = _story_json_schema(target_pages)
         input_messages = [
@@ -228,6 +265,7 @@ def _request_openai_story(
         ]
         if correction:
             input_messages.append({"role": "user", "content": correction})
+
         response = client.responses.create(
             model=_DEFAULT_MODEL,
             input=input_messages,
@@ -240,22 +278,24 @@ def _request_openai_story(
                     "strict": True,
                 }
             },
-            max_output_tokens=2200,
+            max_output_tokens=2600,
         )
         return _extract_response_text(response)
 
+    # chat.completions fallback
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
     if correction:
         messages.append({"role": "user", "content": correction})
+
     response = client.chat.completions.create(
         model=_DEFAULT_MODEL,
         messages=messages,
         temperature=_DEFAULT_TEMPERATURE,
         response_format={"type": "json_object"},
-        max_tokens=2200,
+        max_tokens=2600,
     )
     return response.choices[0].message.content if response.choices else ""
 
