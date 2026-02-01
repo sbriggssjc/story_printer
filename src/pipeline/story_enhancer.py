@@ -148,7 +148,11 @@ def _openai_storybook(
         correction = ""
         if attempt == 1:
             correction = (
-                "Fix the previous response to match the JSON schema exactly and meet all requirements."
+                "Rewrite the story to satisfy ALL requirements:\n"
+                f"- EXACTLY {target_pages} pages.\n"
+                f"- EACH page MUST be between {_MIN_WORDS_PER_PAGE} and {_MAX_WORDS_PER_PAGE} words.\n"
+                '- Include EXACTLY 2 short dialogue lines using straight quotes, e.g. "...".\n'
+                "- Return ONLY JSON matching the schema. No extra keys, no commentary."
             )
         try:
             if client:
