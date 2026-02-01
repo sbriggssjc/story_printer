@@ -1,41 +1,36 @@
-﻿from pathlib import Path
 from datetime import datetime
+from pathlib import Path
+
+from src.pipeline.book_builder import build_book_pdf
 from src.pipeline.storyboarder import make_stub_storyboard
-from src.pipeline.book_builder import build_book_pdf
-
-OUT = Path('out')
-BOOKS = OUT / 'books'
-
-def run_once(transcript: str, pages: list[str] | None = None) -> Path:
-    story = make_stub_storyboard(transcript)
-
-    if pages is None:
-        pages = [transcript]
-
-    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    out_pdf = BOOKS / f'story_{ts}.pdf'
-    build_book_pdf(out_pdf, story.title, pages)
-
-from src.pipeline.book_builder import build_book_pdf
 
 OUT_BOOKS = Path("out") / "books"
 
-def run_once(transcript: str) -> Path:
+
+def run_once(transcript: str, pages: list[str] | None = None) -> Path:
     transcript = (transcript or "").strip()
+
+    story = None
+    if pages is None:
+        if transcript:
+            pages = pages_from_transcript(transcript, max_pages=6)
+        else:
+            story = make_stub_storyboard(transcript)
+            pages = [
+                panel.caption
+                for page in story.pages
+                for panel in page.panels
+                if panel.caption
+            ]
+            if not pages:
+                pages = ["(No story text captured.)"]
 
     if transcript:
         story_title = guess_title_from_transcript(transcript)
-        pages = pages_from_transcript(transcript, max_pages=6)
     else:
-        story_title = "The Amazing Story"
-        pages = [
-            "Once upon a time, a kid had a big idea.",
-            "Then something surprising popped up!",
-            "They decided to be brave and try.",
-            "A silly problem got in the way.",
-            "But teamwork made it easy.",
-            "And that’s how the adventure ended happily.",
-        ]
+        if story is None:
+            story = make_stub_storyboard(transcript)
+        story_title = story.title
 
     OUT_BOOKS.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -48,6 +43,7 @@ def run_once(transcript: str) -> Path:
     )
     return out_pdf
 
+
 def guess_title_from_transcript(t: str) -> str:
     low = t.lower()
     if "pizza" in low:
@@ -56,7 +52,8 @@ def guess_title_from_transcript(t: str) -> str:
         return "The Surprise Monster"
     return "My Awesome Story"
 
-def pages_from_transcript(t: str, max_pages: int = 6):
+
+def pages_from_transcript(t: str, max_pages: int = 6) -> list[str]:
     import re
 
     sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", t) if s.strip()]
