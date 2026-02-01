@@ -3,9 +3,13 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
+from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfgen import canvas
+from reportlab.lib.utils import ImageReader
+
+from src.pipeline.story_builder import StoryPage
 
 
 def _wrap_text(text: str, max_width: float, font: str, font_size: int) -> list[str]:
@@ -26,16 +30,25 @@ def _wrap_text(text: str, max_width: float, font: str, font_size: int) -> list[s
     return lines
 
 
-def _extract_paragraphs(pages: list[str]) -> list[str]:
-    paragraphs: list[str] = []
-    for page_text in pages:
-        if not page_text:
-            continue
-        for paragraph in page_text.split("\n\n"):
-            cleaned = paragraph.strip()
-            if cleaned:
-                paragraphs.append(cleaned)
-    return paragraphs
+def _wrap_paragraphs(text: str, max_width: float, font: str, font_size: int) -> list[str]:
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    if not paragraphs:
+        return [""]
+
+    lines: list[str] = []
+    for index, paragraph in enumerate(paragraphs):
+        lines.extend(_wrap_text(paragraph, max_width, font, font_size))
+        if index < len(paragraphs) - 1:
+            lines.append("")
+    return lines
+
+
+def _coerce_story_pages(pages: list[str] | list[StoryPage]) -> list[StoryPage]:
+    if not pages:
+        return [StoryPage(text="", illustration_prompt="")]
+    if isinstance(pages[0], StoryPage):
+        return list(pages)
+    return [StoryPage(text=page, illustration_prompt="") for page in pages]
 
 
 def _draw_cover_page(
@@ -91,7 +104,7 @@ def _draw_end_page(
 def render_story_pdf(
     title: str,
     subtitle: str,
-    pages: list[str],
+    pages: list[str] | list[StoryPage],
     out_pdf: Path,
     narrator: str | None = None,
 ) -> Path:
@@ -115,18 +128,10 @@ def render_story_pdf(
 
     body_font = "Helvetica"
     body_size = 13
-    line_height = body_size * 1.4
-    paragraph_spacing = line_height * 0.6
     max_width = page_width - 2 * margin
     bottom_limit = margin + footer_height
 
-    paragraphs = _extract_paragraphs(pages)
-    if not paragraphs:
-        paragraphs = [""]
-
     page_number = 1
-    y = page_height - margin
-    canvas_pdf.setFont(body_font, body_size)
 
     def finish_story_page() -> None:
         nonlocal page_number
@@ -136,25 +141,75 @@ def render_story_pdf(
         canvas_pdf.drawString(page_width - margin - number_width, margin / 2, page_label)
         canvas_pdf.showPage()
         page_number += 1
-        canvas_pdf.setFont(body_font, body_size)
 
-    for index, paragraph in enumerate(paragraphs):
-        lines = _wrap_text(paragraph, max_width, body_font, body_size)
+    def draw_illustration_box(page: StoryPage, box_x: float, box_y: float, box_w: float, box_h: float) -> None:
+        if page.illustration_path and Path(page.illustration_path).exists():
+            image = ImageReader(page.illustration_path)
+            img_w, img_h = image.getSize()
+            scale = min(box_w / img_w, box_h / img_h)
+            draw_w = img_w * scale
+            draw_h = img_h * scale
+            offset_x = box_x + (box_w - draw_w) / 2
+            offset_y = box_y + (box_h - draw_h) / 2
+            canvas_pdf.drawImage(image, offset_x, offset_y, draw_w, draw_h, preserveAspectRatio=True)
+            return
+
+        canvas_pdf.setStrokeColor(colors.lightgrey)
+        canvas_pdf.setFillColor(colors.whitesmoke)
+        canvas_pdf.rect(box_x, box_y, box_w, box_h, stroke=1, fill=1)
+        canvas_pdf.setFillColor(colors.black)
+        prompt = page.illustration_prompt.strip() or "Illustration: A cozy children's storybook scene."
+        prompt_text = f"Illustration: {prompt}"
+        prompt_font = "Helvetica-Oblique"
+        prompt_size = 10
+        padding = 10
+        prompt_lines = _wrap_text(prompt_text, box_w - 2 * padding, prompt_font, prompt_size)
+        y_cursor = box_y + box_h - padding - prompt_size
+        canvas_pdf.setFont(prompt_font, prompt_size)
+        for line in prompt_lines:
+            if y_cursor < box_y + padding:
+                break
+            canvas_pdf.drawString(box_x + padding, y_cursor, line)
+            y_cursor -= prompt_size * 1.3
+
+    def draw_story_text(page: StoryPage, text_top: float) -> None:
+        max_font = body_size
+        min_font = 9
+        font_size = max_font
+        while font_size >= min_font:
+            line_height = font_size * 1.4
+            paragraph_spacing = line_height * 0.6
+            lines = _wrap_paragraphs(page.text, max_width, body_font, font_size)
+            total_height = 0.0
+            for line in lines:
+                total_height += paragraph_spacing if line == "" else line_height
+            if text_top - total_height >= bottom_limit:
+                break
+            font_size -= 1
+
+        canvas_pdf.setFont(body_font, font_size)
+        line_height = font_size * 1.4
+        paragraph_spacing = line_height * 0.6
+        lines = _wrap_paragraphs(page.text, max_width, body_font, font_size)
+        y_cursor = text_top
         for line in lines:
-            if y - line_height < bottom_limit:
-                finish_story_page()
-                y = page_height - margin
-            canvas_pdf.drawString(margin, y, line)
-            y -= line_height
+            if line == "":
+                y_cursor -= paragraph_spacing
+                continue
+            canvas_pdf.drawString(margin, y_cursor, line)
+            y_cursor -= line_height
 
-        if index < len(paragraphs) - 1:
-            if y - paragraph_spacing < bottom_limit:
-                finish_story_page()
-                y = page_height - margin
-            else:
-                y -= paragraph_spacing
+    story_pages = _coerce_story_pages(pages)
+    for page in story_pages:
+        illustration_height = page_height * 0.4
+        illustration_top = page_height - margin
+        illustration_bottom = illustration_top - illustration_height
+        draw_illustration_box(page, margin, illustration_bottom, max_width, illustration_height)
 
-    finish_story_page()
+        text_top = illustration_bottom - (margin * 0.4)
+        draw_story_text(page, text_top)
+        finish_story_page()
+
     _draw_end_page(canvas_pdf, page_width, page_height)
 
     canvas_pdf.save()
