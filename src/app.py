@@ -3,6 +3,7 @@ import msvcrt
 import sys
 
 from src.pipeline.orchestrator import run_once
+from src.pipeline.transcriber import transcribe_audio
 from src.io.audio_windows import Recorder, get_default_input_info
 from src.pipeline.constraints import MAX_SECONDS
 
@@ -85,10 +86,17 @@ def main():
                         print("Press SPACE to try recording again.")
                         continue
 
-                    # Stub transcript (your transcriber step can stay where it is in your other version)
-                    transcript = "A child told a story into the microphone."
                     try:
-                        out_pdf = run_once(transcript)
+                        transcript = transcribe_audio(wav_path)
+                    except Exception as e:
+                        print("❌ Transcription failed:", repr(e))
+                        print("Press SPACE to try recording again.")
+                        continue
+
+                    if not transcript:
+                        transcript = "(No transcript captured.)"
+                    try:
+                        out_pdf = run_once(transcript=transcript)
                         print("📘 Book created:", str(out_pdf.resolve()))
                     except Exception as e:
                         print("❌ Book creation failed:", repr(e))
