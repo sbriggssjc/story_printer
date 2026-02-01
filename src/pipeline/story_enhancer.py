@@ -34,6 +34,14 @@ _DEFAULT_STYLE = os.getenv("STORY_STYLE", "whimsical, funny, heartwarming")
 _MIN_WORDS_PER_PAGE = max(240, _DEFAULT_WORDS_PER_PAGE - 40)
 _MAX_WORDS_PER_PAGE = min(320, _DEFAULT_WORDS_PER_PAGE + 40)
 
+
+def _apply_short_transcript_targets(cleaned_transcript: str) -> None:
+    global _DEFAULT_WORDS_PER_PAGE, _MIN_WORDS_PER_PAGE, _MAX_WORDS_PER_PAGE
+    if _word_count(cleaned_transcript) < 40:
+        _DEFAULT_WORDS_PER_PAGE = 200
+        _MIN_WORDS_PER_PAGE = 180
+        _MAX_WORDS_PER_PAGE = 240
+
 # --- Anti-boilerplate / faithfulness guards ---
 
 # Sentences we NEVER want in OpenAI output (these are showing up verbatim in your PDFs)
@@ -133,6 +141,7 @@ def _fails_fidelity(pages_text: str, must_keywords: list[str]) -> list[str]:
 
 def enhance_to_storybook(transcript: str, *, target_pages: int = 2) -> StoryBook:
     cleaned = _clean_transcript(transcript)
+    _apply_short_transcript_targets(cleaned)
     narrator = _find_name(cleaned) if cleaned else None
     title = _infer_title(cleaned) if cleaned else "My Story"
     subtitle = "A story told out loud"
