@@ -9,37 +9,58 @@ class StoryBook:
     title: str
     subtitle: str
     pages: list[str]
+    narrator: str | None = None
+
+
+_STOPWORDS = {
+    "The",
+    "A",
+    "An",
+    "Once",
+    "When",
+    "Then",
+    "After",
+    "Before",
+    "He",
+    "She",
+    "They",
+    "We",
+    "I",
+    "It",
+    "My",
+    "Our",
+    "Your",
+    "And",
+    "But",
+    "Or",
+    "In",
+    "On",
+    "At",
+    "With",
+    "From",
+    "To",
+}
 
 
 def _clean_transcript(transcript: str) -> str:
     text = (transcript or "").strip()
-    text = re.sub(r"\s+", " ", text)
-    return text
+    if not text:
+        return ""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[\t ]+", " ", text)
+    text = re.sub(r"\n\s*\n", "\n\n", text)
+    paragraphs = []
+    for part in text.split("\n\n"):
+        collapsed = re.sub(r"\s+", " ", part.replace("\n", " ")).strip()
+        if collapsed:
+            paragraphs.append(collapsed)
+    return "\n\n".join(paragraphs).strip()
 
 
 def _find_name(transcript: str) -> str | None:
-    stopwords = {
-        "The",
-        "A",
-        "An",
-        "Once",
-        "When",
-        "Then",
-        "After",
-        "Before",
-        "He",
-        "She",
-        "They",
-        "We",
-        "I",
-        "It",
-        "My",
-        "Our",
-        "Your",
-    }
     for match in re.finditer(r"\b[A-Z][a-z]{2,}\b", transcript):
         name = match.group(0)
-        if name in stopwords:
+        if name in _STOPWORDS:
             continue
         return name
     return None
@@ -49,9 +70,19 @@ def _infer_title(transcript: str) -> str:
     lowered = transcript.lower()
     if "pizza" in lowered:
         return "The Pizza Crust Mystery"
+    if "dragon" in lowered:
+        return "The Dragon's Tale"
+    if "monster" in lowered:
+        return "The Monster's Surprise"
+    if "castle" in lowered:
+        return "The Castle Adventure"
     name = _find_name(transcript)
     if name:
-        return f"A Story About {name}"
+        return f"{name}'s Storybook Adventure"
+    tokens = re.findall(r"[A-Za-z']+", transcript)
+    for token in tokens:
+        if token.capitalize() not in _STOPWORDS and len(token) > 3:
+            return f"The {token.capitalize()} Adventure"
     return "My Story"
 
 
@@ -77,54 +108,65 @@ def _split_long_segment(text: str, max_chars: int) -> list[str]:
     return chunks
 
 
-def _chunk_transcript(transcript: str, min_chars: int = 500, max_chars: int = 900) -> list[str]:
-    sentences = re.split(r"(?<=[.!?])\s+", transcript)
-    pages: list[str] = []
-    buffer: list[str] = []
-    current_len = 0
+def _split_into_sentences(text: str) -> list[str]:
+    if not text:
+        return []
+    return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
 
-    for sentence in sentences:
-        sentence = sentence.strip()
-        if not sentence:
+
+def _chunk_transcript(transcript: str, min_chars: int = 450, max_chars: int = 900) -> list[str]:
+    raw_paragraphs = re.split(r"\n\s*\n", transcript)
+    chunks: list[str] = []
+
+    for raw_paragraph in raw_paragraphs:
+        paragraph = raw_paragraph.strip()
+        if not paragraph:
             continue
-        if len(sentence) > max_chars:
-            if buffer:
-                pages.append(" ".join(buffer))
+        sentences = _split_into_sentences(paragraph)
+        buffer: list[str] = []
+        current_len = 0
+
+        for sentence in sentences:
+            if len(sentence) > max_chars:
+                if buffer:
+                    chunks.append(" ".join(buffer))
+                    buffer = []
+                    current_len = 0
+                chunks.extend(_split_long_segment(sentence, max_chars))
+                continue
+
+            add_len = len(sentence) + (1 if buffer else 0)
+            if current_len + add_len > max_chars:
+                chunks.append(" ".join(buffer))
+                buffer = [sentence]
+                current_len = len(sentence)
+            else:
+                buffer.append(sentence)
+                current_len += add_len
+
+            if current_len >= min_chars:
+                chunks.append(" ".join(buffer))
                 buffer = []
                 current_len = 0
-            pages.extend(_split_long_segment(sentence, max_chars))
-            continue
 
-        add_len = len(sentence) + (1 if buffer else 0)
-        if current_len + add_len > max_chars:
-            pages.append(" ".join(buffer))
-            buffer = [sentence]
-            current_len = len(sentence)
-        else:
-            buffer.append(sentence)
-            current_len += add_len
+        if buffer:
+            chunks.append(" ".join(buffer))
 
-        if current_len >= min_chars:
-            pages.append(" ".join(buffer))
-            buffer = []
-            current_len = 0
-
-    if buffer:
-        pages.append(" ".join(buffer))
-
-    if not pages:
-        pages = [transcript]
-    return pages
+    if not chunks:
+        chunks = [transcript]
+    return chunks
 
 
 def build_storybook(transcript: str, pages: list[str] | None = None) -> StoryBook:
     cleaned = _clean_transcript(transcript)
+    narrator = _find_name(cleaned) if cleaned else None
 
     if pages:
         return StoryBook(
             title=_infer_title(cleaned) if cleaned else "My Story",
             subtitle="A story told out loud",
             pages=pages,
+            narrator=narrator,
         )
 
     if not cleaned:
@@ -135,4 +177,5 @@ def build_storybook(transcript: str, pages: list[str] | None = None) -> StoryBoo
         title=_infer_title(cleaned),
         subtitle="A story told out loud",
         pages=derived_pages,
+        narrator=narrator,
     )

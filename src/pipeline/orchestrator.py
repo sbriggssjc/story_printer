@@ -11,4 +11,5 @@ def run_once(transcript: str, pages: list[str] | None = None) -> Path:
         title=book.title,
         subtitle=book.subtitle,
         pages=book.pages,
+        narrator=book.narrator,
     )
