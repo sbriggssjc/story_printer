@@ -102,7 +102,8 @@ def _build_openai_prompts(cleaned: str, narrator: str | None, target_pages: int)
         f"- Exactly {target_pages} pages.\n"
         "- Page 1: setup + mischief + rising trouble + page-turn hook.\n"
         "- Page 2: big moment + apology + funny resolution + warm ending.\n"
-        "- 1–3 short lines of dialogue across the story total.\n"
+        "- Include 1–3 short dialogue lines TOTAL, using quotation marks ONLY for those lines.\n"
+        "- Do NOT use quotation marks for emphasis, sound effects, or any other purpose.\n"
         "- Use quotation marks for dialogue only, and include exactly 2 quoted lines total. Do not quote anything else.\n"
         "- Kid-safe, whimsical, humorous, creative expansion.\n"
         "- Include sensory details and an emotional arc.\n"
@@ -727,7 +728,7 @@ def _page_expansions(topic: str, name: str, *, stage: str) -> list[str]:
     if stage == "resolution":
         additions.extend(
             [
-                "A chorus of \"It's okay!\" floated through the room, light and sincere.",
+                "A chorus of Its okay! floated through the room, light and sincere.",
                 "They made a new rule: big feelings get big hugs and honest words.",
                 "Someone proposed a celebratory dance, and the floor became a stage.",
                 "A goofy plan turned the problem into a game, and everyone played along.",
@@ -763,6 +764,7 @@ def _expand_text_to_range(
     if rng:
         rng.shuffle(candidates)
     for sentence in candidates:
+        sentence = sentence.replace('"', "").replace("“", "").replace("”", "")
         if used and sentence in used:
             continue
         next_text = f"{current} {sentence}"
@@ -784,9 +786,8 @@ def _word_count(text: str) -> int:
 
 
 def _count_dialogue_lines(text: str) -> int:
-    quoted = re.findall(r'"[^"]+"', text)
-    curly = re.findall(r"“[^”]+”", text)
-    return len(quoted) + len(curly)
+    sentence_start = re.compile(r'(^|[.!?]\s+|\n\s*)(["“])')
+    return sum(1 for _ in sentence_start.finditer(text))
 
 
 def _limit_dialogue_lines(text: str, max_lines: int = 3) -> str:
