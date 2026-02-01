@@ -1,10 +1,7 @@
-from datetime import datetime
 from pathlib import Path
 
-from src.pipeline.book_builder import build_book_pdf
+from src.pipeline.book_builder import make_book_pdf
 from src.pipeline.storyboarder import make_stub_storyboard
-
-OUT_BOOKS = Path("out") / "books"
 
 
 def run_once(transcript: str, pages: list[str] | None = None) -> Path:
@@ -32,16 +29,11 @@ def run_once(transcript: str, pages: list[str] | None = None) -> Path:
             story = make_stub_storyboard(transcript)
         story_title = story.title
 
-    OUT_BOOKS.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_pdf = OUT_BOOKS / f"story_{ts}.pdf"
-
-    build_book_pdf(
-        out_path=out_pdf,
+    return make_book_pdf(
         title=story_title,
+        subtitle="",
         pages=pages,
     )
-    return out_pdf
 
 
 def guess_title_from_transcript(t: str) -> str:
