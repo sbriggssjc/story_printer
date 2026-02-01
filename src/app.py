@@ -1,6 +1,5 @@
 ﻿import time
 import msvcrt
-import sys
 
 from src.pipeline.orchestrator import run_once
 from src.pipeline.transcriber import transcribe_audio
@@ -49,6 +48,9 @@ def main():
             # Non-blocking keyboard polling so Ctrl+C works reliably
             if msvcrt.kbhit():
                 ch = msvcrt.getwch()  # wide-char; returns a string like ' ' or '\x1b'
+
+                if ch == "\x03":
+                    raise KeyboardInterrupt
 
                 # ESC
                 if ch == '\x1b':
