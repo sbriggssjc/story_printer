@@ -257,6 +257,13 @@ def _build_anchor_list(cleaned: str, narrator: str | None) -> list[str]:
     return anchors
 
 
+def _anchor_required_count(anchor_count: int) -> int:
+    if anchor_count <= 0:
+        return 0
+    required = max(2, int(round(0.4 * anchor_count)))
+    return min(required, 4)
+
+
 def _anchor_coverage(page_texts: list[str], anchors: list[str]) -> tuple[bool, str, list[str]]:
     """
     Don't require EVERY anchor. Require a reasonable coverage threshold.
@@ -287,8 +294,7 @@ def _anchor_coverage(page_texts: list[str], anchors: list[str]) -> tuple[bool, s
             missing.append(a)
 
     # Threshold: at least 2 hits, or 40% of anchors (whichever is smaller/higher sensibly)
-    required = max(2, int(round(0.4 * len(anchors))))
-    required = min(required, 4)  # never demand too many
+    required = _anchor_required_count(len(anchors))
 
     ok = hits >= required
     summary = f"anchor coverage: {hits}/{len(anchors)} (required >= {required})"
@@ -322,6 +328,22 @@ def _summarize_fidelity_issues(fidelity_result: dict[str, Any]) -> str:
     if len(missing) > 6:
         preview += ", ..."
     return f"Missing key transcript terms: {preview}"
+
+
+def _build_retry_instruction(missing_terms: list[str], required_count: int, narrator: str | None) -> str:
+    trimmed = [t for t in missing_terms if t]
+    preview = ", ".join(trimmed[:8]) if trimmed else "the transcript anchors listed above"
+    name_note = ""
+    if narrator:
+        name_note = f" Keep protagonist name(s) consistent (e.g., {narrator})."
+    return (
+        "Your last output failed because it didn’t include required transcript anchors. "
+        f"Rewrite the SAME story, but ensure you literally include at least {required_count} of these "
+        f"words/phrases: {preview}. "
+        "Keep the transcript beats consistent (lie/hide → monster → rescue → lesson if present), "
+        "and do not add new major characters."
+        f"{name_note}"
+    )
 
 
 def enhance_to_storybook(transcript: str, *, target_pages: int = 2) -> StoryBook:
@@ -385,13 +407,26 @@ def _build_cover_prompt(title: str, narrator: str | None, cleaned: str) -> str:
     )
 
 
-def _build_openai_prompts(cleaned: str, narrator: str | None, target_pages: int) -> tuple[str, str]:
+def _build_openai_prompts(
+    cleaned: str,
+    narrator: str | None,
+    target_pages: int,
+    required_terms: list[str],
+    required_count: int,
+) -> tuple[str, str]:
     system_prompt = (
         "You are a celebrated children's picture-book author and editor. "
         "Expand the transcript into a rich, creative, kid-safe story (not a summary). "
         "IMPORTANT: stay faithful to the transcript's core plot beats and characters. "
         "Return ONLY strict JSON that follows the schema exactly."
     )
+
+    anchor_requirement = ""
+    if required_terms:
+        sample_terms = ", ".join(required_terms[:8])
+        anchor_requirement = (
+            f"- Must include at least {required_count} of these anchor tokens verbatim: {sample_terms}.\n"
+        )
 
     # We keep constraints, but we repair post-hoc too.
     user_prompt = (
@@ -402,6 +437,9 @@ def _build_openai_prompts(cleaned: str, narrator: str | None, target_pages: int)
         f"- Exactly {target_pages} pages.\n"
         "- Page 1: setup + mischief/choice + rising trouble + page-turn hook.\n"
         "- Page 2: big moment + apology/lesson + funny resolution + warm ending.\n"
+        "- Preserve the transcript's beats; if it includes a lie/hide → monster → rescue → lesson sequence, keep it.\n"
+        "- Keep protagonist name(s) consistent if present.\n"
+        f"{anchor_requirement}"
         f"- Dialogue: {_DIALOGUE_MIN}–{_DIALOGUE_MAX} short quoted lines TOTAL across the entire story.\n"
         f"- About {_MIN_WORDS_PER_PAGE}–{_MAX_WORDS_PER_PAGE} words per page.\n"
         "- Kid-safe, whimsical, humorous, vivid sensory details.\n"
@@ -440,19 +478,30 @@ def _openai_storybook(
 
     print(f"OpenAI model: {_DEFAULT_MODEL}")
 
-    system_prompt, user_prompt = _build_openai_prompts(cleaned, narrator, target_pages)
     anchor_spec = _extract_anchor_spec(cleaned, max_terms=_ANCHOR_MAX_TERMS)
     required_terms = _anchor_terms_for_expansion(anchor_spec, max_terms=_ANCHOR_MAX_TERMS)
+    required_count = _anchor_required_count(len(required_terms))
+    system_prompt, user_prompt = _build_openai_prompts(
+        cleaned,
+        narrator,
+        target_pages,
+        required_terms,
+        required_count,
+    )
     anchors = _build_anchor_list(cleaned, narrator)
 
     # We will try up to 3 attempts, but we also *repair*.
+    retry_instruction = ""
     for attempt in range(3):
-        correction = ""
+        correction_parts: list[str] = []
         if attempt >= 1:
-            correction = (
+            correction_parts.append(
                 "Revise the previous JSON to better satisfy word-count per page, dialogue-count, "
                 "avoid repeated sentences, and stay faithful to the transcript plot."
             )
+        if retry_instruction:
+            correction_parts.append(retry_instruction)
+        correction = "\n".join(correction_parts)
 
         try:
             use_responses = hasattr(client, "responses")
@@ -501,14 +550,11 @@ def _openai_storybook(
 
         if not coverage_ok:
             print(f"Anchor validation failed: {coverage_summary}")
-            if attempt == 0:
-                # Give the model actionable feedback for the retry
-                top_missing = missing[:6]
-                user_prompt = (
-                    f"{user_prompt}\n\nIssues:\n- {coverage_summary}\n"
-                    + (("- Missing anchors (examples):\n- " + "\n- ".join(top_missing) + "\n") if top_missing else "")
-                    + "\nRewrite while preserving the transcript’s core events EXACT. "
-                      "Paraphrase is fine, but include more of the concrete nouns/names from the transcript."
+            if attempt < 2:
+                retry_instruction = _build_retry_instruction(
+                    missing_terms=missing or anchors,
+                    required_count=_anchor_required_count(len(anchors)),
+                    narrator=narrator,
                 )
                 continue
             return None
@@ -519,12 +565,11 @@ def _openai_storybook(
         if not fidelity_result.get("pass", False):
             fidelity_note = _summarize_fidelity_issues(fidelity_result)
             print("Fidelity failed via anchor check.")
-            if attempt == 0:
-                user_prompt = (
-                    f"{user_prompt}\n\nIssues:\n- Fidelity check failed.\n"
-                    f"- {fidelity_note}\n\n"
-                    "Rewrite while keeping the transcript’s core events EXACT. "
-                    "Do not add new major characters, settings, or plot turns not present in the transcript."
+            if attempt < 2:
+                retry_instruction = _build_retry_instruction(
+                    missing_terms=fidelity_result.get("missing") or anchors,
+                    required_count=_anchor_required_count(len(anchors)),
+                    narrator=narrator,
                 )
                 continue
             return None
@@ -538,8 +583,10 @@ def _openai_storybook(
         )
         if not ok:
             print(f"Validation failed: {', '.join(reasons)}")
-            # tighten prompt on subsequent tries by appending issues
-            user_prompt = f"{user_prompt}\n\nIMPORTANT FIXES NEEDED:\n- " + "\n- ".join(reasons)
+            retry_instruction = (
+                "Your last output failed validation. Fix the following issues while keeping the SAME story:\n- "
+                + "\n- ".join(reasons)
+            )
             continue
 
         return StoryBook(
