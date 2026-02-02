@@ -1395,13 +1395,29 @@ def _strip_extra_quotes(text: str, *, allowed: int) -> str:
 
 def _pad_to_min_words(text: str, target_min: int, topic: str, name: str) -> str:
     """
-    If text is under target_min, append non-dialogue expansions until it meets min.
+    Guaranteed padding: keep appending expansions (cycling) until we reach target_min
+    or we’re within a small tolerance and can’t add more without exceeding max.
     """
     if _word_count(text) >= target_min:
         return text
 
-    additions = _page_expansions(topic, name, stage="resolution")
-    return _expand_text_to_range(text, target_min, _MAX_WORDS_PER_PAGE, additions)
+    pool = _page_expansions(topic, name, stage="resolution") + _page_expansions(
+        topic, name, stage="setup"
+    )
+
+    pool = [s.replace('"', "").replace("“", "").replace("”", "") for s in pool]
+
+    current = text
+    for _ in range(50):
+        if _word_count(current) >= target_min:
+            break
+        current = _expand_text_to_range(current, target_min, _MAX_WORDS_PER_PAGE, pool)
+
+        if current == text:
+            break
+        text = current
+
+    return current
 
 
 def _pad_text_to_min_words(text: str, min_words: int) -> str:
