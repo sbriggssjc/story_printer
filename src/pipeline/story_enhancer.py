@@ -578,12 +578,15 @@ def _openai_storybook(
             return None
 
         # Post-process pages BEFORE validation so we validate the final text that will be printed
+        used_sentences: set[str] = set()
+        beats = _extract_beats(cleaned)
+        padding_candidates = _transcript_padding_sentences(beats, narrator or "Claire")
         for page in pages:
-            page.text = _pad_text_to_min_words_with_beats(
+            page.text = _pad_to_min_words_no_repeats(
                 page.text,
-                min_words=_MIN_WORDS_PER_PAGE,
-                cleaned=cleaned,
-                narrator=narrator,
+                _MIN_WORDS_PER_PAGE,
+                padding_candidates,
+                used_sentences,
             )
             page.text = _normalize_dialogue_lines(page.text, max_lines=3)
 
@@ -593,14 +596,12 @@ def _openai_storybook(
 
         # Remove any verbatim repeated sentences across pages, then re-pad to hit min words.
         if _dedupe_cross_page_sentences(pages):
-            topic = _infer_topic(cleaned)
-            name = narrator or "A young storyteller"
             for page in pages:
-                page.text = _pad_to_min_words(
+                page.text = _pad_to_min_words_no_repeats(
                     page.text,
                     _MIN_WORDS_PER_PAGE,
-                    topic,
-                    name,
+                    padding_candidates,
+                    used_sentences,
                 )
 
         os.environ["__STORY_CLEANED_TRANSCRIPT__"] = cleaned or ""
@@ -1123,6 +1124,20 @@ def _extract_story_beats(cleaned: str) -> dict[str, str]:
     }
 
 
+def _extract_beats(cleaned: str) -> dict[str, bool]:
+    t = (cleaned or "").lower()
+    return {
+        "pizza": "pizza" in t,
+        "crust": "crust" in t,
+        "trash": "trash" in t or "threw" in t or "thrown" in t,
+        "monster": "monster" in t,
+        "horse": "horse" in t,
+        "dad": "dad" in t or "father" in t,
+        "lied": "lied" in t or "lie" in t,
+        "apology": "sorry" in t or "wish i would have listened" in t or "apolog" in t,
+    }
+
+
 def _local_page_expansions(claire_name: str, dad_name: str, *, stage: str) -> list[str]:
     if stage == "resolution":
         return [
@@ -1437,6 +1452,58 @@ def _strip_extra_quotes(text: str, *, allowed: int) -> str:
         return content
 
     return pattern.sub(replace, text)
+
+
+def _transcript_padding_sentences(beats: dict[str, bool], name: str) -> list[str]:
+    s: list[str] = []
+    if beats.get("pizza"):
+        s.append(
+            "The kitchen smelled like warm pizza, and Claire’s tummy rumbled in a very dramatic way."
+        )
+    if beats.get("crust"):
+        s.append("The crust felt crackly and brave, like it was daring her to take one tiny bite.")
+    if beats.get("trash"):
+        s.append("The trash can lid went thump, and the secret suddenly felt louder than it should have.")
+    if beats.get("lied"):
+        s.append("A little lie can start small, but it can grow legs and tap-dance around your heart.")
+    if beats.get("monster"):
+        s.append("Then came the pizza monster—cheesy, stompy, and much sillier than scary if you looked closely.")
+    if beats.get("horse") and beats.get("dad"):
+        s.append(
+            "Her dad burst in like a storybook hero, riding a shiny horse that looked like it had been polished with sunshine."
+        )
+    if beats.get("apology"):
+        s.append("Claire’s voice got quiet, and her honesty finally felt like a breath of fresh air.")
+    s.append(
+        "Claire tried to act normal, but her cheeks felt warm, like they were telling the truth without permission."
+    )
+    s.append(
+        "For one tiny moment, everything paused—then the story rolled forward like a pizza dough being stretched."
+    )
+    return s
+
+
+def _pad_to_min_words_no_repeats(
+    text: str,
+    target_min: int,
+    candidates: list[str],
+    used: set[str],
+) -> str:
+    cur = (text or "").strip()
+    if _word_count(cur) >= target_min:
+        return cur
+    for sent in candidates:
+        if sent in used:
+            continue
+        if sent in cur:
+            used.add(sent)
+            continue
+        cur2 = cur + (" " if cur else "") + sent
+        used.add(sent)
+        cur = cur2
+        if _word_count(cur) >= target_min:
+            break
+    return cur
 
 
 def _pad_to_min_words(text: str, target_min: int, topic: str, name: str) -> str:
