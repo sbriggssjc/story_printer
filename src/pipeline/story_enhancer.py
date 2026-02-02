@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import importlib
 import json
+import math
 import os
 import random
 import re
@@ -800,6 +801,230 @@ def _fails_fidelity(pages_text: str, must_keywords: list[str]) -> tuple[list[str
     return reasons, banned_phrases
 
 
+_ANCHOR_SYNONYM_GROUPS = [
+    {"trash can", "trashcan", "garbage", "garbage can", "bin", "trash bin"},
+    {"bicycle", "bike"},
+    {"sofa", "couch"},
+]
+
+
+_COMMON_VERBS = {
+    "asked",
+    "arrived",
+    "ate",
+    "brought",
+    "built",
+    "called",
+    "carried",
+    "caught",
+    "chased",
+    "cleaned",
+    "climbed",
+    "cooked",
+    "cried",
+    "decided",
+    "drew",
+    "drank",
+    "dropped",
+    "drove",
+    "fell",
+    "found",
+    "gave",
+    "got",
+    "grabbed",
+    "heard",
+    "hid",
+    "hit",
+    "hugged",
+    "jumped",
+    "kept",
+    "kicked",
+    "laughed",
+    "left",
+    "lied",
+    "listened",
+    "looked",
+    "lost",
+    "made",
+    "met",
+    "opened",
+    "picked",
+    "played",
+    "pulled",
+    "pushed",
+    "ran",
+    "reached",
+    "rode",
+    "saw",
+    "said",
+    "saved",
+    "shared",
+    "shouted",
+    "sat",
+    "sang",
+    "slept",
+    "spoke",
+    "stood",
+    "told",
+    "threw",
+    "tried",
+    "took",
+    "tripped",
+    "waited",
+    "walked",
+    "wanted",
+    "watched",
+    "went",
+    "wrote",
+}
+
+
+def _extract_key_verbs(cleaned: str, *, max_count: int = 4) -> list[str]:
+    if not cleaned:
+        return []
+    stopwords = {
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "but",
+        "so",
+        "to",
+        "of",
+        "in",
+        "on",
+        "at",
+        "for",
+        "with",
+        "from",
+        "into",
+        "up",
+        "down",
+        "over",
+        "under",
+        "then",
+        "when",
+        "while",
+        "after",
+        "before",
+        "as",
+        "that",
+        "this",
+        "these",
+        "those",
+        "it",
+        "its",
+        "is",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "am",
+        "are",
+        "do",
+        "did",
+        "does",
+        "done",
+        "have",
+        "has",
+        "had",
+        "i",
+        "you",
+        "we",
+        "he",
+        "she",
+        "they",
+        "him",
+        "her",
+        "them",
+        "our",
+        "their",
+        "my",
+        "your",
+        "me",
+    }
+    words = [word.lower() for word in re.findall(r"[A-Za-z']+", cleaned)]
+    verbs: list[str] = []
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if word in stopwords:
+            index += 1
+            continue
+        if word in {"throw", "threw", "thrown"} and index + 1 < len(words):
+            next_word = words[index + 1]
+            if next_word in {"away", "out"}:
+                verbs.append(f"{word} {next_word}")
+                index += 2
+                continue
+        if word in _COMMON_VERBS or word.endswith("ed") or word.endswith("ing"):
+            verbs.append(word)
+        index += 1
+    return _dedupe_preserve_order(verbs)[:max_count]
+
+
+def _extract_anchor_tokens(cleaned: str, narrator: str | None) -> list[str]:
+    names = _extract_proper_names(cleaned, narrator) + _extract_role_characters(cleaned)
+    excluded = set(names)
+    nouns = _extract_noun_phrases(cleaned, min_count=4, max_count=8, excluded=excluded)
+    verbs = _extract_key_verbs(cleaned, max_count=4)
+    tokens = _dedupe_preserve_order(names + nouns + verbs)
+    if len(tokens) < 6:
+        extra_nouns = _extract_noun_phrases(cleaned, min_count=2, max_count=10, excluded=excluded)
+        tokens = _dedupe_preserve_order(tokens + extra_nouns)
+    if len(tokens) < 6:
+        tokens = _dedupe_preserve_order(tokens + verbs)
+    return tokens[:10]
+
+
+def _anchor_token_coverage(
+    story_text: str,
+    anchor_tokens: list[str],
+    *,
+    min_ratio: float = 0.6,
+    min_required: int = 4,
+) -> tuple[bool, str]:
+    if not anchor_tokens:
+        return True, ""
+    text_lower = story_text.lower()
+    group_map: dict[str, set[str]] = {}
+    for group in _ANCHOR_SYNONYM_GROUPS:
+        for term in group:
+            group_map[term] = group
+
+    def contains_term(term: str) -> bool:
+        pattern = r"\b" + re.escape(term.lower()) + r"\b"
+        return re.search(pattern, text_lower) is not None
+
+    found: list[str] = []
+    missing: list[str] = []
+    for token in anchor_tokens:
+        token_lower = token.lower()
+        group = group_map.get(token_lower)
+        if group:
+            if any(contains_term(term) for term in group):
+                found.append(token)
+            else:
+                missing.append(token)
+            continue
+        if contains_term(token_lower):
+            found.append(token)
+        else:
+            missing.append(token)
+
+    required = max(min_required, math.ceil(len(anchor_tokens) * min_ratio))
+    required = min(required, len(anchor_tokens))
+    if len(found) >= required:
+        return True, ""
+    summary = (
+        f"Anchor token coverage too low: {len(found)}/{len(anchor_tokens)} found, "
+        f"need at least {required}. Missing: {', '.join(missing)}."
+    )
+    return False, summary
+
+
 _NEGATION_TERMS = (
     "didn't",
     "did not",
@@ -1185,6 +1410,10 @@ def _openai_storybook(
         anchor_spec, plot_facts, narrator, target_pages
     )
     fidelity_note: str | None = None
+    anchor_tokens = _extract_anchor_tokens(cleaned_transcript, narrator)
+    coverage_note: str | None = None
+
+    repeat_sentence_note: str | None = None
     for attempt in range(2):
         correction = ""
         if attempt == 1:
@@ -1199,11 +1428,11 @@ def _openai_storybook(
                 "- Do not use quotation marks for emphasis or any other purpose.\n"
                 "- Return ONLY JSON matching the schema. No extra keys, no commentary."
             )
-            if fidelity_note:
+            if coverage_note:
                 correction += (
-                    "\nFidelity fixes required (be surgical; keep tone and length):\n"
-                    f"{fidelity_note}\n"
-                    "Fix the specific beats/contradictions only; keep page order and structure."
+                    "\nAnchor token coverage fixes required (be surgical; keep tone and length):\n"
+                    f"{coverage_note}\n"
+                    "Improve coverage without adding new major plotlines."
                 )
         try:
             if client:
@@ -1276,7 +1505,7 @@ def _openai_storybook(
                 user_prompt = (
                     f"{user_prompt}\n\nIssues:\n- "
                     + "\n- ".join([f"contains banned filler phrase: {p}" for p in banned_phrases])
-                    + "\n\nRewrite while keeping the anchor beats EXACT."
+                    + "\n\nRewrite while preserving the anchor beats (paraphrase allowed)."
                 )
                 continue
             return None
@@ -1296,36 +1525,16 @@ def _openai_storybook(
                 continue
             return None
 
-        story_payload = {
-            "title": (data.get("title") or title).strip() or title,
-            "subtitle": (data.get("subtitle") or "A story told out loud").strip()
-            or "A story told out loud",
-            "narrator": data.get("narrator") or narrator,
-            "pages": [
-                {"text": page.text, "illustration_prompt": page.illustration_prompt}
-                for page in pages
-            ],
-        }
-        try:
-            if client:
-                use_responses = hasattr(client, "responses")
-                fidelity_result = _request_openai_fidelity_check(
-                    client, anchor_spec, story_payload, use_responses
-                )
-                print("OpenAI fidelity check: SDK")
-            else:
-                fidelity_result, fidelity_endpoint = _request_openai_fidelity_http(
-                    anchor_spec, story_payload
-                )
-                print(f"OpenAI fidelity check: HTTP ({fidelity_endpoint})")
-        except Exception as exc:
-            print(f"OpenAI fidelity check failed: {exc}")
-            fidelity_result = {"pass": True}
-
-        if not fidelity_result.get("pass", False):
-            fidelity_note = _summarize_fidelity_issues(fidelity_result)
-            print("Fidelity failed via anchor check.")
+        coverage_ok, coverage_summary = _anchor_token_coverage(all_text, anchor_tokens)
+        if not coverage_ok:
+            coverage_note = coverage_summary
+            print("Fidelity failed via anchor token coverage.")
             if attempt == 0:
+                user_prompt = (
+                    f"{user_prompt}\n\nIssues:\n- "
+                    + coverage_summary
+                    + "\n\nRewrite to include more of the anchor tokens from the transcript."
+                )
                 continue
             return None
 
