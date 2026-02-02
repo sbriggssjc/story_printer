@@ -461,7 +461,7 @@ def _build_openai_prompts(
         f"- Exactly {target_pages} pages.\n"
         "- Page 1: setup + mischief + rising trouble + page-turn hook.\n"
         "- Page 2: big moment + apology + funny resolution + warm ending.\n"
-        "- Use exactly 2 quoted dialogue lines total, each on its own line starting with '- ' or '— '.\n"
+        "- Exactly two dialogue lines total. Each must be a full sentence in quotes on its own line starting with '- ' or '— '.\n"
         "- Dialogue must be short (<= 12 words each) and natural.\n"
         "- Do not use quotation marks for emphasis or any other purpose.\n"
         "- Kid-safe, whimsical, humorous, creative expansion.\n"
@@ -531,8 +531,8 @@ def _openai_storybook(
                 "Rewrite the story to satisfy ALL requirements:\n"
                 f"- EXACTLY {target_pages} pages.\n"
                 f"- EACH page MUST be between {_MIN_WORDS_PER_PAGE} and {_MAX_WORDS_PER_PAGE} words.\n"
-                '- Use exactly 2 quoted dialogue lines total using straight quotes, e.g. "...".\n'
-                "- Each dialogue line must be short (<= 12 words), natural, and appear on its own line starting with '- ' or '— '.\n"
+                '- Exactly two dialogue lines total using straight quotes, e.g. "...". Each must be a full sentence on its own line starting with "- " or "— ".\n'
+                "- Each dialogue line must be short (<= 12 words) and natural.\n"
                 "- Do not use quotation marks for emphasis or any other purpose.\n"
                 "- Return ONLY JSON matching the schema. No extra keys, no commentary."
             )
@@ -588,11 +588,11 @@ def _openai_storybook(
                 padding_candidates,
                 used_sentences,
             )
-            page.text = _normalize_dialogue_lines(page.text, max_lines=3)
+            page.text = _normalize_dialogue_lines(page.text, max_lines=2)
 
         total_dialogue = sum(_count_dialogue_lines(page.text) for page in pages)
-        if total_dialogue < 1:
-            pages[-1].text = _ensure_dialogue_count(pages[-1].text, target_lines=1)
+        if total_dialogue < 2:
+            pages[-1].text = _ensure_dialogue_count(pages[-1].text, target_lines=2)
 
         # Remove any verbatim repeated sentences across pages, then re-pad to hit min words.
         if _dedupe_cross_page_sentences(pages):
@@ -1020,10 +1020,8 @@ def _validate_story_data(data: Any, target_pages: int) -> tuple[bool, list[str]]
     if missing:
         reasons.append(f"missing required transcript term(s): {missing}")
 
-    if total_dialogue < 1 or total_dialogue > 3:
-        reasons.append(
-            f"dialogue lines counted {total_dialogue} but expected between 1 and 3"
-        )
+    if total_dialogue != 2:
+        reasons.append(f"dialogue lines counted {total_dialogue} but expected 2")
     return (len(reasons) == 0, reasons)
 
 
@@ -1070,10 +1068,8 @@ def _validate_story_pages(pages: list[StoryPage], target_pages: int) -> tuple[bo
     if missing:
         reasons.append(f"missing required transcript term(s): {missing}")
 
-    if total_dialogue < 1 or total_dialogue > 3:
-        reasons.append(
-            f"dialogue lines counted {total_dialogue} but expected between 1 and 3"
-        )
+    if total_dialogue != 2:
+        reasons.append(f"dialogue lines counted {total_dialogue} but expected 2")
 
     return (len(reasons) == 0, reasons)
 
@@ -1374,11 +1370,11 @@ def _word_count(text: str) -> int:
 
 
 def _count_dialogue_lines(text: str) -> int:
-    line_start = re.compile(r"^\s*[-—]\s+", re.MULTILINE)
+    line_start = re.compile(r'^\s*[-—]\s+["“].+["”]\s*$', re.MULTILINE)
     return sum(1 for _ in line_start.finditer(text))
 
 
-def _limit_dialogue_lines(text: str, max_lines: int = 3) -> str:
+def _limit_dialogue_lines(text: str, max_lines: int = 2) -> str:
     """
     Keeps the first max_lines dialogue lines, removes leading markers from the rest
     so they no longer count as dialogue lines.
@@ -1404,8 +1400,8 @@ def _ensure_dialogue_count(text: str, target_lines: int = 2) -> str:
         return text
 
     additions = [
-        "- We can fix it.",
-        "- That was silly.",
+        '- "We can fix it."',
+        '- "That was silly."',
     ]
     needed = target_lines - current
     extra = "\n".join(additions[:needed])
@@ -1413,7 +1409,7 @@ def _ensure_dialogue_count(text: str, target_lines: int = 2) -> str:
     return f"{text.rstrip()}{separator}{extra}".strip()
 
 
-def _normalize_dialogue_lines(text: str, max_lines: int = 3) -> str:
+def _normalize_dialogue_lines(text: str, max_lines: int = 2) -> str:
     """
     Keep up to max_lines of dialogue. Any extra dialogue lines or quoted segments
     are rewritten into plain narration (no quotes).
