@@ -596,7 +596,6 @@ def _request_openai_story(
             *([{"role": "user", "content": correction}] if correction else []),
         ],
         temperature=_DEFAULT_TEMPERATURE,
-        response_format={"type": "json_object"},
     )
     return response.choices[0].message.content if response.choices else ""
 
