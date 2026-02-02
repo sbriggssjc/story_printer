@@ -871,26 +871,29 @@ def _maybe_generate_images(story: StoryBook) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # 1) Cover image
-    cover_prompt = (getattr(story, "cover_prompt", None) or "").strip()
-    if cover_prompt:
-        try:
-            resp = client.images.generate(
-                model="gpt-image-1",
-                prompt=cover_prompt,
-                size="1024x1024",
-            )
-            data = resp.data[0] if resp.data else None
-            if data:
-                cover_path = out_dir / f"story_{timestamp}_cover.png"
-                if getattr(data, "b64_json", None):
-                    cover_path.write_bytes(base64.b64decode(data.b64_json))
-                    story.cover_image_path = str(cover_path)
-                elif getattr(data, "url", None):
-                    request.urlretrieve(data.url, cover_path)
-                    story.cover_image_path = str(cover_path)
-        except Exception:
-            pass
+    # 1) Cover art (no text rendered; leave space for title)
+    try:
+        cover_prompt = (
+            "Watercolor children's picture book cover illustration. "
+            f"Title: {story.title!r}. "
+            f"Main characters: {story.narrator or 'the child and a parent'}. "
+            "Scene inspired by the story (but do not include any words or letters). "
+            "Leave a clean, empty area near the top for the title to be placed later. "
+            "Warm, whimsical, cinematic lighting, cozy picture-book style."
+        )
+        cover_resp = client.images.generate(
+            model="gpt-image-1",
+            prompt=cover_prompt,
+            size="1024x1024",
+        )
+        cover_data = cover_resp.data[0] if getattr(cover_resp, "data", None) else None
+        if cover_data and getattr(cover_data, "b64_json", None):
+            cover_path = out_dir / f"cover_{timestamp}.png"
+            cover_path.write_bytes(base64.b64decode(cover_data.b64_json))
+            story.cover_image_path = str(cover_path)
+    except Exception:
+        # Cover art is optional; don't fail the run if it errors.
+        pass
 
     # 2) Page images
     for index, page in enumerate(story.pages, start=1):
@@ -916,7 +919,7 @@ def _maybe_generate_images(story: StoryBook) -> None:
             else:
                 continue
 
-            page.illustration_path = str(image_path)
             page.image_path = str(image_path)
+            page.illustration_path = str(image_path)  # back-compat
         except Exception:
             continue
