@@ -55,6 +55,7 @@ def _clean_transcript(transcript: str) -> str:
         return ""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[\t ]+", " ", text)
+    text = re.sub(r"^\s*(this|here)\s+is\s+(a\s+)?story\s+about\s+", "", text, flags=re.I)
     text = re.sub(r"\[(?:inaudible|noise|music|laughs?|crosstalk)\]", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s+([,;:.!?])", r"\1", text)
     text = re.sub(r"([,;:.!?])([^\s])", r"\1 \2", text)
