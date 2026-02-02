@@ -337,8 +337,9 @@ def _extract_fidelity_keywords(cleaned: str) -> list[str]:
     return must[:4]
 
 
-def _fails_fidelity(pages_text: str, must_keywords: list[str]) -> list[str]:
+def _fails_fidelity(pages_text: str, must_keywords: list[str]) -> tuple[list[str], list[str]]:
     reasons = []
+    banned_phrases = []
     low = pages_text.lower()
     for k in must_keywords:
         if k not in low:
@@ -346,7 +347,8 @@ def _fails_fidelity(pages_text: str, must_keywords: list[str]) -> list[str]:
     for phrase in _BANNED_PHRASES:
         if phrase.lower() in low:
             reasons.append(f"contains banned filler phrase: {phrase}")
-    return reasons
+            banned_phrases.append(phrase)
+    return reasons, banned_phrases
 
 
 def enhance_to_storybook(transcript: str, *, target_pages: int = 2) -> StoryBook:
@@ -426,10 +428,9 @@ def _build_openai_prompts(
         f"- Exactly {target_pages} pages.\n"
         "- Page 1: setup + mischief + rising trouble + page-turn hook.\n"
         "- Page 2: big moment + apology + funny resolution + warm ending.\n"
-        '- Exactly 2 lines of dialogue total, both MUST be in quotes.\n'
-        "- The two dialogue lines must be short (<= 12 words each) and must appear in the story text.\n"
-        "- Use quotation marks only for spoken dialogue. Do not quote signs, thoughts, or emphasis.\n"
-        "- Do NOT use quotation marks for emphasis, sound effects, or any other purpose.\n"
+        "- Use 1–3 dialogue lines total, each on its own line starting with '- ' or '— '.\n"
+        "- The dialogue lines must be short (<= 12 words each) and must appear in the story text.\n"
+        "- Do not use quotation marks anywhere in the story text.\n"
         "- Kid-safe, whimsical, humorous, creative expansion.\n"
         "- Include sensory details and an emotional arc.\n"
         "- Avoid repeating filler sentences or stock phrases.\n"
@@ -498,6 +499,9 @@ def _openai_storybook(
                 f"- EACH page MUST be between {_MIN_WORDS_PER_PAGE} and {_MAX_WORDS_PER_PAGE} words.\n"
                 '- Include EXACTLY 2 short dialogue lines using straight quotes, e.g. "...".\n'
                 "- Return ONLY JSON matching the schema. No extra keys, no commentary.\n"
+                "- Use 1–3 short dialogue lines total, each on its own line starting with '- ' or '— '.\n"
+                "- Do not use quotation marks anywhere in the story text.\n"
+                "- Return ONLY JSON matching the schema. No extra keys, no commentary."
             )
             if missing_anchor_note:
                 correction += (
@@ -543,11 +547,11 @@ def _openai_storybook(
         # Post-process pages BEFORE validation so we validate the final text that will be printed
         for page in pages:
             page.text = _pad_text_to_min_words(page.text, min_words=_MIN_WORDS_PER_PAGE)
-            page.text = _limit_dialogue_lines(page.text, max_lines=2)
+            page.text = _limit_dialogue_lines(page.text, max_lines=3)
 
         total_dialogue = sum(_count_dialogue_lines(page.text) for page in pages)
-        if total_dialogue < 2:
-            pages[-1].text = _ensure_dialogue_count(pages[-1].text, target_lines=2)
+        if total_dialogue < 1:
+            pages[-1].text = _ensure_dialogue_count(pages[-1].text, target_lines=1)
 
         os.environ["__STORY_CLEANED_TRANSCRIPT__"] = cleaned or ""
         valid, reasons = _validate_story_pages(pages, target_pages)
@@ -572,14 +576,22 @@ def _openai_storybook(
             ]
         )
         must = _extract_fidelity_keywords(cleaned)
-        fidelity_reasons = _fails_fidelity(all_text, must)
+        fidelity_reasons, banned_phrases = _fails_fidelity(all_text, must)
         if fidelity_reasons:
             print(f"Fidelity failed: {', '.join(fidelity_reasons)}")
             if attempt == 0:
+                retry_instruction = ""
+                if banned_phrases:
+                    retry_instruction = (
+                        "\nDo not use any of these phrases: "
+                        + "; ".join(banned_phrases)
+                        + ". Replace them with fresh, specific detail from the transcript."
+                    )
                 user_prompt = (
-                    f"{user_prompt}\n\nFidelity issues:\n- "
+                    f"{user_prompt}\n\nIssues:\n- "
                     + "\n- ".join(fidelity_reasons)
                     + "\n\nRewrite while keeping the transcript’s core events EXACT."
+                    + retry_instruction
                 )
                 continue
             return None
@@ -957,8 +969,10 @@ def _validate_story_data(data: Any, target_pages: int) -> tuple[bool, list[str]]
     if missing:
         reasons.append(f"missing required transcript term(s): {missing}")
 
-    if total_dialogue != 2:
-        reasons.append(f"dialogue lines counted {total_dialogue} but expected exactly 2")
+    if total_dialogue < 1 or total_dialogue > 3:
+        reasons.append(
+            f"dialogue lines counted {total_dialogue} but expected between 1 and 3"
+        )
     return (len(reasons) == 0, reasons)
 
 
@@ -1005,8 +1019,10 @@ def _validate_story_pages(pages: list[StoryPage], target_pages: int) -> tuple[bo
     if missing:
         reasons.append(f"missing required transcript term(s): {missing}")
 
-    if total_dialogue != 2:
-        reasons.append(f"dialogue lines counted {total_dialogue} but expected exactly 2")
+    if total_dialogue < 1 or total_dialogue > 3:
+        reasons.append(
+            f"dialogue lines counted {total_dialogue} but expected between 1 and 3"
+        )
 
     return (len(reasons) == 0, reasons)
 
@@ -1043,7 +1059,8 @@ def _local_storybook(
         f"On a bright afternoon, {name} felt a fizz of curiosity about {topic}. "
         f"The day began with a giggle and a whisper of adventure, and soon a playful idea popped up: {snippet}. "
         "At first it seemed tiny and harmless, like a secret tucked in a sock, but the air started to buzz. "
-        f"\"Should we tell?\" someone whispered, and {name} grinned, watching the idea wobble bigger. "
+        f"Someone whispered:\n- Should we tell?\n"
+        f"{name} grinned, watching the idea wobble bigger. "
         "A silly misunderstanding bounced from friend to friend, and even the pets looked suspicious. "
         "By the time the sun slid behind a cloud, the mix-up had become a swirl of whispers and wide eyes, "
         "and the next step was about to land with a thump."
@@ -1059,7 +1076,8 @@ def _local_storybook(
 
     page2 = (
         "With a deep breath and a brave heart, the truth finally tumbled out. "
-        f"\"I did it,\" {name} said, and the room froze for one tiny second before melting into relieved smiles. "
+        f"{name} admitted it aloud:\n- I did it.\n"
+        "The room froze for one tiny second before melting into relieved smiles. "
         f"Together they turned the problem into a plan, transforming {topic} into a funny, shared solution. "
         "There was an apology that sounded like a warm hug and a giggle that sounded like bells. "
         "Everyone joined in to fix the mix-up, and the story swung toward a cozy, happy ending. "
@@ -1231,63 +1249,43 @@ def _word_count(text: str) -> int:
 
 
 def _count_dialogue_lines(text: str) -> int:
-    sentence_start = re.compile(r'(^|[.!?]\s+|\n\s*)(["“])')
-    return sum(1 for _ in sentence_start.finditer(text))
+    line_start = re.compile(r"^\s*[-—]\s+", re.MULTILINE)
+    return sum(1 for _ in line_start.finditer(text))
 
 
 def _limit_dialogue_lines(text: str, max_lines: int = 3) -> str:
     """
-    Keeps the first max_lines quoted segments, removes quotation marks from the rest
+    Keeps the first max_lines dialogue lines, removes leading markers from the rest
     so they no longer count as dialogue lines.
     """
-    patterns = [
-        r'"[^"]+"',
-        r"“[^”]+”",
-    ]
-
-    matches: list[tuple[int, int]] = []
-    for pattern in patterns:
-        for match in re.finditer(pattern, text):
-            matches.append((match.start(), match.end()))
-    matches.sort(key=lambda item: item[0])
-
-    if len(matches) <= max_lines:
-        return text
-
-    out: list[str] = []
-    last = 0
-    for index, (start, end) in enumerate(matches):
-        out.append(text[last:start])
-        segment = text[start:end]
-        if index < max_lines:
-            out.append(segment)
-        else:
-            if segment.startswith('"') and segment.endswith('"'):
-                out.append(segment[1:-1])
-            elif segment.startswith("“") and segment.endswith("”"):
-                out.append(segment[1:-1])
-            else:
-                out.append(segment)
-        last = end
-    out.append(text[last:])
-    return "".join(out)
+    lines = text.splitlines(keepends=True)
+    dialogue_count = 0
+    updated: list[str] = []
+    for line in lines:
+        if re.match(r"^\s*[-—]\s+", line):
+            dialogue_count += 1
+            if dialogue_count > max_lines:
+                line = re.sub(r"^(\s*)[-—]\s+", r"\1", line)
+        updated.append(line)
+    return "".join(updated)
 
 
 def _ensure_dialogue_count(text: str, target_lines: int = 2) -> str:
     """
-    Ensure the text includes exactly target_lines of quoted dialogue by appending short lines.
+    Ensure the text includes at least target_lines of dialogue by appending short lines.
     """
     current = _count_dialogue_lines(text)
     if current >= target_lines:
         return text
 
     additions = [
-        '"We can fix it," she said.',
-        '"That was silly," he laughed.',
+        "- We can fix it.",
+        "- That was silly.",
     ]
     needed = target_lines - current
-    extra = " ".join(additions[:needed])
-    return f"{text.rstrip()} {extra}".strip()
+    extra = "\n".join(additions[:needed])
+    separator = "\n" if text.rstrip() else ""
+    return f"{text.rstrip()}{separator}{extra}".strip()
 
 
 def _pad_to_min_words(text: str, target_min: int, topic: str, name: str) -> str:
