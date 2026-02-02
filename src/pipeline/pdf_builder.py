@@ -59,7 +59,7 @@ def _draw_cover_page(
     title: str,
     subtitle: str,
     narrator: str | None,
-    cover_image_path: str | None,
+    cover_illustration_path: str | None,
 ) -> None:
     cover_title = (title or "My Story").strip()
     cover_subtitle = (subtitle or "").strip()
@@ -86,13 +86,24 @@ def _draw_cover_page(
         )
         offset += 0.6 * margin
 
-    if cover_image_path and Path(cover_image_path).exists():
-        img = ImageReader(cover_image_path)
+    if cover_illustration_path and Path(cover_illustration_path).exists():
+        img = ImageReader(cover_illustration_path)
         box_w = page_width - 2 * margin
-        box_h = page_height * 0.45
-        box_x = margin
-        box_y = page_height * 0.25
-        canvas_pdf.drawImage(img, box_x, box_y, box_w, box_h, preserveAspectRatio=True, anchor="c")
+        top_y = page_height - offset - (0.5 * margin)
+        bottom_y = margin * 2
+        if top_y > bottom_y:
+            box_h = top_y - bottom_y
+            box_x = margin
+            box_y = bottom_y
+            canvas_pdf.drawImage(
+                img,
+                box_x,
+                box_y,
+                box_w,
+                box_h,
+                preserveAspectRatio=True,
+                anchor="c",
+            )
 
     today = datetime.now().strftime("%B %d, %Y")
     canvas_pdf.setFont("Helvetica", 11)
@@ -116,7 +127,7 @@ def render_story_pdf(
     pages: list[str] | list[StoryPage],
     out_pdf: Path,
     narrator: str | None = None,
-    cover_image_path: str | None = None,
+    cover_illustration_path: str | None = None,
 ) -> Path:
     out_pdf = Path(out_pdf)
     out_pdf.parent.mkdir(parents=True, exist_ok=True)
@@ -134,7 +145,7 @@ def render_story_pdf(
         title=title,
         subtitle=subtitle,
         narrator=narrator,
-        cover_image_path=cover_image_path,
+        cover_illustration_path=cover_illustration_path,
     )
 
     body_font = "Helvetica"
