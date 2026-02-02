@@ -428,9 +428,9 @@ def _build_openai_prompts(
         f"- Exactly {target_pages} pages.\n"
         "- Page 1: setup + mischief + rising trouble + page-turn hook.\n"
         "- Page 2: big moment + apology + funny resolution + warm ending.\n"
-        "- Use 1–3 dialogue lines total, each on its own line starting with '- ' or '— '.\n"
-        "- The dialogue lines must be short (<= 12 words each) and must appear in the story text.\n"
-        "- Do not use quotation marks anywhere in the story text.\n"
+        "- Use exactly 2 quoted dialogue lines total, each on its own line starting with '- ' or '— '.\n"
+        "- Dialogue must be short (<= 12 words each) and natural.\n"
+        "- Do not use quotation marks for emphasis or any other purpose.\n"
         "- Kid-safe, whimsical, humorous, creative expansion.\n"
         "- Include sensory details and an emotional arc.\n"
         "- Avoid repeating filler sentences or stock phrases.\n"
@@ -497,10 +497,9 @@ def _openai_storybook(
                 "Rewrite the story to satisfy ALL requirements:\n"
                 f"- EXACTLY {target_pages} pages.\n"
                 f"- EACH page MUST be between {_MIN_WORDS_PER_PAGE} and {_MAX_WORDS_PER_PAGE} words.\n"
-                '- Include EXACTLY 2 short dialogue lines using straight quotes, e.g. "...".\n'
-                "- Return ONLY JSON matching the schema. No extra keys, no commentary.\n"
-                "- Use 1–3 short dialogue lines total, each on its own line starting with '- ' or '— '.\n"
-                "- Do not use quotation marks anywhere in the story text.\n"
+                '- Use exactly 2 quoted dialogue lines total using straight quotes, e.g. "...".\n'
+                "- Each dialogue line must be short (<= 12 words), natural, and appear on its own line starting with '- ' or '— '.\n"
+                "- Do not use quotation marks for emphasis or any other purpose.\n"
                 "- Return ONLY JSON matching the schema. No extra keys, no commentary."
             )
             if missing_anchor_note:
