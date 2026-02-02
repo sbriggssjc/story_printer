@@ -18,6 +18,8 @@ class StoryBook:
     pages: list[StoryPage]
     narrator: str | None = None
     cover_path: str | None = None
+    cover_illustration_prompt: str | None = None
+    cover_illustration_path: str | None = None
 
 
 _STOPWORDS = {

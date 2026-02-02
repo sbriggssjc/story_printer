@@ -1511,8 +1511,9 @@ def _cover_prompt(story: StoryBook, cleaned: str) -> str:
     beats = _extract_beats(cleaned)
     main_character = story.narrator or "a cheerful child"
     parts = [
-        "Watercolor children's picture book cover illustration, cozy and whimsical, no text.",
-        f"Theme: {story.title}.",
+        f"Cover illustration for a children's picture book titled '{story.title}'.",
+        "Include the main characters in a cozy, whimsical scene.",
+        "Watercolor style, storybook composition, no text.",
     ]
     if beats.get("pizza"):
         parts.append("A pizza on a table, warm kitchen light.")
@@ -1974,6 +1975,7 @@ def _maybe_generate_images(story: StoryBook, cleaned: str) -> None:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     cover_prompt = _cover_prompt(story, cleaned)
+    story.cover_illustration_prompt = cover_prompt
     try:
         cover_response = client.images.generate(
             model="gpt-image-1",
@@ -1990,6 +1992,7 @@ def _maybe_generate_images(story: StoryBook, cleaned: str) -> None:
             cover_bytes = base64.b64decode(cover_data.b64_json)
             cover_path.write_bytes(cover_bytes)
             story.cover_path = str(cover_path)
+            story.cover_illustration_path = str(cover_path)
         elif getattr(cover_data, "url", None):
             try:
                 request.urlretrieve(cover_data.url, cover_path)
@@ -1997,6 +2000,7 @@ def _maybe_generate_images(story: StoryBook, cleaned: str) -> None:
                 cover_path = None
             else:
                 story.cover_path = str(cover_path)
+                story.cover_illustration_path = str(cover_path)
 
     for index, page in enumerate(story.pages, start=1):
         prompt = page.illustration_prompt or "A cozy children's storybook illustration."
