@@ -40,10 +40,19 @@ _MAX_WORDS_PER_PAGE = min(320, _DEFAULT_WORDS_PER_PAGE + 40)
 
 def _apply_short_transcript_targets(cleaned_transcript: str) -> None:
     global _DEFAULT_WORDS_PER_PAGE, _MIN_WORDS_PER_PAGE, _MAX_WORDS_PER_PAGE
-    if _word_count(cleaned_transcript) < 40:
-        _DEFAULT_WORDS_PER_PAGE = 200
-        _MIN_WORDS_PER_PAGE = 180
-        _MAX_WORDS_PER_PAGE = 240
+    transcript_words = _word_count(cleaned_transcript)
+    if transcript_words < 70:
+        _MIN_WORDS_PER_PAGE = 160
+        _MAX_WORDS_PER_PAGE = 260
+        _DEFAULT_WORDS_PER_PAGE = 210
+    elif transcript_words < 140:
+        _MIN_WORDS_PER_PAGE = 200
+        _MAX_WORDS_PER_PAGE = 300
+        _DEFAULT_WORDS_PER_PAGE = 250
+    else:
+        _MIN_WORDS_PER_PAGE = 240
+        _MAX_WORDS_PER_PAGE = 320
+        _DEFAULT_WORDS_PER_PAGE = min(max(_DEFAULT_WORDS_PER_PAGE, 240), 320)
 
 # --- Anti-boilerplate / faithfulness guards ---
 
