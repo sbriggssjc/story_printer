@@ -1631,7 +1631,11 @@ def _rule_based_contradictions(
 
     for obj in key_objects:
         obj_pattern = r"\b%s\b" % re.escape(obj.lower())
-        if not _has_term_near_object(transcript, negation_pattern, obj_pattern):
+        transcript_negates = _has_term_near_object(transcript, negation_pattern, obj_pattern)
+        if not transcript_negates:
+            continue
+        transcript_affirms = _has_term_near_object(transcript, positive_pattern, obj_pattern)
+        if transcript_affirms:
             continue
         if _has_term_near_object(story_text, positive_pattern, obj_pattern):
             contradictions.append(
