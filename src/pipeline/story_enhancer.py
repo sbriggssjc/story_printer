@@ -8,6 +8,8 @@ Environment variables:
 - STORY_TARGET_PAGES: number of pages to generate (default: "2").
 - STORY_WORDS_PER_PAGE: word count target per page (default: "260").
 - STORY_STYLE: story tone/style (default: "whimsical, funny, heartwarming").
+- STORY_VOICE_MODE: "kid" (default) or "standard".
+- STORY_FIDELITY_MODE: "fun" (default) or "strict".
 
 Optional robustness knobs:
 - STORY_DIALOGUE_MIN: minimum dialogue lines across the whole story (default: 1)
@@ -37,6 +39,14 @@ _DEFAULT_TEMPERATURE = float(os.getenv("STORY_TEMPERATURE", "0.7"))
 _DEFAULT_TARGET_PAGES = int(os.getenv("STORY_TARGET_PAGES", "2"))
 _DEFAULT_WORDS_PER_PAGE = int(os.getenv("STORY_WORDS_PER_PAGE", "260"))
 _DEFAULT_STYLE = os.getenv("STORY_STYLE", "whimsical, funny, heartwarming")
+
+_VOICE_MODE = os.getenv("STORY_VOICE_MODE", "kid").strip().lower()
+if _VOICE_MODE not in {"kid", "standard"}:
+    _VOICE_MODE = "kid"
+
+_FIDELITY_MODE = os.getenv("STORY_FIDELITY_MODE", "fun").strip().lower()
+if _FIDELITY_MODE not in {"fun", "strict"}:
+    _FIDELITY_MODE = "fun"
 
 # Keep ranges forgiving; enforce via postprocessing.
 _MIN_WORDS_PER_PAGE = max(200, _DEFAULT_WORDS_PER_PAGE - 60)
@@ -415,22 +425,34 @@ def _build_retry_instruction(missing_terms: list[str], required_count: int, narr
     )
 
 
+def _resolve_display_name(narrator: str | None) -> str | None:
+    if not narrator:
+        return None
+    cleaned = " ".join(narrator.split()).strip()
+    if not cleaned:
+        return None
+    if cleaned.lower() == "claire":
+        return "Claire"
+    return cleaned
+
+
 def enhance_to_storybook(transcript: str, *, target_pages: int = 2) -> StoryBook:
     cleaned = _clean_transcript(transcript)
     story_cleaned = _clean_transcript_for_story(cleaned)
     narrator = _find_name(story_cleaned) if story_cleaned else None
+    display_name = _resolve_display_name(narrator)
     title = _infer_title(story_cleaned) if story_cleaned else "My Story"
     subtitle = "A story told out loud"
     target_pages = target_pages or _DEFAULT_TARGET_PAGES
 
     if _is_openai_story_requested():
         print("STORY_ENHANCE_MODE=openai detected")
-        openai_story = _openai_storybook(story_cleaned, title, narrator, target_pages)
+        openai_story = _openai_storybook(story_cleaned, title, narrator, display_name, target_pages)
         if openai_story:
             _maybe_generate_images(openai_story)
             return openai_story
 
-    local_story = _local_storybook(story_cleaned, title, narrator, target_pages)
+    local_story = _local_storybook(story_cleaned, title, narrator, display_name, target_pages)
     _maybe_generate_images(local_story)
     return local_story
 
@@ -480,10 +502,49 @@ def _build_cover_prompt(title: str, narrator: str | None, cleaned: str) -> str:
 def _build_openai_prompts(
     cleaned: str,
     narrator: str | None,
+    display_name: str | None,
     target_pages: int,
     required_terms: list[str],
     required_count: int,
 ) -> tuple[str, str]:
+    voice_notes = ""
+    if _VOICE_MODE == "kid":
+        voice_notes = (
+            "- Voice: short sentences. Simple vocabulary. Use more first-person voice "
+            "(I/we) when it fits. Avoid words like: brandishing, momentarily, zesty, "
+            "mischief, gleaming, distracted.\n"
+        )
+    else:
+        voice_notes = "- Voice: natural picture-book narration with varied sentence lengths.\n"
+
+    fidelity_notes = ""
+    if _FIDELITY_MODE == "strict":
+        fidelity_notes = (
+            "- Fidelity mode: STRICT. Do not add new characters or objects beyond transcript anchors. "
+            "Only mild sensory adjectives are allowed.\n"
+        )
+    else:
+        fidelity_notes = (
+            "- Fidelity mode: FUN. Whimsical embellishments are allowed if they fit the transcript.\n"
+        )
+
+    name_guidance = ""
+    if display_name:
+        if display_name == "Claire":
+            name_guidance = (
+                "- Use the display name exactly as “Claire” throughout the cover and page text. "
+                "Do NOT use “Claire Briggs.”\n"
+            )
+        elif len(display_name.split()) >= 2:
+            name_guidance = (
+                f"- Use the full name “{display_name}” consistently in the cover and body text ("
+                "do not switch to first-name-only).\n"
+            )
+        else:
+            name_guidance = (
+                f"- Use the display name “{display_name}” consistently and do not invent a last name.\n"
+            )
+
     system_prompt = (
         "You are a celebrated children's picture-book author and editor. "
         "Expand the transcript into a rich, creative, kid-safe story (not a summary). "
@@ -499,20 +560,27 @@ def _build_openai_prompts(
         )
 
     # We keep constraints, but we repair post-hoc too.
+    page1_beat = "setup + playful choice + rising trouble + page-turn hook"
+    if _VOICE_MODE != "kid":
+        page1_beat = "setup + mischief/choice + rising trouble + page-turn hook"
+
     user_prompt = (
         "TRANSCRIPT (idea source; keep the SAME core plot and characters; do NOT invent a different story):\n"
         f"{cleaned or 'Empty transcript.'}\n\n"
-        f"NARRATOR (use name if present): {narrator or 'none'}\n\n"
+        f"NARRATOR (use name if present): {display_name or narrator or 'none'}\n\n"
         "Story requirements:\n"
         f"- Exactly {target_pages} pages.\n"
-        "- Page 1: setup + mischief/choice + rising trouble + page-turn hook.\n"
+        f"- Page 1: {page1_beat}.\n"
         "- Page 2: big moment + apology/lesson + funny resolution + warm ending.\n"
         "- Preserve the transcript's beats; if it includes a lie/hide → monster → rescue → lesson sequence, keep it.\n"
         "- Keep protagonist name(s) consistent if present.\n"
+        f"{name_guidance}"
         f"{anchor_requirement}"
         f"- Dialogue: {_DIALOGUE_MIN}–{_DIALOGUE_MAX} short quoted lines TOTAL across the entire story.\n"
         f"- About {_MIN_WORDS_PER_PAGE}–{_MAX_WORDS_PER_PAGE} words per page.\n"
         "- Kid-safe, whimsical, humorous, vivid sensory details.\n"
+        f"{voice_notes}"
+        f"{fidelity_notes}"
         "- Avoid repeated stock phrases or generic filler.\n"
         "- Each page must include a rich illustration_prompt in consistent watercolor picture-book style.\n\n"
         "OUTPUT JSON schema:\n"
@@ -533,6 +601,7 @@ def _openai_storybook(
     cleaned: str,
     title: str,
     narrator: str | None,
+    display_name: str | None,
     target_pages: int,
 ) -> StoryBook | None:
     if not os.getenv("OPENAI_API_KEY"):
@@ -554,11 +623,12 @@ def _openai_storybook(
     system_prompt, user_prompt = _build_openai_prompts(
         cleaned,
         narrator,
+        display_name,
         target_pages,
         required_terms,
         required_count,
     )
-    anchors = _build_anchor_list(cleaned, narrator)
+    anchors = _build_anchor_list(cleaned, display_name or narrator)
 
     # We will try up to 3 attempts, but we also *repair*.
     retry_instruction = ""
@@ -607,13 +677,13 @@ def _openai_storybook(
         # REPAIR PHASE (critical for robustness)
         pages = _repair_pages(
             pages=pages,
-            narrator=narrator,
+            narrator=display_name or narrator,
             required_terms=required_terms,
             target_min=_MIN_WORDS_PER_PAGE,
             target_max=_MAX_WORDS_PER_PAGE,
         )
 
-        anchors = _build_anchor_list(cleaned, narrator)
+        anchors = _build_anchor_list(cleaned, display_name or narrator)
         page_texts = [page.text for page in pages]
         coverage_ok, coverage_summary, missing = _anchor_coverage(page_texts, anchors)
 
@@ -625,7 +695,7 @@ def _openai_storybook(
                 retry_instruction = _build_retry_instruction(
                     missing_terms=missing,
                     required_count=_anchor_required_count(len(anchors)),
-                    narrator=narrator,
+                    narrator=display_name or narrator,
                 )
                 continue
             return None
@@ -648,8 +718,8 @@ def _openai_storybook(
             title=(data.get("title") or title).strip() or title,
             subtitle=(data.get("subtitle") or "A story told out loud").strip() or "A story told out loud",
             pages=pages,
-            narrator=(data.get("narrator") or narrator),
-            cover_prompt=_build_cover_prompt(title, narrator, cleaned),
+            narrator=(display_name or data.get("narrator") or narrator),
+            cover_prompt=_build_cover_prompt(title, display_name or narrator, cleaned),
             cover_image_path=None,
         )
 
@@ -1180,9 +1250,15 @@ def _snippet_from_transcript(cleaned: str, max_words: int = 18) -> str:
     return snippet.rstrip(".") + "."
 
 
-def _local_storybook(cleaned: str, title: str, narrator: str | None, target_pages: int) -> StoryBook:
+def _local_storybook(
+    cleaned: str,
+    title: str,
+    narrator: str | None,
+    display_name: str | None,
+    target_pages: int,
+) -> StoryBook:
     topic = _infer_topic(cleaned)
-    name = narrator or "A young storyteller"
+    name = display_name or narrator or "A young storyteller"
     snippet = _snippet_from_transcript(cleaned)
 
     seed = abs(hash(cleaned or topic)) % (2**32)
@@ -1241,8 +1317,8 @@ def _local_storybook(cleaned: str, title: str, narrator: str | None, target_page
         title=title,
         subtitle="A story told out loud",
         pages=pages,
-        narrator=narrator,
-        cover_prompt=_build_cover_prompt(title, narrator, cleaned),
+        narrator=display_name or narrator,
+        cover_prompt=_build_cover_prompt(title, display_name or narrator, cleaned),
         cover_image_path=None,
     )
     return story
