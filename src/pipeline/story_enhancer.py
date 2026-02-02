@@ -132,6 +132,223 @@ def _normalize_anchor_terms(terms: list[str] | None, *, max_terms: int = 8) -> l
     return out
 
 
+def _extract_proper_names(cleaned: str, narrator: str | None) -> list[str]:
+    names: list[str] = []
+    if narrator:
+        names.append(narrator)
+    for match in re.finditer(r"\b[A-Z][a-z]{2,}\b", cleaned or ""):
+        candidate = match.group(0)
+        if candidate.lower() in _STOPWORDS:
+            continue
+        names.append(candidate)
+    seen: set[str] = set()
+    unique: list[str] = []
+    for name in names:
+        key = name.strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(name.strip())
+    return unique
+
+
+def _extract_noun_phrases(
+    cleaned: str,
+    min_count: int = 2,
+    max_count: int = 6,
+    excluded: set[str] | None = None,
+) -> list[str]:
+    tokens = re.findall(r"[A-Za-z']+", cleaned or "")
+    if not tokens:
+        return []
+    stop = _STOPWORDS | _ANCHOR_STOPWORDS | {"is", "was", "were", "are", "be", "been"}
+    excluded_low = {e.lower() for e in (excluded or set())}
+    phrases: dict[str, tuple[int, str]] = {}
+    lower_tokens = [t.lower() for t in tokens]
+    for length in (2, 3):
+        for i in range(len(tokens) - length + 1):
+            chunk = tokens[i : i + length]
+            low_chunk = lower_tokens[i : i + length]
+            if any(word in stop for word in low_chunk):
+                continue
+            phrase_low = " ".join(low_chunk)
+            if phrase_low in excluded_low:
+                continue
+            count, original = phrases.get(phrase_low, (0, " ".join(chunk)))
+            phrases[phrase_low] = (count + 1, original)
+    ranked = sorted(phrases.items(), key=lambda item: (-item[1][0], item[0]))
+    results: list[str] = []
+    for phrase_low, (count, original) in ranked:
+        if count < min_count:
+            continue
+        results.append(original)
+        if len(results) >= max_count:
+            break
+    return results
+
+
+def _extract_fidelity_keywords(cleaned: str, anchors: list[str]) -> list[str]:
+    """
+    Pick a small set of 'must keep' tokens that work for ANY story:
+    - any proper names
+    - a few strong noun phrases
+    Avoid generic words like 'story', 'one day', etc.
+    """
+    generic = {
+        "story", "tale", "one day", "then", "after", "before", "suddenly",
+        "and", "the", "a", "an", "about", "end", "beginning", "middle",
+        "kid", "child", "dad", "mom",
+    }
+
+    must: list[str] = []
+
+    # prioritize proper names / distinctive anchors
+    for a in anchors[:10]:
+        a_norm = (a or "").strip()
+        if not a_norm:
+            continue
+        low = a_norm.lower()
+        if low in generic:
+            continue
+        if len(low) <= 2:
+            continue
+        # if it's a multi-word phrase, keep it (but later we match loosely)
+        must.append(a_norm)
+
+    # If transcript is tiny, require fewer.
+    # Return up to 4 "must" items.
+    return must[:4]
+
+
+def _build_anchor_list(cleaned: str, narrator: str | None) -> list[str]:
+    anchors: list[str] = []
+    seen: set[str] = set()
+
+    # Proper names first (best anchors)
+    for name in _extract_proper_names(cleaned, narrator):
+        normalized = name.strip()
+        if not normalized:
+            continue
+        key = normalized.lower()
+        if key in seen:
+            continue
+        anchors.append(normalized)
+        seen.add(key)
+
+    # Optional: keep apology signals if the kid actually said them
+    apology_terms = []
+    lowered = (cleaned or "").lower()
+    if "sorry" in lowered:
+        apology_terms.append("sorry")
+    if "apolog" in lowered:
+        apology_terms.append("apologize")
+
+    for term in apology_terms:
+        if term not in seen:
+            anchors.append(term)
+            seen.add(term)
+
+    # Add a FEW noun phrases, but filter generic/filler phrases
+    phrase_exclusions = set(seen)
+    phrases = _extract_noun_phrases(cleaned, min_count=2, max_count=6, excluded=phrase_exclusions)
+
+    banned_fragments = (
+        "this is a story", "end of the story", "the end", "one day", "comes along",
+        "and then", "about", "story", "told out loud"
+    )
+
+    for phrase in phrases:
+        p = (phrase or "").strip()
+        if not p:
+            continue
+        low = p.lower()
+        if any(b in low for b in banned_fragments):
+            continue
+        if len(low) < 4:
+            continue
+        key = low
+        if key in seen:
+            continue
+        anchors.append(p)
+        seen.add(key)
+
+    return anchors
+
+
+def _anchor_coverage(page_texts: list[str], anchors: list[str]) -> tuple[bool, str, list[str]]:
+    """
+    Don't require EVERY anchor. Require a reasonable coverage threshold.
+    This makes the system robust across wildly different kid stories.
+    """
+    if not anchors:
+        return True, "no anchors", []
+
+    combined = " ".join(page_texts).lower()
+
+    hits = 0
+    missing: list[str] = []
+    for anchor in anchors:
+        a = (anchor or "").strip()
+        if not a:
+            continue
+        a_low = a.lower()
+
+        found = False
+        if " " in a_low:
+            found = a_low in combined
+        else:
+            found = re.search(rf"\b{re.escape(a_low)}\b", combined) is not None
+
+        if found:
+            hits += 1
+        else:
+            missing.append(a)
+
+    # Threshold: at least 2 hits, or 40% of anchors (whichever is smaller/higher sensibly)
+    required = max(2, int(round(0.4 * len(anchors))))
+    required = min(required, 4)  # never demand too many
+
+    ok = hits >= required
+    summary = f"anchor coverage: {hits}/{len(anchors)} (required >= {required})"
+    return ok, summary, missing
+
+
+def _fails_fidelity(all_text: str, must: list[str]) -> dict[str, Any]:
+    if not must:
+        return {"pass": True, "missing": [], "hits": 0, "required": 0}
+
+    combined = (all_text or "").lower()
+    hits = 0
+    missing: list[str] = []
+    for token in must:
+        t = (token or "").strip()
+        if not t:
+            continue
+        t_low = t.lower()
+        if " " in t_low:
+            found = t_low in combined
+        else:
+            found = re.search(rf"\b{re.escape(t_low)}\b", combined) is not None
+        if found:
+            hits += 1
+        else:
+            missing.append(token)
+
+    required = max(1, int(round(0.5 * len(must))))
+    required = min(required, 3)
+    return {"pass": hits >= required, "missing": missing, "hits": hits, "required": required}
+
+
+def _summarize_fidelity_issues(fidelity_result: dict[str, Any]) -> str:
+    missing = fidelity_result.get("missing") or []
+    hits = fidelity_result.get("hits")
+    required = fidelity_result.get("required")
+    if missing:
+        preview = ", ".join(missing[:6])
+        return f"missing key anchors ({hits}/{required}): {preview}"
+    return f"fidelity coverage low ({hits}/{required})"
+
+
 def enhance_to_storybook(transcript: str, *, target_pages: int = 2) -> StoryBook:
     cleaned = _clean_transcript(transcript)
     narrator = _find_name(cleaned) if cleaned else None
@@ -302,6 +519,8 @@ def _openai_storybook(
             target_max=_MAX_WORDS_PER_PAGE,
         )
 
+        anchors = _build_anchor_list(cleaned, narrator)
+        must = _extract_fidelity_keywords(cleaned, anchors)
         page_texts = [page.text for page in pages]
         coverage_ok, coverage_summary, missing = _anchor_coverage(page_texts, anchors)
 
@@ -322,6 +541,7 @@ def _openai_storybook(
         must = _extract_fidelity_keywords(cleaned, anchors)
         all_text = " ".join(page_texts)
         fidelity_result = _fails_fidelity(all_text, must)
+        fidelity_result = _fails_fidelity(" ".join(page_texts), must)
         if not fidelity_result.get("pass", False):
             fidelity_note = _summarize_fidelity_issues(fidelity_result)
             print("Fidelity failed via anchor check.")
@@ -1194,7 +1414,8 @@ def _maybe_generate_images(story: StoryBook) -> None:
             else:
                 continue
 
-            page.image_path = str(image_path)
-            page.illustration_path = str(image_path)  # back-compat
+            saved_path = str(image_path)
+            page.illustration_path = saved_path
+            setattr(page, "image_path", saved_path)  # back-compat
         except Exception:
             continue
