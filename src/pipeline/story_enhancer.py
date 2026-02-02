@@ -326,7 +326,6 @@ def _request_openai_story(
 
 
 def _story_json_schema(target_pages: int) -> dict[str, Any]:
-    # narrator must be in required if present in properties for strict json_schema
     return {
         "type": "object",
         "properties": {
@@ -348,6 +347,8 @@ def _story_json_schema(target_pages: int) -> dict[str, Any]:
                 },
             },
         },
+        # For strict JSON schema enforcement in OpenAI Responses,
+        # required must include every property key (even if nullable).
         "required": ["title", "subtitle", "narrator", "pages"],
         "additionalProperties": False,
     }
