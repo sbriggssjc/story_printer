@@ -434,6 +434,7 @@ def _build_openai_prompts(
         "- Kid-safe, whimsical, humorous, creative expansion.\n"
         "- Include sensory details and an emotional arc.\n"
         "- Avoid repeating filler sentences or stock phrases.\n"
+        "- Do NOT repeat any exact sentence across pages. Each sentence must be unique.\n"
         "- Keep names consistent; use narrator if provided.\n"
         f"- Your story MUST include all anchors exactly once or more: {anchor_line}.\n"
         f"- {_MIN_WORDS_PER_PAGE}–{_MAX_WORDS_PER_PAGE} words per page (target {_DEFAULT_WORDS_PER_PAGE}).\n"
