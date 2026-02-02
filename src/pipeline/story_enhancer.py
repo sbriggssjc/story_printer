@@ -9,6 +9,9 @@ Environment variables:
 - STORY_WORDS_PER_PAGE: word count target per page (default: "280").
 - STORY_STYLE: story tone/style (default: "whimsical, funny, heartwarming").
 - STORY_STRICT_DIALOGUE: set to "1" to fail validation when dialogue count is outside range.
+- STORY_DIALOGUE_MIN: minimum number of dialogue lines (default: "1").
+- STORY_DIALOGUE_MAX: maximum number of dialogue lines (default: "3").
+- STORY_DIALOGUE_EXACT: set to an integer to require an exact dialogue count (default: unset).
 """
 
 from __future__ import annotations
@@ -38,6 +41,34 @@ _DEFAULT_STYLE = os.getenv("STORY_STYLE", "whimsical, funny, heartwarming")
 _DEFAULT_FIDELITY_MODEL = os.getenv("STORY_FIDELITY_MODEL", _DEFAULT_MODEL)
 _MIN_WORDS_PER_PAGE = max(240, _DEFAULT_WORDS_PER_PAGE - 40)
 _MAX_WORDS_PER_PAGE = min(320, _DEFAULT_WORDS_PER_PAGE + 40)
+_DIALOGUE_MIN_DEFAULT = 1
+_DIALOGUE_MAX_DEFAULT = 3
+
+
+def _get_env_int(name: str, default: int | None, *, minimum: int | None = None) -> int | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    if minimum is not None and value < minimum:
+        return default
+    return value
+
+
+_DIALOGUE_MIN = _get_env_int("STORY_DIALOGUE_MIN", _DIALOGUE_MIN_DEFAULT, minimum=0)
+_DIALOGUE_MAX = _get_env_int("STORY_DIALOGUE_MAX", _DIALOGUE_MAX_DEFAULT, minimum=0)
+_DIALOGUE_EXACT = _get_env_int("STORY_DIALOGUE_EXACT", None, minimum=1)
+if _DIALOGUE_EXACT is not None:
+    _DIALOGUE_MIN = _DIALOGUE_EXACT
+    _DIALOGUE_MAX = _DIALOGUE_EXACT
+if _DIALOGUE_MAX < _DIALOGUE_MIN:
+    _DIALOGUE_MAX = _DIALOGUE_MIN
 
 
 def _apply_short_transcript_targets(cleaned_transcript: str) -> None:
@@ -1588,7 +1619,7 @@ def _build_openai_prompts(
         f"- Exactly {target_pages} pages.\n"
         "- Page 1: setup + early beats + rising trouble + page-turn hook.\n"
         "- Page 2: remaining beats + resolution + warm ending.\n"
-        "- Exactly two dialogue lines total. Each must be a full sentence in quotes on its own line starting with '- ' or '— '.\n"
+        f"{_dialogue_prompt_line()}"
         "- Dialogue must be short (<= 12 words each) and natural.\n"
         "- Do not use quotation marks for emphasis or any other purpose.\n"
         "- Kid-safe, whimsical, humorous, creative expansion.\n"
@@ -1727,12 +1758,13 @@ def _openai_storybook(
             return None
 
         # Post-process pages BEFORE validation so we validate the final text that will be printed
+        dialogue_min, dialogue_max = _dialogue_bounds()
         for page in pages:
-            page.text = _normalize_dialogue_lines(page.text, max_lines=2)
+            page.text = _normalize_dialogue_lines(page.text, max_lines=dialogue_max)
 
         total_dialogue = sum(_count_dialogue_lines(page.text) for page in pages)
-        if total_dialogue < 2:
-            pages[-1].text = _ensure_dialogue_count(pages[-1].text, target_lines=2)
+        if total_dialogue < dialogue_min:
+            pages[-1].text = _ensure_dialogue_count(pages[-1].text, target_lines=dialogue_min)
 
         # Remove any verbatim repeated sentences across pages without local padding.
         _dedupe_cross_page_sentences(pages, _MIN_WORDS_PER_PAGE)
@@ -2194,6 +2226,35 @@ def _is_strict_dialogue() -> bool:
     return os.getenv("STORY_STRICT_DIALOGUE", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _dialogue_bounds() -> tuple[int, int]:
+    return _DIALOGUE_MIN, _DIALOGUE_MAX
+
+
+def _dialogue_expected_label() -> str:
+    min_lines, max_lines = _dialogue_bounds()
+    if min_lines == max_lines:
+        return str(min_lines)
+    return f"{min_lines}-{max_lines}"
+
+
+def _dialogue_prompt_line() -> str:
+    min_lines, max_lines = _dialogue_bounds()
+    if min_lines == max_lines:
+        return (
+            f"- Exactly {min_lines} dialogue lines total. Each must be a full sentence in quotes on "
+            "its own line starting with '- ' or '— '.\n"
+        )
+    return (
+        f"- Between {min_lines} and {max_lines} dialogue lines total. Each must be a full sentence in "
+        "quotes on its own line starting with '- ' or '— '.\n"
+    )
+
+
+def _dialogue_in_range(total_dialogue: int) -> bool:
+    min_lines, max_lines = _dialogue_bounds()
+    return min_lines <= total_dialogue <= max_lines
+
+
 def _validate_story_data(data: Any, target_pages: int) -> tuple[bool, list[str]]:
     if not isinstance(data, dict):
         return False, ["response is not a JSON object"]
@@ -2242,10 +2303,14 @@ def _validate_story_data(data: Any, target_pages: int) -> tuple[bool, list[str]]
         reasons.append(f"repeated sentence across pages: {dupes[0]}")
         fatal_reasons.append(f"repeated sentence across pages: {dupes[0]}")
 
-    if total_dialogue < 1 or total_dialogue > 3:
-        reasons.append(f"dialogue lines counted {total_dialogue} but expected 1-3")
+    if not _dialogue_in_range(total_dialogue):
+        reasons.append(
+            f"dialogue lines counted {total_dialogue} but expected {_dialogue_expected_label()}"
+        )
         if _is_strict_dialogue():
-            fatal_reasons.append(f"dialogue lines counted {total_dialogue} but expected 1-3")
+            fatal_reasons.append(
+                f"dialogue lines counted {total_dialogue} but expected {_dialogue_expected_label()}"
+            )
     return (len(fatal_reasons) == 0, reasons)
 
 
@@ -2301,10 +2366,14 @@ def _validate_story_pages(
         reasons.append(f"repeated sentence across pages: {dupes[0]}")
         fatal_reasons.append(f"repeated sentence across pages: {dupes[0]}")
 
-    if enforce_dialogue and (total_dialogue < 1 or total_dialogue > 3):
-        reasons.append(f"dialogue lines counted {total_dialogue} but expected 1-3")
+    if enforce_dialogue and not _dialogue_in_range(total_dialogue):
+        reasons.append(
+            f"dialogue lines counted {total_dialogue} but expected {_dialogue_expected_label()}"
+        )
         if _is_strict_dialogue():
-            fatal_reasons.append(f"dialogue lines counted {total_dialogue} but expected 1-3")
+            fatal_reasons.append(
+                f"dialogue lines counted {total_dialogue} but expected {_dialogue_expected_label()}"
+            )
 
     return (len(fatal_reasons) == 0, reasons)
 
@@ -2358,7 +2427,7 @@ def _build_repair_spec(
         "exact_pages": target_pages,
         "min_words_per_page": _MIN_WORDS_PER_PAGE,
         "max_words_per_page": _MAX_WORDS_PER_PAGE,
-        "dialogue_lines_total": [1, 3],
+        "dialogue_lines_total": list(_dialogue_bounds()),
         "avoid_meta_phrases": sorted(avoid_phrases),
     }
 
@@ -2664,19 +2733,29 @@ def _ensure_dialogue_count(text: str, target_lines: int = 2) -> str:
 
 
 def _ensure_minimum_dialogue_lines(pages: list[StoryPage], target_pages: int) -> None:
+    min_lines, _ = _dialogue_bounds()
+    if min_lines <= 0:
+        return
     total_dialogue = sum(_count_dialogue_lines(page.text) for page in pages)
-    if total_dialogue >= 1:
+    if total_dialogue >= min_lines:
         return
     fallback_lines = [
         '- "Dad: Crunch the crust, kiddo!"',
         '- "Claire: I should\'ve listened, Dad."',
+        '- "We can do this!"',
+        '- "Okay, let\'s try."',
     ]
-    for index, line in enumerate(fallback_lines[:target_pages]):
+    needed = min_lines - total_dialogue
+    available = fallback_lines[: max(target_pages, needed)]
+    for index, line in enumerate(available):
+        if needed <= 0:
+            break
         page = pages[index]
         if line in page.text:
             continue
         separator = "\n" if page.text.rstrip() else ""
         page.text = f"{page.text.rstrip()}{separator}{line}".strip()
+        needed -= 1
 
 
 def _normalize_dialogue_lines(text: str, max_lines: int = 2) -> str:
