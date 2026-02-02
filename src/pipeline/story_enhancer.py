@@ -117,6 +117,215 @@ def _missing_required_terms(page_texts: list[str], required_terms: list[str]) ->
     return missing
 
 
+def _extract_proper_names(cleaned: str, narrator: str | None) -> list[str]:
+    names: list[str] = []
+    if narrator:
+        names.append(narrator.strip())
+    if not cleaned:
+        return names
+    candidates = re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b", cleaned)
+    ignored = {
+        "The",
+        "A",
+        "An",
+        "And",
+        "But",
+        "Or",
+        "So",
+        "Because",
+        "When",
+        "Then",
+        "After",
+        "Before",
+        "Once",
+        "With",
+        "Without",
+        "I",
+        "We",
+        "He",
+        "She",
+        "They",
+        "It",
+    }
+    for candidate in candidates:
+        if candidate in ignored:
+            continue
+        names.append(candidate)
+    return names
+
+
+def _extract_noun_phrases(
+    cleaned: str,
+    *,
+    min_count: int = 3,
+    max_count: int = 8,
+    excluded: set[str] | None = None,
+) -> list[str]:
+    if not cleaned:
+        return []
+    stopwords = {
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "but",
+        "so",
+        "to",
+        "of",
+        "in",
+        "on",
+        "at",
+        "for",
+        "with",
+        "from",
+        "into",
+        "up",
+        "down",
+        "over",
+        "under",
+        "then",
+        "when",
+        "while",
+        "after",
+        "before",
+        "as",
+        "that",
+        "this",
+        "these",
+        "those",
+        "it",
+        "its",
+        "is",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "am",
+        "are",
+        "do",
+        "did",
+        "does",
+        "done",
+        "have",
+        "has",
+        "had",
+        "i",
+        "you",
+        "we",
+        "he",
+        "she",
+        "they",
+        "him",
+        "her",
+        "them",
+        "our",
+        "their",
+        "my",
+        "your",
+    }
+    excluded = {term.lower() for term in (excluded or set())}
+    words = [word.lower() for word in re.findall(r"[A-Za-z']+", cleaned)]
+    counts: dict[str, int] = {}
+    for index in range(len(words)):
+        if words[index] in stopwords:
+            continue
+        for length in range(3, 0, -1):
+            if index + length > len(words):
+                continue
+            chunk = words[index : index + length]
+            if any(part in stopwords for part in chunk):
+                continue
+            phrase = " ".join(chunk)
+            counts[phrase] = counts.get(phrase, 0) + 1
+
+    ranked = sorted(
+        counts.items(),
+        key=lambda item: (item[1], len(item[0].split()), len(item[0])),
+        reverse=True,
+    )
+    phrases: list[str] = []
+    for phrase, _ in ranked:
+        if phrase in excluded:
+            continue
+        if len(phrases) >= max_count:
+            break
+        phrases.append(phrase)
+
+    if len(phrases) < min_count:
+        for word in words:
+            if word in stopwords or word in excluded:
+                continue
+            if word not in phrases:
+                phrases.append(word)
+            if len(phrases) >= min_count:
+                break
+
+    return phrases[:max_count]
+
+
+def _build_anchor_list(cleaned: str, narrator: str | None) -> list[str]:
+    anchors: list[str] = []
+    seen: set[str] = set()
+
+    for name in _extract_proper_names(cleaned, narrator):
+        normalized = name.strip()
+        if not normalized:
+            continue
+        key = normalized.lower()
+        if key in seen:
+            continue
+        anchors.append(normalized)
+        seen.add(key)
+
+    apology_terms = []
+    lowered = (cleaned or "").lower()
+    if "sorry" in lowered:
+        apology_terms.append("sorry")
+    if "apolog" in lowered:
+        apology_terms.append("apologize")
+    if "fix" in lowered:
+        apology_terms.append("fix")
+
+    for term in apology_terms:
+        if term not in seen:
+            anchors.append(term)
+            seen.add(term)
+
+    phrase_exclusions = set(seen)
+    phrases = _extract_noun_phrases(
+        cleaned, min_count=3, max_count=8, excluded=phrase_exclusions
+    )
+    for phrase in phrases:
+        key = phrase.lower()
+        if key in seen:
+            continue
+        anchors.append(phrase)
+        seen.add(key)
+
+    return anchors
+
+
+def _missing_anchors(page_texts: list[str], anchors: list[str]) -> list[str]:
+    if not anchors:
+        return []
+    combined = " ".join(page_texts).lower()
+    missing: list[str] = []
+    for anchor in anchors:
+        anchor_text = anchor.strip()
+        if not anchor_text:
+            continue
+        anchor_lower = anchor_text.lower()
+        if " " in anchor_lower:
+            if anchor_lower not in combined:
+                missing.append(anchor_text)
+            continue
+        if not re.search(rf"\b{re.escape(anchor_lower)}\b", combined):
+            missing.append(anchor_text)
+    return missing
+
+
 def _extract_fidelity_keywords(cleaned: str) -> list[str]:
     # small, pragmatic: keep the “story spine”
     lowered = (cleaned or "").lower()
@@ -128,8 +337,9 @@ def _extract_fidelity_keywords(cleaned: str) -> list[str]:
     return must[:4]
 
 
-def _fails_fidelity(pages_text: str, must_keywords: list[str]) -> list[str]:
+def _fails_fidelity(pages_text: str, must_keywords: list[str]) -> tuple[list[str], list[str]]:
     reasons = []
+    banned_phrases = []
     low = pages_text.lower()
     for k in must_keywords:
         if k not in low:
@@ -137,7 +347,9 @@ def _fails_fidelity(pages_text: str, must_keywords: list[str]) -> list[str]:
     for phrase in _BANNED_PHRASES:
         if phrase.lower() in low:
             reasons.append(f"contains banned filler phrase: {phrase}")
-    return reasons
+            banned_phrases.append(phrase)
+    return reasons, banned_phrases
+
 
 def enhance_to_storybook(transcript: str, *, target_pages: int = 2) -> StoryBook:
     cleaned = _clean_transcript(transcript)
@@ -182,7 +394,9 @@ def _get_openai_client():
     return openai_module.OpenAI()
 
 
-def _build_openai_prompts(cleaned: str, narrator: str | None, target_pages: int) -> tuple[str, str]:
+def _build_openai_prompts(
+    cleaned: str, narrator: str | None, target_pages: int
+) -> tuple[str, str, list[str]]:
     system_prompt = (
         "You are a celebrated children's picture-book author and editor. "
         "Expand the transcript into a rich, creative, kid-safe story (not a summary). "
@@ -199,6 +413,8 @@ def _build_openai_prompts(cleaned: str, narrator: str | None, target_pages: int)
         "7) Funny resolution.\n"
         "8) Warm ending with emotional lift.\n"
     )
+    anchors = _build_anchor_list(cleaned, narrator)
+    anchor_line = ", ".join(anchors) if anchors else "none"
     user_prompt = (
         "TRANSCRIPT (core plot MUST be preserved; you may rephrase sentences, but do not invent new major events):\n"
         f"{cleaned or 'Empty transcript.'}\n\n"
@@ -212,14 +428,14 @@ def _build_openai_prompts(cleaned: str, narrator: str | None, target_pages: int)
         f"- Exactly {target_pages} pages.\n"
         "- Page 1: setup + mischief + rising trouble + page-turn hook.\n"
         "- Page 2: big moment + apology + funny resolution + warm ending.\n"
-        '- Exactly 2 lines of dialogue total, both MUST be in quotes.\n'
-        "- The two dialogue lines must be short (<= 12 words each) and must appear in the story text.\n"
-        "- Use quotation marks only for spoken dialogue. Do not quote signs, thoughts, or emphasis.\n"
-        "- Do NOT use quotation marks for emphasis, sound effects, or any other purpose.\n"
+        "- Use 1–3 dialogue lines total, each on its own line starting with '- ' or '— '.\n"
+        "- The dialogue lines must be short (<= 12 words each) and must appear in the story text.\n"
+        "- Do not use quotation marks anywhere in the story text.\n"
         "- Kid-safe, whimsical, humorous, creative expansion.\n"
         "- Include sensory details and an emotional arc.\n"
         "- Avoid repeating filler sentences or stock phrases.\n"
         "- Keep names consistent; use narrator if provided.\n"
+        f"- Your story MUST include all anchors exactly once or more: {anchor_line}.\n"
         f"- {_MIN_WORDS_PER_PAGE}–{_MAX_WORDS_PER_PAGE} words per page (target {_DEFAULT_WORDS_PER_PAGE}).\n"
         "- Each page must include a rich illustration_prompt in consistent watercolor picture-book style.\n"
         f"{beat_sheet}\n"
@@ -248,7 +464,7 @@ def _build_openai_prompts(cleaned: str, narrator: str | None, target_pages: int)
         + "\n".join([f"  - {s}" for s in sorted(_BLOCKLIST_SENTENCES)])
         + "\n"
     )
-    return system_prompt, user_prompt
+    return system_prompt, user_prompt, anchors
 
 
 def _openai_storybook(
@@ -269,7 +485,10 @@ def _openai_storybook(
 
     print(f"OpenAI model: {_DEFAULT_MODEL}")
 
-    system_prompt, user_prompt = _build_openai_prompts(cleaned, narrator, target_pages)
+    system_prompt, user_prompt, anchors = _build_openai_prompts(
+        cleaned, narrator, target_pages
+    )
+    missing_anchor_note: list[str] = []
 
     for attempt in range(2):
         correction = ""
@@ -279,8 +498,17 @@ def _openai_storybook(
                 f"- EXACTLY {target_pages} pages.\n"
                 f"- EACH page MUST be between {_MIN_WORDS_PER_PAGE} and {_MAX_WORDS_PER_PAGE} words.\n"
                 '- Include EXACTLY 2 short dialogue lines using straight quotes, e.g. "...".\n'
+                "- Return ONLY JSON matching the schema. No extra keys, no commentary.\n"
+                "- Use 1–3 short dialogue lines total, each on its own line starting with '- ' or '— '.\n"
+                "- Do not use quotation marks anywhere in the story text.\n"
                 "- Return ONLY JSON matching the schema. No extra keys, no commentary."
             )
+            if missing_anchor_note:
+                correction += (
+                    "\nMissing anchors from previous attempt:\n- "
+                    + "\n- ".join(missing_anchor_note)
+                    + "\nEnsure every anchor appears at least once."
+                )
         try:
             if client:
                 use_responses = hasattr(client, "responses")
@@ -319,11 +547,11 @@ def _openai_storybook(
         # Post-process pages BEFORE validation so we validate the final text that will be printed
         for page in pages:
             page.text = _pad_text_to_min_words(page.text, min_words=_MIN_WORDS_PER_PAGE)
-            page.text = _limit_dialogue_lines(page.text, max_lines=2)
+            page.text = _limit_dialogue_lines(page.text, max_lines=3)
 
         total_dialogue = sum(_count_dialogue_lines(page.text) for page in pages)
-        if total_dialogue < 2:
-            pages[-1].text = _ensure_dialogue_count(pages[-1].text, target_lines=2)
+        if total_dialogue < 1:
+            pages[-1].text = _ensure_dialogue_count(pages[-1].text, target_lines=1)
 
         os.environ["__STORY_CLEANED_TRANSCRIPT__"] = cleaned or ""
         valid, reasons = _validate_story_pages(pages, target_pages)
@@ -348,15 +576,32 @@ def _openai_storybook(
             ]
         )
         must = _extract_fidelity_keywords(cleaned)
-        fidelity_reasons = _fails_fidelity(all_text, must)
+        fidelity_reasons, banned_phrases = _fails_fidelity(all_text, must)
         if fidelity_reasons:
             print(f"Fidelity failed: {', '.join(fidelity_reasons)}")
             if attempt == 0:
+                retry_instruction = ""
+                if banned_phrases:
+                    retry_instruction = (
+                        "\nDo not use any of these phrases: "
+                        + "; ".join(banned_phrases)
+                        + ". Replace them with fresh, specific detail from the transcript."
+                    )
                 user_prompt = (
-                    f"{user_prompt}\n\nFidelity issues:\n- "
+                    f"{user_prompt}\n\nIssues:\n- "
                     + "\n- ".join(fidelity_reasons)
                     + "\n\nRewrite while keeping the transcript’s core events EXACT."
+                    + retry_instruction
                 )
+                continue
+            return None
+
+        page_texts = [page.text for page in pages]
+        missing_anchors = _missing_anchors(page_texts, anchors)
+        if missing_anchors:
+            print(f"Anchor validation failed: {', '.join(missing_anchors)}")
+            if attempt == 0:
+                missing_anchor_note = missing_anchors
                 continue
             return None
 
@@ -724,8 +969,10 @@ def _validate_story_data(data: Any, target_pages: int) -> tuple[bool, list[str]]
     if missing:
         reasons.append(f"missing required transcript term(s): {missing}")
 
-    if total_dialogue != 2:
-        reasons.append(f"dialogue lines counted {total_dialogue} but expected exactly 2")
+    if total_dialogue < 1 or total_dialogue > 3:
+        reasons.append(
+            f"dialogue lines counted {total_dialogue} but expected between 1 and 3"
+        )
     return (len(reasons) == 0, reasons)
 
 
@@ -772,8 +1019,10 @@ def _validate_story_pages(pages: list[StoryPage], target_pages: int) -> tuple[bo
     if missing:
         reasons.append(f"missing required transcript term(s): {missing}")
 
-    if total_dialogue != 2:
-        reasons.append(f"dialogue lines counted {total_dialogue} but expected exactly 2")
+    if total_dialogue < 1 or total_dialogue > 3:
+        reasons.append(
+            f"dialogue lines counted {total_dialogue} but expected between 1 and 3"
+        )
 
     return (len(reasons) == 0, reasons)
 
@@ -810,7 +1059,8 @@ def _local_storybook(
         f"On a bright afternoon, {name} felt a fizz of curiosity about {topic}. "
         f"The day began with a giggle and a whisper of adventure, and soon a playful idea popped up: {snippet}. "
         "At first it seemed tiny and harmless, like a secret tucked in a sock, but the air started to buzz. "
-        f"\"Should we tell?\" someone whispered, and {name} grinned, watching the idea wobble bigger. "
+        f"Someone whispered:\n- Should we tell?\n"
+        f"{name} grinned, watching the idea wobble bigger. "
         "A silly misunderstanding bounced from friend to friend, and even the pets looked suspicious. "
         "By the time the sun slid behind a cloud, the mix-up had become a swirl of whispers and wide eyes, "
         "and the next step was about to land with a thump."
@@ -826,7 +1076,8 @@ def _local_storybook(
 
     page2 = (
         "With a deep breath and a brave heart, the truth finally tumbled out. "
-        f"\"I did it,\" {name} said, and the room froze for one tiny second before melting into relieved smiles. "
+        f"{name} admitted it aloud:\n- I did it.\n"
+        "The room froze for one tiny second before melting into relieved smiles. "
         f"Together they turned the problem into a plan, transforming {topic} into a funny, shared solution. "
         "There was an apology that sounded like a warm hug and a giggle that sounded like bells. "
         "Everyone joined in to fix the mix-up, and the story swung toward a cozy, happy ending. "
@@ -998,63 +1249,43 @@ def _word_count(text: str) -> int:
 
 
 def _count_dialogue_lines(text: str) -> int:
-    sentence_start = re.compile(r'(^|[.!?]\s+|\n\s*)(["“])')
-    return sum(1 for _ in sentence_start.finditer(text))
+    line_start = re.compile(r"^\s*[-—]\s+", re.MULTILINE)
+    return sum(1 for _ in line_start.finditer(text))
 
 
 def _limit_dialogue_lines(text: str, max_lines: int = 3) -> str:
     """
-    Keeps the first max_lines quoted segments, removes quotation marks from the rest
+    Keeps the first max_lines dialogue lines, removes leading markers from the rest
     so they no longer count as dialogue lines.
     """
-    patterns = [
-        r'"[^"]+"',
-        r"“[^”]+”",
-    ]
-
-    matches: list[tuple[int, int]] = []
-    for pattern in patterns:
-        for match in re.finditer(pattern, text):
-            matches.append((match.start(), match.end()))
-    matches.sort(key=lambda item: item[0])
-
-    if len(matches) <= max_lines:
-        return text
-
-    out: list[str] = []
-    last = 0
-    for index, (start, end) in enumerate(matches):
-        out.append(text[last:start])
-        segment = text[start:end]
-        if index < max_lines:
-            out.append(segment)
-        else:
-            if segment.startswith('"') and segment.endswith('"'):
-                out.append(segment[1:-1])
-            elif segment.startswith("“") and segment.endswith("”"):
-                out.append(segment[1:-1])
-            else:
-                out.append(segment)
-        last = end
-    out.append(text[last:])
-    return "".join(out)
+    lines = text.splitlines(keepends=True)
+    dialogue_count = 0
+    updated: list[str] = []
+    for line in lines:
+        if re.match(r"^\s*[-—]\s+", line):
+            dialogue_count += 1
+            if dialogue_count > max_lines:
+                line = re.sub(r"^(\s*)[-—]\s+", r"\1", line)
+        updated.append(line)
+    return "".join(updated)
 
 
 def _ensure_dialogue_count(text: str, target_lines: int = 2) -> str:
     """
-    Ensure the text includes exactly target_lines of quoted dialogue by appending short lines.
+    Ensure the text includes at least target_lines of dialogue by appending short lines.
     """
     current = _count_dialogue_lines(text)
     if current >= target_lines:
         return text
 
     additions = [
-        '"We can fix it," she said.',
-        '"That was silly," he laughed.',
+        "- We can fix it.",
+        "- That was silly.",
     ]
     needed = target_lines - current
-    extra = " ".join(additions[:needed])
-    return f"{text.rstrip()} {extra}".strip()
+    extra = "\n".join(additions[:needed])
+    separator = "\n" if text.rstrip() else ""
+    return f"{text.rstrip()}{separator}{extra}".strip()
 
 
 def _pad_to_min_words(text: str, target_min: int, topic: str, name: str) -> str:
