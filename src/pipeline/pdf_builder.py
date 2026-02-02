@@ -95,15 +95,13 @@ def _draw_cover_page(
             box_h = top_y - bottom_y
             box_x = margin
             box_y = bottom_y
-            canvas_pdf.drawImage(
-                img,
-                box_x,
-                box_y,
-                box_w,
-                box_h,
-                preserveAspectRatio=True,
-                anchor="c",
-            )
+            img_w, img_h = img.getSize()
+            scale = min(box_w / img_w, box_h / img_h)
+            draw_w = img_w * scale
+            draw_h = img_h * scale
+            offset_x = box_x + (box_w - draw_w) / 2
+            offset_y = box_y + (box_h - draw_h) / 2
+            canvas_pdf.drawImage(img, offset_x, offset_y, draw_w, draw_h, preserveAspectRatio=True)
 
     today = datetime.now().strftime("%B %d, %Y")
     canvas_pdf.setFont("Helvetica", 11)
