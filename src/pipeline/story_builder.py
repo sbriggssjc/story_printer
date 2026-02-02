@@ -12,6 +12,12 @@ class StoryPage:
     illustration_path: str | None = None
     image_path: str | None = None
 
+    def __post_init__(self) -> None:
+        if self.image_path is None and self.illustration_path:
+            self.image_path = self.illustration_path
+        if self.illustration_path is None and self.image_path:
+            self.illustration_path = self.image_path
+
 
 @dataclass
 class StoryBook:
