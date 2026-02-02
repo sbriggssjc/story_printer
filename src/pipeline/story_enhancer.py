@@ -1218,7 +1218,8 @@ def _maybe_generate_images(story: StoryBook) -> None:
             else:
                 continue
 
-            page.image_path = str(image_path)
-            page.illustration_path = str(image_path)  # back-compat
+            saved_path = str(image_path)
+            page.illustration_path = saved_path
+            setattr(page, "image_path", saved_path)  # back-compat
         except Exception:
             continue
