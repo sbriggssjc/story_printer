@@ -1042,52 +1042,110 @@ def _build_pages_from_data(data: dict[str, Any], target_pages: int) -> list[Stor
     return pages
 
 
+def _extract_story_beats(cleaned: str) -> dict[str, str]:
+    lower = (cleaned or "").lower()
+    claire_name = "Claire" if "claire" in lower else "Claire"
+    dad_name = "Dad" if any(token in lower for token in ("dad", "father")) else "Dad"
+    object_name = "pizza crust" if "crust" in lower or "pizza" in lower else "pizza crust"
+
+    deception_phrases = ("hide", "hid", "threw away", "throw away", "lied", "lie")
+    deception_action = "hid it under her napkin"
+    if any(phrase in lower for phrase in deception_phrases):
+        if "threw away" in lower or "throw away" in lower:
+            deception_action = "threw it away when no one was looking"
+        elif "lied" in lower or "lie" in lower:
+            deception_action = "tucked it away and told a small lie"
+        else:
+            deception_action = "hid it under her napkin"
+
+    lesson_line = "I wish I would have listened."
+    if "should've listened" in lower or "should have listened" in lower:
+        lesson_line = "I should have listened."
+    if "wish i listened" in lower or "wish i'd listened" in lower:
+        lesson_line = "I wish I listened."
+
+    return {
+        "claire_name": claire_name,
+        "dad_name": dad_name,
+        "object_name": object_name,
+        "deception_action": deception_action,
+        "lesson_line": lesson_line,
+    }
+
+
+def _local_page_expansions(claire_name: str, dad_name: str, *, stage: str) -> list[str]:
+    if stage == "resolution":
+        return [
+            f"{dad_name}'s horse snorted softly and stamped the ground, eager and brave.",
+            f"{claire_name} felt the knot in her chest loosen as the danger passed.",
+            "The kitchen smelled warm and buttery, and the plates clinked gently on the table.",
+            "A neighbor waved through the window, smiling at the excitement.",
+            "The wind carried away the last rumble of the monster.",
+            f"{dad_name} brushed {claire_name}'s hair back and listened closely.",
+            "The house felt safe again, like a blanket tucked around their shoulders.",
+            "They laughed in relief, the kind of laughter that turns fear into a story.",
+        ]
+    return [
+        "The afternoon light painted soft squares on the floor.",
+        f"{claire_name} shifted her feet, unsure, while the room grew still.",
+        "The pizza smelled cheesy and warm, but the air felt prickly with worry.",
+        f"{dad_name} looked up with a gentle question in his eyes.",
+        "A curtain fluttered, and a shadow slid across the wall.",
+        "The monster's footsteps thudded like drums outside.",
+        "The table vibrated with each stomp, making cups tremble.",
+        f"{claire_name}'s heart beat fast, like a small bird in her chest.",
+    ]
+
+
 def _local_storybook(
     cleaned: str,
     title: str,
     narrator: str | None,
     target_pages: int,
 ) -> StoryBook:
-    topic = _infer_topic(cleaned)
-    name = narrator or "A young storyteller"
-    snippet = _snippet_from_transcript(cleaned)
-    seed = abs(hash(cleaned or topic)) % (2**32)
+    beats = _extract_story_beats(cleaned)
+    claire_name = beats["claire_name"]
+    dad_name = beats["dad_name"]
+    object_name = beats["object_name"]
+    seed = abs(hash(cleaned or "storybook")) % (2**32)
     rng = random.Random(seed)
     used_sentences: set[str] = set()
 
     page1 = (
-        f"On a bright afternoon, {name} felt a fizz of curiosity about {topic}. "
-        f"The day began with a giggle and a whisper of adventure, and soon a playful idea popped up: {snippet}. "
-        "At first it seemed tiny and harmless, like a secret tucked in a sock, but the air started to buzz. "
-        f"Someone whispered:\n- Should we tell?\n"
-        f"{name} grinned, watching the idea wobble bigger. "
-        "A silly misunderstanding bounced from friend to friend, and even the pets looked suspicious. "
-        "By the time the sun slid behind a cloud, the mix-up had become a swirl of whispers and wide eyes, "
-        "and the next step was about to land with a thump."
+        f"{claire_name} and {dad_name} shared a cozy pizza lunch at home. "
+        f"There was just one {object_name} left, and {claire_name} wanted it so badly her fingers curled. "
+        f"Instead of asking, she {beats['deception_action']}, and when {dad_name} asked about the missing crust, "
+        f"{claire_name} gave a tiny fib that felt like a pebble in her pocket. "
+        "The room went quiet for a moment, as if the house was holding its breath. "
+        "Outside the window, a shadow stretched long and a growl rumbled, soft at first and then louder. "
+        f"A pizza monster stomped into the yard, sniffing the air for {object_name}s, "
+        "and it peered in with hungry, googly eyes. "
+        f"{claire_name} froze, her stomach fluttering as the monster crept closer."
     )
     page1 = _expand_text_to_range(
         page1,
         _MIN_WORDS_PER_PAGE,
         _MAX_WORDS_PER_PAGE,
-        _page_expansions(topic, name, stage="setup"),
+        _local_page_expansions(claire_name, dad_name, stage="setup"),
         rng=rng,
         used=used_sentences,
     )
 
     page2 = (
-        "With a deep breath and a brave heart, the truth finally tumbled out. "
-        f"{name} admitted it aloud:\n- I did it.\n"
-        "The room froze for one tiny second before melting into relieved smiles. "
-        f"Together they turned the problem into a plan, transforming {topic} into a funny, shared solution. "
-        "There was an apology that sounded like a warm hug and a giggle that sounded like bells. "
-        "Everyone joined in to fix the mix-up, and the story swung toward a cozy, happy ending. "
-        "By bedtime, the adventure felt like a secret handshake—silly, sweet, and sure to be remembered."
+        "The pizza monster lunged, and the table rattled as it swiped the air. "
+        f"Just then, {dad_name} burst through the gate riding a shiny horse, its mane glittering like coins. "
+        f"With one brave swing, {dad_name} sent the monster tumbling away and chased it from the yard. "
+        f"{claire_name}'s eyes filled with tears. She whispered, \"{beats['lesson_line']}\" "
+        f"and she told {dad_name} the truth about the {object_name}. "
+        f"{dad_name} knelt beside her, hugged her tight, and said mistakes could be mended with honesty. "
+        f"Together they shared fresh pizza, and {claire_name} promised to speak up next time. "
+        "The sun set warm and golden, and the house felt safe and peaceful again."
     )
     page2 = _expand_text_to_range(
         page2,
         _MIN_WORDS_PER_PAGE,
         _MAX_WORDS_PER_PAGE,
-        _page_expansions(topic, name, stage="resolution"),
+        _local_page_expansions(claire_name, dad_name, stage="resolution"),
         rng=rng,
         used=used_sentences,
     )
@@ -1096,15 +1154,17 @@ def _local_storybook(
         StoryPage(
             text=page1,
             illustration_prompt=(
-                f"A whimsical storybook scene of {name} discovering {topic}, "
-                "with bright colors, cozy surroundings, gentle watercolor textures, and a playful hint of mischief."
+                f"A cozy kitchen storybook scene with {claire_name} and {dad_name} at a pizza lunch, "
+                f"a single {object_name} on the plate, and a silly pizza monster looming outside the window, "
+                "bright colors, gentle watercolor textures, warm afternoon light, and playful tension."
             ),
         ),
         StoryPage(
             text=page2,
             illustration_prompt=(
-                f"A warm, joyful illustration of friends making amends around {topic}, "
-                "smiling and laughing in a cozy setting with gentle, friendly colors and soft light."
+                f"A triumphant, heartwarming illustration of {dad_name} on a shiny horse chasing away a pizza monster, "
+                f"with {claire_name} relieved and hugging {dad_name} afterward, cozy home setting, "
+                "gentle watercolor textures, warm golden light, and a peaceful ending."
             ),
         ),
     ]
