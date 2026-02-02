@@ -1936,6 +1936,12 @@ def _openai_storybook(
             narrator,
             append_expansions=False,
         )
+        _pad_pages_with_anchor_paragraphs(
+            pages,
+            anchor_spec=anchor_spec,
+            min_words=_MIN_WORDS_PER_PAGE,
+            max_words=_MAX_WORDS_PER_PAGE,
+        )
         _trim_pages_to_word_limit(pages, _MAX_WORDS_PER_PAGE)
 
         low_word_pages = [
@@ -2776,6 +2782,12 @@ def _local_storybook(
         page_text = _pad_to_min_words_no_repeats(
             page_text, _MIN_WORDS_PER_PAGE, padding_candidates, used_sentences
         )
+        page_text = _pad_page_with_anchor_paragraphs(
+            page_text,
+            anchor_spec=anchor_spec,
+            min_words=_MIN_WORDS_PER_PAGE,
+            max_words=_MAX_WORDS_PER_PAGE,
+        )
         illustration_prompt_parts = [
             "Watercolor children's picture book illustration",
         ]
@@ -3186,6 +3198,134 @@ def _anchor_padding_sentences(anchor_spec: AnchorSpec, narrator: str | None) -> 
         sentences.append(f"{character} stayed close, keeping the plan honest and steady.")
 
     return _dedupe_preserve_order(sentences)
+
+
+def _anchor_phrase_keywords(phrase: str) -> list[str]:
+    return [token.lower() for token in re.findall(r"[A-Za-z']+", phrase) if len(token) > 3]
+
+
+def _phrase_covered(text: str, phrase: str) -> bool:
+    if not phrase:
+        return True
+    lowered = text.lower()
+    keywords = _anchor_phrase_keywords(phrase)
+    if not keywords:
+        return phrase.lower() in lowered
+    required = max(1, math.ceil(len(keywords) * 0.5))
+    return sum(1 for keyword in keywords if keyword in lowered) >= required
+
+
+def _missing_anchor_items(text: str, anchor_spec: AnchorSpec) -> list[str]:
+    lowered = (text or "").lower()
+    missing_beats = [
+        beat for beat in (anchor_spec.beats or []) if beat and not _phrase_covered(lowered, beat)
+    ]
+    missing_objects = [
+        obj for obj in (anchor_spec.key_objects or []) if obj and obj.lower() not in lowered
+    ]
+    missing_setting = [anchor_spec.setting] if anchor_spec.setting and anchor_spec.setting.lower() not in lowered else []
+    missing_characters = [
+        char for char in (anchor_spec.characters or []) if char and char.lower() not in lowered
+    ]
+    missing_lesson = [anchor_spec.lesson] if anchor_spec.lesson and anchor_spec.lesson.lower() not in lowered else []
+    return _dedupe_preserve_order(
+        [item for item in missing_beats + missing_objects + missing_setting + missing_characters + missing_lesson if item]
+    )
+
+
+def _sensory_clause_for_anchor(anchor: str) -> str:
+    lowered = anchor.lower()
+    cues = [
+        (("pizza", "cheese", "crust"), "the scent of warm cheese lingered in the air"),
+        (("trash", "bin", "garbage"), "a metal lid rang out with a sharp clang"),
+        (("hoof", "horse"), "hoofbeats clicked across the ground in quick taps"),
+        (("rain", "storm"), "rain pattered in a steady, close rhythm"),
+        (("snow", "ice", "frost"), "cold flakes brushed against their cheeks"),
+        (("ocean", "sea", "salt"), "salt air pricked their noses"),
+        (("forest", "tree", "pine"), "damp earth and pine filled each breath"),
+        (("fire", "smoke", "ember"), "heat wavered and smoke curled nearby"),
+        (("robot", "machine", "motor"), "tiny motors whirred with a tinny buzz"),
+        (("castle", "stone", "tower"), "cool stone held a faint echo"),
+    ]
+    for keys, clause in cues:
+        if any(key in lowered for key in keys):
+            return clause
+
+    noun_phrases = _extract_noun_phrases(anchor, min_count=1, max_count=1)
+    if noun_phrases:
+        noun = noun_phrases[0]
+        return f"the {noun} left a clear texture against their hands"
+    return "the moment carried a small, concrete detail they could feel"
+
+
+def _sentence_with_sensory(anchor: str) -> str:
+    sentence = _split_sentences(anchor)
+    base = (sentence[0] if sentence else anchor).strip().rstrip(".!?")
+    if not base:
+        return ""
+    base = base[0].upper() + base[1:]
+    sensory = _sensory_clause_for_anchor(base)
+    return f"{base}, {sensory}."
+
+
+def _anchor_padding_paragraph(anchor_one: str, anchor_two: str | None = None) -> str:
+    sentences = []
+    first = _sentence_with_sensory(anchor_one)
+    if first:
+        sentences.append(first)
+    if anchor_two:
+        second = _sentence_with_sensory(anchor_two)
+        if second:
+            sentences.append(second)
+    return " ".join(sentences).strip()
+
+
+def _pad_page_with_anchor_paragraphs(
+    text: str,
+    *,
+    anchor_spec: AnchorSpec,
+    min_words: int,
+    max_words: int,
+) -> str:
+    if _word_count(text) >= min_words:
+        return text
+    missing = _missing_anchor_items(text, anchor_spec)
+    if not missing:
+        return text
+    current = text.strip()
+    paragraphs_added = 0
+    index = 0
+    while _word_count(current) < min_words and paragraphs_added < 3 and index < len(missing):
+        anchor_one = missing[index]
+        anchor_two = missing[index + 1] if index + 1 < len(missing) else None
+        paragraph = _anchor_padding_paragraph(anchor_one, anchor_two)
+        if not paragraph:
+            break
+        next_text = f"{current}\n\n{paragraph}" if current else paragraph
+        if _word_count(next_text) > max_words and _word_count(current) >= min_words:
+            break
+        current = next_text
+        paragraphs_added += 1
+        index += 2 if anchor_two else 1
+    return current
+
+
+def _pad_pages_with_anchor_paragraphs(
+    pages: list[StoryPage],
+    *,
+    anchor_spec: AnchorSpec,
+    min_words: int,
+    max_words: int,
+) -> None:
+    for page in pages:
+        if _word_count(page.text) >= min_words:
+            continue
+        page.text = _pad_page_with_anchor_paragraphs(
+            page.text,
+            anchor_spec=anchor_spec,
+            min_words=min_words,
+            max_words=max_words,
+        )
 
 
 def _pad_to_min_words_no_repeats(
