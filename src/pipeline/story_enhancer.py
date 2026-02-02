@@ -879,15 +879,25 @@ def _dedupe_across_pages(pages: list[StoryPage]) -> list[StoryPage]:
     return out
 
 
-def _expand_text_to_range(text: str, target_min: int, target_max: int, additions: list[str]) -> str:
+def _expand_text_to_range(
+    text: str,
+    target_min: int,
+    target_max: int,
+    additions: list[str],
+    used_sentences: set[str] | None = None,
+) -> str:
     """
     Expand with varied, transcript-keyword-aware additions until we hit target_min (without exceeding target_max).
     """
     current = text.strip()
-    used = set()
+    used = used_sentences if used_sentences is not None else set()
+    seen_local = {s.lower().strip() for s in _split_sentences(current)}
     current_words = _word_count(current)
     for sentence in additions:
-        if sentence in used:
+        normalized = sentence.lower().strip()
+        if not normalized:
+            continue
+        if normalized in seen_local or normalized in used:
             continue
         next_text = f"{current} {sentence}".strip()
         next_words = _word_count(next_text)
@@ -896,7 +906,8 @@ def _expand_text_to_range(text: str, target_min: int, target_max: int, additions
         if next_words <= target_max or current_words < target_min:
             current = next_text
             current_words = next_words
-            used.add(sentence)
+            seen_local.add(normalized)
+            used.add(normalized)
         if current_words >= target_min:
             break
     return current
@@ -977,13 +988,26 @@ def _repair_pages(
     if total_dialogue > _DIALOGUE_MAX and pages:
         pages[-1].text = re.sub(r'["“”]', "", pages[-1].text)
 
+    used_sentences = {
+        s.lower().strip()
+        for p in pages
+        for s in _split_sentences(p.text)
+        if s.strip()
+    }
+
     # 4) word count normalization (expand if short)
     for idx, p in enumerate(pages):
         wc = _word_count(p.text)
         if wc < target_min:
             stage = "setup" if idx == 0 else "resolution"
             additions = _keyword_expansions(required_terms, stage=stage, rng=rng)
-            p.text = _expand_text_to_range(p.text, target_min, target_max, additions)
+            p.text = _expand_text_to_range(
+                p.text,
+                target_min,
+                target_max,
+                additions,
+                used_sentences=used_sentences,
+            )
 
         # If still short (very short transcript), we allow slightly under-min rather than failing hard
         # but we will try to hit min as best effort.
@@ -1094,6 +1118,7 @@ def _local_storybook(cleaned: str, title: str, narrator: str | None, target_page
 
     anchor_spec = _extract_anchor_spec(cleaned, max_terms=_ANCHOR_MAX_TERMS)
     required_terms = _anchor_terms_for_expansion(anchor_spec, max_terms=_ANCHOR_MAX_TERMS)
+    used_sentences: set[str] = set()
     pages = [
         StoryPage(
             text=_expand_text_to_range(
@@ -1101,6 +1126,7 @@ def _local_storybook(cleaned: str, title: str, narrator: str | None, target_page
                 _MIN_WORDS_PER_PAGE,
                 _MAX_WORDS_PER_PAGE,
                 _keyword_expansions(required_terms, "setup", rng),
+                used_sentences=used_sentences,
             ),
             illustration_prompt=(
                 f"Watercolor children's book illustration of {name} and {topic} beginning, "
@@ -1113,6 +1139,7 @@ def _local_storybook(cleaned: str, title: str, narrator: str | None, target_page
                 _MIN_WORDS_PER_PAGE,
                 _MAX_WORDS_PER_PAGE,
                 _keyword_expansions(required_terms, "resolution", rng),
+                used_sentences=used_sentences,
             ),
             illustration_prompt=(
                 f"Watercolor children's book illustration of {name} resolving {topic}, "
