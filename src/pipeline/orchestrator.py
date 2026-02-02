@@ -8,6 +8,8 @@ from src.pipeline.story_builder import build_storybook
 # ADD THIS IMPORT
 from src.pipeline.audio_transcriber import transcribe_audio
 
+__all__ = ["run_once", "run_once_from_audio"]
+
 def run_once(transcript: str, pages: list[str] | None = None) -> Path:
     if pages:
         book = build_storybook(transcript, pages=pages)
@@ -20,11 +22,11 @@ def run_once(transcript: str, pages: list[str] | None = None) -> Path:
         subtitle=book.subtitle,
         pages=book.pages,
         narrator=book.narrator,
-        cover_image_path=book.cover_image_path or book.cover_illustration_path,
+        cover_image_path=book.cover_image_path or book.cover_path or book.cover_illustration_path,
     )
 
 
-def run_once_from_audio(audio_path: str | Path, pages: list[str] | None = None) -> Path:
+def run_once_from_audio(audio_path: str, pages: list[str] | None = None) -> Path:
     """
     Build a storybook PDF from an audio recording:
     audio -> transcript -> story enhancement/build -> PDF
