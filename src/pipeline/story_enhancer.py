@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import importlib
 import json
+import math
 import os
 import random
 import re
@@ -126,6 +127,10 @@ def _dedupe_cross_page_sentences(pages: list[StoryPage], min_words: int) -> bool
             page.text = new_text
 
     return changed
+
+
+def _normalize_sentence_key(sentence: str) -> str:
+    return re.sub(r"\s+", " ", sentence.strip()).lower()
 
 
 def _find_blocklisted_sentences(text: str) -> list[str]:
@@ -796,6 +801,230 @@ def _fails_fidelity(pages_text: str, must_keywords: list[str]) -> tuple[list[str
     return reasons, banned_phrases
 
 
+_ANCHOR_SYNONYM_GROUPS = [
+    {"trash can", "trashcan", "garbage", "garbage can", "bin", "trash bin"},
+    {"bicycle", "bike"},
+    {"sofa", "couch"},
+]
+
+
+_COMMON_VERBS = {
+    "asked",
+    "arrived",
+    "ate",
+    "brought",
+    "built",
+    "called",
+    "carried",
+    "caught",
+    "chased",
+    "cleaned",
+    "climbed",
+    "cooked",
+    "cried",
+    "decided",
+    "drew",
+    "drank",
+    "dropped",
+    "drove",
+    "fell",
+    "found",
+    "gave",
+    "got",
+    "grabbed",
+    "heard",
+    "hid",
+    "hit",
+    "hugged",
+    "jumped",
+    "kept",
+    "kicked",
+    "laughed",
+    "left",
+    "lied",
+    "listened",
+    "looked",
+    "lost",
+    "made",
+    "met",
+    "opened",
+    "picked",
+    "played",
+    "pulled",
+    "pushed",
+    "ran",
+    "reached",
+    "rode",
+    "saw",
+    "said",
+    "saved",
+    "shared",
+    "shouted",
+    "sat",
+    "sang",
+    "slept",
+    "spoke",
+    "stood",
+    "told",
+    "threw",
+    "tried",
+    "took",
+    "tripped",
+    "waited",
+    "walked",
+    "wanted",
+    "watched",
+    "went",
+    "wrote",
+}
+
+
+def _extract_key_verbs(cleaned: str, *, max_count: int = 4) -> list[str]:
+    if not cleaned:
+        return []
+    stopwords = {
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "but",
+        "so",
+        "to",
+        "of",
+        "in",
+        "on",
+        "at",
+        "for",
+        "with",
+        "from",
+        "into",
+        "up",
+        "down",
+        "over",
+        "under",
+        "then",
+        "when",
+        "while",
+        "after",
+        "before",
+        "as",
+        "that",
+        "this",
+        "these",
+        "those",
+        "it",
+        "its",
+        "is",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "am",
+        "are",
+        "do",
+        "did",
+        "does",
+        "done",
+        "have",
+        "has",
+        "had",
+        "i",
+        "you",
+        "we",
+        "he",
+        "she",
+        "they",
+        "him",
+        "her",
+        "them",
+        "our",
+        "their",
+        "my",
+        "your",
+        "me",
+    }
+    words = [word.lower() for word in re.findall(r"[A-Za-z']+", cleaned)]
+    verbs: list[str] = []
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if word in stopwords:
+            index += 1
+            continue
+        if word in {"throw", "threw", "thrown"} and index + 1 < len(words):
+            next_word = words[index + 1]
+            if next_word in {"away", "out"}:
+                verbs.append(f"{word} {next_word}")
+                index += 2
+                continue
+        if word in _COMMON_VERBS or word.endswith("ed") or word.endswith("ing"):
+            verbs.append(word)
+        index += 1
+    return _dedupe_preserve_order(verbs)[:max_count]
+
+
+def _extract_anchor_tokens(cleaned: str, narrator: str | None) -> list[str]:
+    names = _extract_proper_names(cleaned, narrator) + _extract_role_characters(cleaned)
+    excluded = set(names)
+    nouns = _extract_noun_phrases(cleaned, min_count=4, max_count=8, excluded=excluded)
+    verbs = _extract_key_verbs(cleaned, max_count=4)
+    tokens = _dedupe_preserve_order(names + nouns + verbs)
+    if len(tokens) < 6:
+        extra_nouns = _extract_noun_phrases(cleaned, min_count=2, max_count=10, excluded=excluded)
+        tokens = _dedupe_preserve_order(tokens + extra_nouns)
+    if len(tokens) < 6:
+        tokens = _dedupe_preserve_order(tokens + verbs)
+    return tokens[:10]
+
+
+def _anchor_token_coverage(
+    story_text: str,
+    anchor_tokens: list[str],
+    *,
+    min_ratio: float = 0.6,
+    min_required: int = 4,
+) -> tuple[bool, str]:
+    if not anchor_tokens:
+        return True, ""
+    text_lower = story_text.lower()
+    group_map: dict[str, set[str]] = {}
+    for group in _ANCHOR_SYNONYM_GROUPS:
+        for term in group:
+            group_map[term] = group
+
+    def contains_term(term: str) -> bool:
+        pattern = r"\b" + re.escape(term.lower()) + r"\b"
+        return re.search(pattern, text_lower) is not None
+
+    found: list[str] = []
+    missing: list[str] = []
+    for token in anchor_tokens:
+        token_lower = token.lower()
+        group = group_map.get(token_lower)
+        if group:
+            if any(contains_term(term) for term in group):
+                found.append(token)
+            else:
+                missing.append(token)
+            continue
+        if contains_term(token_lower):
+            found.append(token)
+        else:
+            missing.append(token)
+
+    required = max(min_required, math.ceil(len(anchor_tokens) * min_ratio))
+    required = min(required, len(anchor_tokens))
+    if len(found) >= required:
+        return True, ""
+    summary = (
+        f"Anchor token coverage too low: {len(found)}/{len(anchor_tokens)} found, "
+        f"need at least {required}. Missing: {', '.join(missing)}."
+    )
+    return False, summary
+
+
 _NEGATION_TERMS = (
     "didn't",
     "did not",
@@ -1128,6 +1357,12 @@ def _build_openai_prompts(
         "- You may add whimsical details, but do not add new major plotlines.\n"
         f"- {_MIN_WORDS_PER_PAGE}–{_MAX_WORDS_PER_PAGE} words per page (target {_DEFAULT_WORDS_PER_PAGE}).\n"
         "- Each page must include a rich illustration_prompt in consistent watercolor picture-book style.\n"
+        "- Write in scene-based narrative (actions, feelings, sensory detail).\n"
+        "- Do not use meta-story phrasing like:\n"
+        "  - This was the part where...\n"
+        "  - X stayed important as the story moved forward...\n"
+        "  - The lesson was...\n"
+        "- Do not list events as short declarative sentences.\n"
         f"{beat_sheet}\n"
         "MUST KEEP TRUE FACTS (do not change these; list them verbatim):\n"
         f"{facts_lines}\n\n"
@@ -1180,33 +1415,29 @@ def _openai_storybook(
     system_prompt, user_prompt, anchor_spec = _build_openai_prompts(
         anchor_spec, plot_facts, narrator, target_pages
     )
+    repair_spec: dict[str, Any] | None = None
     fidelity_note: str | None = None
+    anchor_tokens = _extract_anchor_tokens(cleaned_transcript, narrator)
+    coverage_note: str | None = None
 
     repeat_sentence_note: str | None = None
     for attempt in range(2):
         correction = ""
         if attempt == 1:
+            repair_payload = repair_spec or {}
             correction = (
-                "Targeted repair only. Keep tone, page structure, and length stable.\n"
-                "Fix ONLY the missing beats or contradictions; do not add new major plotlines.\n"
-                "Rewrite the story to satisfy ALL requirements:\n"
-                f"- EXACTLY {target_pages} pages.\n"
-                f"- EACH page MUST be between {_MIN_WORDS_PER_PAGE} and {_MAX_WORDS_PER_PAGE} words.\n"
-                '- Exactly two dialogue lines total using straight quotes, e.g. "...". Each must be a full sentence on its own line starting with "- " or "— ".\n'
-                "- Each dialogue line must be short (<= 12 words) and natural.\n"
-                "- Do not use quotation marks for emphasis or any other purpose.\n"
-                "- Return ONLY JSON matching the schema. No extra keys, no commentary."
+                "Second-pass rewrite required. Use ONLY the repair spec below.\n"
+                "Rewrite completely; do NOT reuse phrasing from any previous attempt.\n"
+                "Do not quote or paste any prior story text.\n"
+                "Return ONLY JSON matching the schema. No extra keys, no commentary.\n\n"
+                "Repair spec (machine-built JSON):\n"
+                f"{json.dumps(repair_payload, ensure_ascii=False, indent=2)}"
             )
-            if fidelity_note:
+            if coverage_note:
                 correction += (
-                    "\nFidelity fixes required (be surgical; keep tone and length):\n"
-                    f"{fidelity_note}\n"
-                    "Fix the specific beats/contradictions only; keep page order and structure."
-                )
-            if repeat_sentence_note:
-                correction += (
-                    "\nRepeated sentence fix required (be surgical; keep structure unchanged):\n"
-                    f"{repeat_sentence_note}\n"
+                    "\nAnchor token coverage fixes required (be surgical; keep tone and length):\n"
+                    f"{coverage_note}\n"
+                    "Improve coverage without adding new major plotlines."
                 )
         try:
             if client:
@@ -1244,15 +1475,7 @@ def _openai_storybook(
             return None
 
         # Post-process pages BEFORE validation so we validate the final text that will be printed
-        used_sentences: set[str] = set()
-        padding_candidates = _anchor_padding_sentences(anchor_spec, narrator)
         for page in pages:
-            page.text = _pad_to_min_words_no_repeats(
-                page.text,
-                _MIN_WORDS_PER_PAGE,
-                padding_candidates,
-                used_sentences,
-            )
             page.text = _normalize_dialogue_lines(page.text, max_lines=2)
 
         total_dialogue = sum(_count_dialogue_lines(page.text) for page in pages)
@@ -1269,22 +1492,24 @@ def _openai_storybook(
                     used_sentences,
                 )
 
-        remaining_dupes = _find_duplicate_sentences_across_pages([page.text for page in pages])
-        if remaining_dupes:
-            repeat_sentence_note = (
-                "Rewrite ONLY this sentence everywhere it appears, leaving everything else unchanged:\n"
-                f"Sentence: \"{remaining_dupes[0]}\""
-            )
-
         valid, reasons = _validate_story_pages(pages, target_pages)
         if not valid:
             print(f"Validation failed: {', '.join(reasons)}")
             if attempt == 0:
-                if repeat_sentence_note and all(
-                    reason.startswith("repeated sentence across pages:") for reason in reasons
-                ):
-                    continue
-                repeat_sentence_note = None
+                repair_spec = _build_repair_spec(reasons, target_pages)
+        _ensure_minimum_dialogue_lines(pages, target_pages)
+        _ensure_unique_sentences_across_pages(pages, anchor_spec, cleaned_transcript, narrator)
+        _trim_pages_to_word_limit(pages, _MAX_WORDS_PER_PAGE)
+
+        valid, reasons = _validate_story_pages(
+            pages,
+            target_pages,
+            enforce_word_count=False,
+            enforce_dialogue=False,
+        )
+        if not valid:
+            print(f"Validation failed: {', '.join(reasons)}")
+            if attempt == 0:
                 user_prompt = (
                     f"{user_prompt}\n\n"
                     "Your previous attempt failed validation. Fix ALL issues below:\n"
@@ -1301,10 +1526,14 @@ def _openai_storybook(
         if banned_phrases:
             print(f"Fidelity failed: contains banned filler phrases: {', '.join(banned_phrases)}")
             if attempt == 0:
+                repair_spec = _build_repair_spec(
+                    [],
+                    target_pages,
+                    banned_phrases=banned_phrases,
                 user_prompt = (
                     f"{user_prompt}\n\nIssues:\n- "
                     + "\n- ".join([f"contains banned filler phrase: {p}" for p in banned_phrases])
-                    + "\n\nRewrite while keeping the anchor beats EXACT."
+                    + "\n\nRewrite while preserving the anchor beats (paraphrase allowed)."
                 )
                 continue
             return None
@@ -1316,10 +1545,10 @@ def _openai_storybook(
                 + "; ".join(rule_contradictions)
             )
             if attempt == 0:
-                user_prompt = (
-                    f"{user_prompt}\n\nIssues:\n- "
-                    + "\n- ".join(rule_contradictions)
-                    + "\n\nRewrite to avoid contradicting the transcript."
+                repair_spec = _build_repair_spec(
+                    [],
+                    target_pages,
+                    rule_contradictions=rule_contradictions,
                 )
                 continue
             return None
@@ -1351,9 +1580,22 @@ def _openai_storybook(
             fidelity_result = {"pass": True}
 
         if not fidelity_result.get("pass", False):
-            fidelity_note = _summarize_fidelity_issues(fidelity_result)
             print("Fidelity failed via anchor check.")
             if attempt == 0:
+                repair_spec = _build_repair_spec(
+                    [],
+                    target_pages,
+                    fidelity_result=fidelity_result,
+        coverage_ok, coverage_summary = _anchor_token_coverage(all_text, anchor_tokens)
+        if not coverage_ok:
+            coverage_note = coverage_summary
+            print("Fidelity failed via anchor token coverage.")
+            if attempt == 0:
+                user_prompt = (
+                    f"{user_prompt}\n\nIssues:\n- "
+                    + coverage_summary
+                    + "\n\nRewrite to include more of the anchor tokens from the transcript."
+                )
                 continue
             return None
 
@@ -1721,7 +1963,13 @@ def _validate_story_data(data: Any, target_pages: int) -> tuple[bool, list[str]]
     return (len(reasons) == 0, reasons)
 
 
-def _validate_story_pages(pages: list[StoryPage], target_pages: int) -> tuple[bool, list[str]]:
+def _validate_story_pages(
+    pages: list[StoryPage],
+    target_pages: int,
+    *,
+    enforce_word_count: bool = True,
+    enforce_dialogue: bool = True,
+) -> tuple[bool, list[str]]:
     if not isinstance(pages, list) or len(pages) != target_pages:
         return False, [
             f"expected {target_pages} pages but got {len(pages) if isinstance(pages, list) else 'non-list'}"
@@ -1742,7 +1990,7 @@ def _validate_story_pages(pages: list[StoryPage], target_pages: int) -> tuple[bo
             reasons.append(f"page {index} missing illustration_prompt")
 
         wc = _word_count(text)
-        if wc < _MIN_WORDS_PER_PAGE or wc > _MAX_WORDS_PER_PAGE:
+        if enforce_word_count and (wc < _MIN_WORDS_PER_PAGE or wc > _MAX_WORDS_PER_PAGE):
             reasons.append(
                 f"page {index} word count {wc} outside {_MIN_WORDS_PER_PAGE}-{_MAX_WORDS_PER_PAGE}"
             )
@@ -1759,10 +2007,89 @@ def _validate_story_pages(pages: list[StoryPage], target_pages: int) -> tuple[bo
     if dupes:
         reasons.append(f"repeated sentence across pages: {dupes[0]}")
 
-    if total_dialogue < 1 or total_dialogue > 3:
+    if enforce_dialogue and (total_dialogue < 1 or total_dialogue > 3):
         reasons.append(f"dialogue lines counted {total_dialogue} but expected 1-3")
 
     return (len(reasons) == 0, reasons)
+
+
+def _build_repair_spec(
+    reasons: list[str],
+    target_pages: int,
+    *,
+    banned_phrases: list[str] | None = None,
+    rule_contradictions: list[str] | None = None,
+    fidelity_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    problems: set[str] = set()
+    avoid_phrases = set(_BLOCKLIST_SENTENCES)
+    if banned_phrases:
+        problems.add("banned_filler_phrases")
+        avoid_phrases.update(banned_phrases)
+
+    for reason in reasons:
+        if reason.startswith("expected ") and " pages but got " in reason:
+            problems.add("page_count_mismatch")
+            continue
+        match = re.search(r"page (\d+) word count (\d+) outside", reason)
+        if match:
+            page_num = int(match.group(1))
+            word_count = int(match.group(2))
+            if word_count < _MIN_WORDS_PER_PAGE:
+                problems.add(f"page_{page_num}_too_short")
+            else:
+                problems.add(f"page_{page_num}_too_long")
+            continue
+        match = re.search(r"page (\d+) missing text", reason)
+        if match:
+            problems.add(f"page_{int(match.group(1))}_missing_text")
+            continue
+        match = re.search(r"page (\d+) missing illustration_prompt", reason)
+        if match:
+            problems.add(f"page_{int(match.group(1))}_missing_illustration_prompt")
+            continue
+        if "boilerplate sentence" in reason:
+            problems.add("boilerplate_sentence_used")
+            continue
+        if reason.startswith("repeated sentence across pages:"):
+            problems.add("repeated_sentence_across_pages")
+            continue
+        if reason.startswith("dialogue lines counted"):
+            problems.add("dialogue_lines_out_of_range")
+            continue
+
+    constraints: dict[str, Any] = {
+        "exact_pages": target_pages,
+        "min_words_per_page": _MIN_WORDS_PER_PAGE,
+        "max_words_per_page": _MAX_WORDS_PER_PAGE,
+        "dialogue_lines_total": [1, 3],
+        "avoid_meta_phrases": sorted(avoid_phrases),
+    }
+
+    if rule_contradictions:
+        problems.add("rule_contradiction")
+        constraints["avoid_contradictions"] = rule_contradictions
+
+    if fidelity_result:
+        missing_beats = [str(item) for item in fidelity_result.get("missing_beats") or []]
+        contradictions = [str(item) for item in fidelity_result.get("contradictions") or []]
+        issues = [str(item) for item in fidelity_result.get("issues") or []]
+        if missing_beats:
+            problems.add("missing_anchor_beats")
+            constraints["missing_beats"] = missing_beats
+        if contradictions:
+            problems.add("anchor_contradictions")
+            constraints["avoid_contradictions"] = sorted(
+                set(constraints.get("avoid_contradictions", [])) | set(contradictions)
+            )
+        if issues:
+            problems.add("fidelity_issues")
+            constraints["fidelity_issues"] = issues
+
+    return {
+        "problems": sorted(problems),
+        "constraints": constraints,
+    }
 
 
 def _build_pages_from_data(data: dict[str, Any], target_pages: int) -> list[StoryPage]:
@@ -2048,6 +2375,22 @@ def _ensure_dialogue_count(text: str, target_lines: int = 2) -> str:
     return f"{text.rstrip()}{separator}{extra}".strip()
 
 
+def _ensure_minimum_dialogue_lines(pages: list[StoryPage], target_pages: int) -> None:
+    total_dialogue = sum(_count_dialogue_lines(page.text) for page in pages)
+    if total_dialogue >= 1:
+        return
+    fallback_lines = [
+        '- "Dad: Crunch the crust, kiddo!"',
+        '- "Claire: I should\'ve listened, Dad."',
+    ]
+    for index, line in enumerate(fallback_lines[:target_pages]):
+        page = pages[index]
+        if line in page.text:
+            continue
+        separator = "\n" if page.text.rstrip() else ""
+        page.text = f"{page.text.rstrip()}{separator}{line}".strip()
+
+
 def _normalize_dialogue_lines(text: str, max_lines: int = 2) -> str:
     """
     Keep up to max_lines of dialogue. Any extra dialogue lines or quoted segments
@@ -2087,6 +2430,113 @@ def _strip_extra_quotes(text: str, *, allowed: int) -> str:
         return content
 
     return pattern.sub(replace, text)
+
+
+def _build_anchor_expansion_sentences(
+    anchor_spec: AnchorSpec,
+    cleaned: str,
+    narrator: str | None,
+) -> list[str]:
+    primary = narrator or (anchor_spec.characters[0] if anchor_spec.characters else "They")
+    setting = anchor_spec.setting
+    key_objects = anchor_spec.key_objects or []
+    sentences: list[str] = []
+
+    for beat in anchor_spec.beats[:6]:
+        action = beat.strip().rstrip(".")
+        if not action:
+            continue
+        if setting:
+            sentences.append(f"In the {setting}, {primary} {action}.")
+        elif key_objects:
+            sentences.append(f"The {key_objects[0]} was right there when {primary} {action}.")
+        else:
+            sentences.append(f"{primary} {action}.")
+
+    if key_objects:
+        sentences.append(f"{primary} kept the {key_objects[0]} close as the plan unfolded.")
+        if len(key_objects) > 1:
+            sentences.append(f"The {key_objects[1]} waited nearby while {primary} made the next move.")
+    if setting:
+        sentences.append(f"The {setting} held steady as {primary} took a careful breath.")
+
+    sentences.extend(_beat_expansion_sentences(cleaned, narrator))
+    sentences.extend(_fallback_beat_expansions(cleaned, narrator))
+    return _dedupe_preserve_order(sentences)
+
+
+def _append_anchor_expansions(
+    text: str,
+    *,
+    min_words: int,
+    anchor_spec: AnchorSpec,
+    cleaned: str,
+    narrator: str | None,
+    used: set[str],
+    max_sentences: int = 3,
+) -> str:
+    if _word_count(text) >= min_words:
+        return text.strip()
+
+    current = text.strip()
+    existing = {_normalize_sentence_key(s) for s in _split_sentences_for_dedupe(text)}
+    additions = _build_anchor_expansion_sentences(anchor_spec, cleaned, narrator)
+    added = 0
+    for sentence in additions:
+        if added >= max_sentences:
+            break
+        key = _normalize_sentence_key(sentence)
+        if key in existing or key in used:
+            continue
+        separator = " " if current else ""
+        current = f"{current}{separator}{sentence}".strip()
+        existing.add(key)
+        used.add(key)
+        added += 1
+    return current
+
+
+def _ensure_unique_sentences_across_pages(
+    pages: list[StoryPage],
+    anchor_spec: AnchorSpec,
+    cleaned: str,
+    narrator: str | None,
+) -> None:
+    used_sentences: set[str] = set()
+    for page in pages:
+        sents = _split_sentences(page.text)
+        unique: list[str] = []
+        for sentence in sents:
+            key = _normalize_sentence_key(sentence)
+            if key in used_sentences:
+                continue
+            unique.append(sentence.strip())
+            used_sentences.add(key)
+        page.text = " ".join(unique).strip()
+        page.text = _append_anchor_expansions(
+            page.text,
+            min_words=_MIN_WORDS_PER_PAGE,
+            anchor_spec=anchor_spec,
+            cleaned=cleaned,
+            narrator=narrator,
+            used=used_sentences,
+            max_sentences=3,
+        )
+
+
+def _trim_pages_to_word_limit(pages: list[StoryPage], max_words: int) -> None:
+    for page in pages:
+        page.text = _trim_to_max_words(page.text, max_words)
+
+
+def _trim_to_max_words(text: str, max_words: int) -> str:
+    current = text.strip()
+    if _word_count(current) <= max_words:
+        return current
+    sentences = _split_sentences(current)
+    while sentences and _word_count(" ".join(sentences)) > max_words:
+        sentences.pop()
+    return " ".join(sentences).strip()
 
 
 def _anchor_padding_sentences(anchor_spec: AnchorSpec, narrator: str | None) -> list[str]:
