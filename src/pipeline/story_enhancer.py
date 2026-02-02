@@ -1540,6 +1540,9 @@ def _build_openai_prompts(
     system_prompt = (
         "You are a celebrated children's picture-book author and editor. "
         "Expand the transcript into a rich, creative, kid-safe story (not a summary). "
+        "Do NOT use any stock phrases, cliché similes, classroom/hallway sensory filler, "
+        "or generic storybook language. Every sentence must clearly relate to the "
+        "transcript's specific plot and objects. No sentence may be reused across pages. "
         "Return ONLY strict JSON that follows the schema exactly."
     )
     beat_sheet = (
@@ -1637,10 +1640,15 @@ def _build_openai_prompts(
     )
     user_prompt += (
         "\nHard bans:\n"
+        "- Do NOT use any stock phrases, cliché similes, classroom/hallway sensory filler, "
+        "or generic storybook language. Every sentence must clearly relate to the "
+        "transcript's specific plot and objects.\n"
         "- Do NOT use any generic boilerplate sensory sentences.\n"
         "- Do NOT repeat any sentence verbatim across pages.\n"
         "- Do NOT include these sentences (exactly as written):\n"
         + "\n".join([f"  - {s}" for s in sorted(_BLOCKLIST_SENTENCES)])
+        + "\n- Never output these phrases (verbatim or near-verbatim):\n"
+        + "\n".join([f"  - {s}" for s in _BANNED_PHRASES])
         + "\n"
     )
     return system_prompt, user_prompt, anchor_spec
