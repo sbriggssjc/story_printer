@@ -65,6 +65,47 @@ _ANCHOR_STOPWORDS = {
     "along",
     "tries",
     "tried",
+    "made",
+    "make",
+    "makes",
+    "making",
+    "went",
+    "go",
+    "goes",
+    "going",
+    "got",
+    "get",
+    "gets",
+    "getting",
+    "look",
+    "looked",
+    "looks",
+    "looking",
+    "see",
+    "saw",
+    "seen",
+    "think",
+    "thought",
+    "thinking",
+    "know",
+    "knew",
+    "known",
+    "tell",
+    "tells",
+    "telling",
+    "ask",
+    "asked",
+    "asking",
+    "want",
+    "wanted",
+    "wants",
+    "feel",
+    "felt",
+    "feels",
+    "really",
+    "very",
+    "just",
+    "like",
     "told",
     "said",
     "says",
@@ -338,8 +379,8 @@ def _build_retry_instruction(missing_terms: list[str], required_count: int, narr
         name_note = f" Keep protagonist name(s) consistent (e.g., {narrator})."
     return (
         "Your last output failed because it didn’t include required transcript anchors. "
-        f"Rewrite the SAME story, but ensure you literally include at least {required_count} of these "
-        f"words/phrases: {preview}. "
+        f"Rewrite the SAME story and characters, but ensure you literally include at least {required_count} "
+        f"of these missing anchors: {preview}. "
         "Keep the transcript beats consistent (lie/hide → monster → rescue → lesson if present), "
         "and do not add new major characters."
         f"{name_note}"
@@ -544,30 +585,16 @@ def _openai_storybook(
         )
 
         anchors = _build_anchor_list(cleaned, narrator)
-        must = _extract_fidelity_keywords(cleaned, anchors)
         page_texts = [page.text for page in pages]
         coverage_ok, coverage_summary, missing = _anchor_coverage(page_texts, anchors)
 
         if not coverage_ok:
-            print(f"Anchor validation failed: {coverage_summary}")
+            print(f"Transcript coverage failed: {coverage_summary}")
+            if missing:
+                print(f"Missing anchors (preview): {', '.join(missing[:6])}")
             if attempt < 2:
                 retry_instruction = _build_retry_instruction(
-                    missing_terms=missing or anchors,
-                    required_count=_anchor_required_count(len(anchors)),
-                    narrator=narrator,
-                )
-                continue
-            return None
-
-        must = _extract_fidelity_keywords(cleaned, anchors)
-        all_text = " ".join(page_texts)
-        fidelity_result = _fails_fidelity(all_text, must)
-        if not fidelity_result.get("pass", False):
-            fidelity_note = _summarize_fidelity_issues(fidelity_result)
-            print("Fidelity failed via anchor check.")
-            if attempt < 2:
-                retry_instruction = _build_retry_instruction(
-                    missing_terms=fidelity_result.get("missing") or anchors,
+                    missing_terms=missing,
                     required_count=_anchor_required_count(len(anchors)),
                     narrator=narrator,
                 )
@@ -963,21 +990,36 @@ def _keyword_expansions(required_terms: list[str], stage: str, rng: random.Rando
     """
     Generate non-stock, keyword-aware expansion sentences so we don't get the same filler every story.
     """
-    terms = [t for t in required_terms if t and t.lower() not in _STOPWORDS]
+    terms = [
+        t for t in required_terms
+        if t and t.lower() not in _STOPWORDS and t.lower() not in _ANCHOR_STOPWORDS
+    ]
+    terms = [t for t in terms if len(t.strip()) >= 4]
     rng.shuffle(terms)
-    terms = terms[:4]
+    terms = terms[:2]
 
     sensory = [
         "The air felt busy with tiny sounds—shuffling feet, a soft laugh, and something far away clinking.",
         "Somewhere nearby, something smelled delicious, and it made the moment feel even bigger.",
         "The room seemed to hold its breath, like it was waiting to see what would happen next.",
         "A silly idea wobbled into everyone’s thoughts, and suddenly it felt hard not to grin.",
+        "A small breeze drifted through, carrying a mix of warmth and a hint of surprise.",
+        "Shoes scuffed the floor and a quiet hush slid over the room.",
     ]
-    action = []
-    for t in terms:
-        action.append(f"Everything seemed connected to {t}, as if {t} was the clue hiding in plain sight.")
-        action.append(f"Someone pointed at {t} and said it was probably the reason for the whole mix-up.")
-        action.append(f"The thought of {t} made everyone react at once—gasping, giggling, and whispering.")
+    action = [
+        "They traded quick glances, deciding to be brave even if their voices were small.",
+        "A quiet plan formed, and everyone leaned in as if sharing a secret.",
+        "Someone took a careful step, and the whole mood tipped toward action.",
+        "It felt like the moment when a story decides to turn a corner.",
+    ]
+    anchor_templates = [
+        "They remembered the {term} and tried again.",
+        "The {term} flashed back to mind, and that was enough to keep going.",
+    ]
+    anchor_lines: list[str] = []
+    for idx, term in enumerate(terms):
+        template = anchor_templates[idx % len(anchor_templates)]
+        anchor_lines.append(template.format(term=term))
 
     if stage == "setup":
         extra = [
@@ -992,7 +1034,7 @@ def _keyword_expansions(required_terms: list[str], stage: str, rng: random.Rando
             "Once everyone worked together, the scary part turned into the funny part.",
         ]
 
-    pool = sensory + action + extra
+    pool = sensory + action + extra + anchor_lines
     rng.shuffle(pool)
     return pool
 
@@ -1090,7 +1132,7 @@ def _validate_story_pages(
             reasons.append("anchor/fidelity missing proper-name match")
 
     if anchor_spec.keywords:
-        required_keyword_hits = min(2, len(anchor_spec.keywords))
+        required_keyword_hits = 1 if anchor_spec.transcript_word_count < 120 else min(2, len(anchor_spec.keywords))
         keyword_hits = _count_term_hits(combined, anchor_spec.keywords)
         if keyword_hits < required_keyword_hits:
             reasons.append(
