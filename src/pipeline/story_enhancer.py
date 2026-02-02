@@ -1362,6 +1362,7 @@ def _build_openai_prompts(
         "  - This was the part where...\n"
         "  - X stayed important as the story moved forward...\n"
         "  - The lesson was...\n"
+        "- Anchors are invisible constraints; do NOT recap, list, or label anchor beats or entities in the story.\n"
         "- Do not list events as short declarative sentences.\n"
         f"{beat_sheet}\n"
         "MUST KEEP TRUE FACTS (do not change these; list them verbatim):\n"
