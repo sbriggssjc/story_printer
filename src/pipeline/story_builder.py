@@ -9,6 +9,7 @@ class StoryPage:
     text: str
     illustration_prompt: str
     illustration_path: str | None = None
+    image_path: str | None = None
 
 
 @dataclass

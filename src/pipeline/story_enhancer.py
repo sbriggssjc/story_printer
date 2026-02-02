@@ -3225,6 +3225,7 @@ def _maybe_generate_images(story: StoryBook, cleaned: str) -> None:
             image_bytes = base64.b64decode(data.b64_json)
             image_path.write_bytes(image_bytes)
             page.illustration_path = str(image_path)
+            page.image_path = str(image_path)
             continue
 
         if getattr(data, "url", None):
@@ -3233,3 +3234,4 @@ def _maybe_generate_images(story: StoryBook, cleaned: str) -> None:
             except Exception:
                 continue
             page.illustration_path = str(image_path)
+            page.image_path = str(image_path)
