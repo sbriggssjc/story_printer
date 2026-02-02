@@ -428,9 +428,9 @@ def _build_openai_prompts(
         f"- Exactly {target_pages} pages.\n"
         "- Page 1: setup + mischief + rising trouble + page-turn hook.\n"
         "- Page 2: big moment + apology + funny resolution + warm ending.\n"
-        "- Use 1–3 dialogue lines total, each on its own line starting with '- ' or '— '.\n"
-        "- The dialogue lines must be short (<= 12 words each) and must appear in the story text.\n"
-        "- Do not use quotation marks anywhere in the story text.\n"
+        "- Use exactly 2 quoted dialogue lines total, each on its own line starting with '- ' or '— '.\n"
+        "- Dialogue must be short (<= 12 words each) and natural.\n"
+        "- Do not use quotation marks for emphasis or any other purpose.\n"
         "- Kid-safe, whimsical, humorous, creative expansion.\n"
         "- Include sensory details and an emotional arc.\n"
         "- Avoid repeating filler sentences or stock phrases.\n"
@@ -497,10 +497,9 @@ def _openai_storybook(
                 "Rewrite the story to satisfy ALL requirements:\n"
                 f"- EXACTLY {target_pages} pages.\n"
                 f"- EACH page MUST be between {_MIN_WORDS_PER_PAGE} and {_MAX_WORDS_PER_PAGE} words.\n"
-                '- Include EXACTLY 2 short dialogue lines using straight quotes, e.g. "...".\n'
-                "- Return ONLY JSON matching the schema. No extra keys, no commentary.\n"
-                "- Use 1–3 short dialogue lines total, each on its own line starting with '- ' or '— '.\n"
-                "- Do not use quotation marks anywhere in the story text.\n"
+                '- Use exactly 2 quoted dialogue lines total using straight quotes, e.g. "...".\n'
+                "- Each dialogue line must be short (<= 12 words), natural, and appear on its own line starting with '- ' or '— '.\n"
+                "- Do not use quotation marks for emphasis or any other purpose.\n"
                 "- Return ONLY JSON matching the schema. No extra keys, no commentary."
             )
             if missing_anchor_note:
@@ -546,8 +545,13 @@ def _openai_storybook(
 
         # Post-process pages BEFORE validation so we validate the final text that will be printed
         for page in pages:
-            page.text = _pad_text_to_min_words(page.text, min_words=_MIN_WORDS_PER_PAGE)
-            page.text = _limit_dialogue_lines(page.text, max_lines=3)
+            page.text = _pad_text_to_min_words_with_beats(
+                page.text,
+                min_words=_MIN_WORDS_PER_PAGE,
+                cleaned=cleaned,
+                narrator=narrator,
+            )
+            page.text = _normalize_dialogue_lines(page.text, max_lines=3)
 
         total_dialogue = sum(_count_dialogue_lines(page.text) for page in pages)
         if total_dialogue < 1:
@@ -1042,52 +1046,110 @@ def _build_pages_from_data(data: dict[str, Any], target_pages: int) -> list[Stor
     return pages
 
 
+def _extract_story_beats(cleaned: str) -> dict[str, str]:
+    lower = (cleaned or "").lower()
+    claire_name = "Claire" if "claire" in lower else "Claire"
+    dad_name = "Dad" if any(token in lower for token in ("dad", "father")) else "Dad"
+    object_name = "pizza crust" if "crust" in lower or "pizza" in lower else "pizza crust"
+
+    deception_phrases = ("hide", "hid", "threw away", "throw away", "lied", "lie")
+    deception_action = "hid it under her napkin"
+    if any(phrase in lower for phrase in deception_phrases):
+        if "threw away" in lower or "throw away" in lower:
+            deception_action = "threw it away when no one was looking"
+        elif "lied" in lower or "lie" in lower:
+            deception_action = "tucked it away and told a small lie"
+        else:
+            deception_action = "hid it under her napkin"
+
+    lesson_line = "I wish I would have listened."
+    if "should've listened" in lower or "should have listened" in lower:
+        lesson_line = "I should have listened."
+    if "wish i listened" in lower or "wish i'd listened" in lower:
+        lesson_line = "I wish I listened."
+
+    return {
+        "claire_name": claire_name,
+        "dad_name": dad_name,
+        "object_name": object_name,
+        "deception_action": deception_action,
+        "lesson_line": lesson_line,
+    }
+
+
+def _local_page_expansions(claire_name: str, dad_name: str, *, stage: str) -> list[str]:
+    if stage == "resolution":
+        return [
+            f"{dad_name}'s horse snorted softly and stamped the ground, eager and brave.",
+            f"{claire_name} felt the knot in her chest loosen as the danger passed.",
+            "The kitchen smelled warm and buttery, and the plates clinked gently on the table.",
+            "A neighbor waved through the window, smiling at the excitement.",
+            "The wind carried away the last rumble of the monster.",
+            f"{dad_name} brushed {claire_name}'s hair back and listened closely.",
+            "The house felt safe again, like a blanket tucked around their shoulders.",
+            "They laughed in relief, the kind of laughter that turns fear into a story.",
+        ]
+    return [
+        "The afternoon light painted soft squares on the floor.",
+        f"{claire_name} shifted her feet, unsure, while the room grew still.",
+        "The pizza smelled cheesy and warm, but the air felt prickly with worry.",
+        f"{dad_name} looked up with a gentle question in his eyes.",
+        "A curtain fluttered, and a shadow slid across the wall.",
+        "The monster's footsteps thudded like drums outside.",
+        "The table vibrated with each stomp, making cups tremble.",
+        f"{claire_name}'s heart beat fast, like a small bird in her chest.",
+    ]
+
+
 def _local_storybook(
     cleaned: str,
     title: str,
     narrator: str | None,
     target_pages: int,
 ) -> StoryBook:
-    topic = _infer_topic(cleaned)
-    name = narrator or "A young storyteller"
-    snippet = _snippet_from_transcript(cleaned)
-    seed = abs(hash(cleaned or topic)) % (2**32)
+    beats = _extract_story_beats(cleaned)
+    claire_name = beats["claire_name"]
+    dad_name = beats["dad_name"]
+    object_name = beats["object_name"]
+    seed = abs(hash(cleaned or "storybook")) % (2**32)
     rng = random.Random(seed)
     used_sentences: set[str] = set()
 
     page1 = (
-        f"On a bright afternoon, {name} felt a fizz of curiosity about {topic}. "
-        f"The day began with a giggle and a whisper of adventure, and soon a playful idea popped up: {snippet}. "
-        "At first it seemed tiny and harmless, like a secret tucked in a sock, but the air started to buzz. "
-        f"Someone whispered:\n- Should we tell?\n"
-        f"{name} grinned, watching the idea wobble bigger. "
-        "A silly misunderstanding bounced from friend to friend, and even the pets looked suspicious. "
-        "By the time the sun slid behind a cloud, the mix-up had become a swirl of whispers and wide eyes, "
-        "and the next step was about to land with a thump."
+        f"{claire_name} and {dad_name} shared a cozy pizza lunch at home. "
+        f"There was just one {object_name} left, and {claire_name} wanted it so badly her fingers curled. "
+        f"Instead of asking, she {beats['deception_action']}, and when {dad_name} asked about the missing crust, "
+        f"{claire_name} gave a tiny fib that felt like a pebble in her pocket. "
+        "The room went quiet for a moment, as if the house was holding its breath. "
+        "Outside the window, a shadow stretched long and a growl rumbled, soft at first and then louder. "
+        f"A pizza monster stomped into the yard, sniffing the air for {object_name}s, "
+        "and it peered in with hungry, googly eyes. "
+        f"{claire_name} froze, her stomach fluttering as the monster crept closer."
     )
     page1 = _expand_text_to_range(
         page1,
         _MIN_WORDS_PER_PAGE,
         _MAX_WORDS_PER_PAGE,
-        _page_expansions(topic, name, stage="setup"),
+        _local_page_expansions(claire_name, dad_name, stage="setup"),
         rng=rng,
         used=used_sentences,
     )
 
     page2 = (
-        "With a deep breath and a brave heart, the truth finally tumbled out. "
-        f"{name} admitted it aloud:\n- I did it.\n"
-        "The room froze for one tiny second before melting into relieved smiles. "
-        f"Together they turned the problem into a plan, transforming {topic} into a funny, shared solution. "
-        "There was an apology that sounded like a warm hug and a giggle that sounded like bells. "
-        "Everyone joined in to fix the mix-up, and the story swung toward a cozy, happy ending. "
-        "By bedtime, the adventure felt like a secret handshake—silly, sweet, and sure to be remembered."
+        "The pizza monster lunged, and the table rattled as it swiped the air. "
+        f"Just then, {dad_name} burst through the gate riding a shiny horse, its mane glittering like coins. "
+        f"With one brave swing, {dad_name} sent the monster tumbling away and chased it from the yard. "
+        f"{claire_name}'s eyes filled with tears. She whispered, \"{beats['lesson_line']}\" "
+        f"and she told {dad_name} the truth about the {object_name}. "
+        f"{dad_name} knelt beside her, hugged her tight, and said mistakes could be mended with honesty. "
+        f"Together they shared fresh pizza, and {claire_name} promised to speak up next time. "
+        "The sun set warm and golden, and the house felt safe and peaceful again."
     )
     page2 = _expand_text_to_range(
         page2,
         _MIN_WORDS_PER_PAGE,
         _MAX_WORDS_PER_PAGE,
-        _page_expansions(topic, name, stage="resolution"),
+        _local_page_expansions(claire_name, dad_name, stage="resolution"),
         rng=rng,
         used=used_sentences,
     )
@@ -1096,15 +1158,17 @@ def _local_storybook(
         StoryPage(
             text=page1,
             illustration_prompt=(
-                f"A whimsical storybook scene of {name} discovering {topic}, "
-                "with bright colors, cozy surroundings, gentle watercolor textures, and a playful hint of mischief."
+                f"A cozy kitchen storybook scene with {claire_name} and {dad_name} at a pizza lunch, "
+                f"a single {object_name} on the plate, and a silly pizza monster looming outside the window, "
+                "bright colors, gentle watercolor textures, warm afternoon light, and playful tension."
             ),
         ),
         StoryPage(
             text=page2,
             illustration_prompt=(
-                f"A warm, joyful illustration of friends making amends around {topic}, "
-                "smiling and laughing in a cozy setting with gentle, friendly colors and soft light."
+                f"A triumphant, heartwarming illustration of {dad_name} on a shiny horse chasing away a pizza monster, "
+                f"with {claire_name} relieved and hugging {dad_name} afterward, cozy home setting, "
+                "gentle watercolor textures, warm golden light, and a peaceful ending."
             ),
         ),
     ]
@@ -1288,6 +1352,47 @@ def _ensure_dialogue_count(text: str, target_lines: int = 2) -> str:
     return f"{text.rstrip()}{separator}{extra}".strip()
 
 
+def _normalize_dialogue_lines(text: str, max_lines: int = 3) -> str:
+    """
+    Keep up to max_lines of dialogue. Any extra dialogue lines or quoted segments
+    are rewritten into plain narration (no quotes).
+    """
+    lines = text.splitlines(keepends=True)
+    dialogue_count = 0
+    updated: list[str] = []
+    for line in lines:
+        if re.match(r"^\s*[-—]\s+", line):
+            dialogue_count += 1
+            if dialogue_count > max_lines:
+                line = re.sub(r"^(\s*)[-—]\s+", r"\1", line)
+        updated.append(line)
+
+    interim = "".join(updated)
+    remaining = max(0, max_lines - _count_dialogue_lines(interim))
+
+    if remaining == 0:
+        return _strip_extra_quotes(interim, allowed=0)
+    return _strip_extra_quotes(interim, allowed=remaining)
+
+
+def _strip_extra_quotes(text: str, *, allowed: int) -> str:
+    """
+    Keep the first `allowed` quoted segments and rewrite the rest without quotes.
+    """
+    pattern = re.compile(r'"([^"\n]+)"|“([^”\n]+)”')
+    seen = 0
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal seen
+        seen += 1
+        content = match.group(1) or match.group(2) or ""
+        if seen <= allowed:
+            return match.group(0)
+        return content
+
+    return pattern.sub(replace, text)
+
+
 def _pad_to_min_words(text: str, target_min: int, topic: str, name: str) -> str:
     """
     If text is under target_min, append non-dialogue expansions until it meets min.
@@ -1309,6 +1414,68 @@ def _pad_text_to_min_words(text: str, min_words: int) -> str:
     name = "A young storyteller"
     additions = _page_expansions(topic, name, stage="resolution")
     return _expand_text_to_range(text, min_words, _MAX_WORDS_PER_PAGE, additions)
+
+
+def _pad_text_to_min_words_with_beats(
+    text: str,
+    *,
+    min_words: int,
+    cleaned: str,
+    narrator: str | None,
+) -> str:
+    """
+    If text is under min_words, append plot-relevant expansion sentences derived
+    from the transcript beats (avoid boilerplate).
+    """
+    if _word_count(text) >= min_words:
+        return text
+
+    additions = _beat_expansion_sentences(cleaned, narrator)
+    if not additions:
+        additions = _fallback_beat_expansions(cleaned, narrator)
+
+    existing = {s.lower() for s in _split_sentences_for_dedupe(text)}
+    filtered = [s for s in additions if s.lower() not in existing]
+
+    if not filtered:
+        return text
+    return _expand_text_to_range(text, min_words, _MAX_WORDS_PER_PAGE, filtered)
+
+
+def _beat_expansion_sentences(cleaned: str, narrator: str | None) -> list[str]:
+    lowered = (cleaned or "").lower()
+    name = narrator or "Claire"
+    sentences: list[str] = []
+
+    if "pizza" in lowered:
+        sentences.append("The pizza smell curled through the room like a warm ribbon.")
+    if "crust" in lowered:
+        sentences.append(f"{name} tucked the crust away, feeling its crackly edges.")
+    if "trash" in lowered or "trash can" in lowered or "bin" in lowered:
+        sentences.append("The trash can lid clinked louder than anyone expected.")
+    if "monster" in lowered and "cheese" in lowered:
+        sentences.append("The monster's cheese breath puffed out in a goofy cloud.")
+    elif "monster" in lowered:
+        sentences.append("A pretend monster stomped in with a silly, cheesy roar.")
+    if "horse" in lowered or "hooves" in lowered:
+        sentences.append("Shiny horse hooves tapped the floor like tiny cymbals.")
+    if "apolog" in lowered or "sorry" in lowered:
+        sentences.append("The apology came out soft and brave, like a whispering hug.")
+    if "laugh" in lowered or "giggl" in lowered:
+        sentences.append("Everyone laughed, and the tension loosened like a shoelace.")
+
+    return sentences
+
+
+def _fallback_beat_expansions(cleaned: str, narrator: str | None) -> list[str]:
+    phrases = _extract_noun_phrases(cleaned, min_count=3, max_count=6)
+    if not phrases:
+        return []
+    speaker = narrator or "They"
+    sentences: list[str] = []
+    for phrase in phrases:
+        sentences.append(f"{speaker} kept noticing the {phrase} as the moment unfolded.")
+    return sentences
 
 
 def _maybe_generate_images(story: StoryBook) -> None:

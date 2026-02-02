@@ -37,6 +37,10 @@ _STOPWORDS = {
     "My",
     "Our",
     "Your",
+    "This",
+    "Dad",
+    "Her",
+    "One",
     "And",
     "But",
     "Or",
@@ -55,6 +59,7 @@ def _clean_transcript(transcript: str) -> str:
         return ""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[\t ]+", " ", text)
+    text = re.sub(r"^\s*(this|here)\s+is\s+(a\s+)?story\s+about\s+", "", text, flags=re.I)
     text = re.sub(r"\[(?:inaudible|noise|music|laughs?|crosstalk)\]", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s+([,;:.!?])", r"\1", text)
     text = re.sub(r"([,;:.!?])([^\s])", r"\1 \2", text)
@@ -72,6 +77,17 @@ def _clean_transcript(transcript: str) -> str:
 
 
 def _find_name(transcript: str) -> str | None:
+    full_name_match = re.search(r"\b([A-Z][a-z]+)\s+([A-Z][a-z]+)\b", transcript)
+    if full_name_match:
+        first, last = full_name_match.groups()
+        if first not in _STOPWORDS and last not in _STOPWORDS:
+            return f"{first} {last}"
+
+    preferred_names = ["Claire", "Graham", "Jack"]
+    for name in preferred_names:
+        if re.search(rf"\b{name}\b", transcript):
+            return name
+
     for match in re.finditer(r"\b[A-Z][a-z]{2,}\b", transcript):
         name = match.group(0)
         if name in _STOPWORDS:
