@@ -1555,6 +1555,28 @@ def _build_openai_prompts(
     entities = plot_facts.get("entities", [])
     facts_lines = "\n".join([f"- {fact}" for fact in facts]) or "- (none)"
     entity_lines = "\n".join([f"- {entity}" for entity in entities]) or "- (none)"
+    anchor_fact_lines: list[str] = []
+    if anchor_spec.characters:
+        anchor_fact_lines.append(
+            "The main characters are " + ", ".join(anchor_spec.characters) + "."
+        )
+    if anchor_spec.setting:
+        anchor_fact_lines.append(f"The story is set in {anchor_spec.setting}.")
+    if anchor_spec.key_objects:
+        anchor_fact_lines.append(
+            "Important objects include " + ", ".join(anchor_spec.key_objects) + "."
+        )
+    if anchor_spec.beats:
+        for beat in anchor_spec.beats:
+            trimmed = beat.strip()
+            if trimmed and not trimmed.endswith((".", "!", "?")):
+                trimmed += "."
+            anchor_fact_lines.append(f"The plot includes this beat: {trimmed}")
+    if anchor_spec.lesson:
+        anchor_fact_lines.append(f"The underlying lesson is: {anchor_spec.lesson}.")
+    anchor_fact_text = (
+        "\n".join([f"- {fact}" for fact in anchor_fact_lines]) or "- (none)"
+    )
     user_prompt = (
         "Use the AnchorSpec JSON below and the plot facts as the ONLY sources of plot truth. "
         "Do not invent new major plotlines beyond what the plot facts and anchors imply.\n\n"
@@ -1584,11 +1606,18 @@ def _build_openai_prompts(
         "  - X stayed important as the story moved forward...\n"
         "  - The lesson was...\n"
         "- Do not list events as short declarative sentences.\n"
+        "IMPORTANT:\n"
+        "- Do NOT list anchors, beats, requirements, or checks inside the story text.\n"
+        "- Do NOT write lines like \"This was the part where...\" or \"The lesson was...\" unless it fits naturally.\n"
+        "- The story must read like a real picture-book narrative, not an outline or recap.\n"
+        "- Use anchors as facts to weave into the plot naturally.\n\n"
         f"{beat_sheet}\n"
         "MUST KEEP TRUE FACTS (do not change these; list them verbatim):\n"
         f"{facts_lines}\n\n"
         "ENTITIES (names to keep consistent):\n"
         f"{entity_lines}\n\n"
+        "Must-keep story facts to weave in naturally (do NOT list these in the story):\n"
+        f"{anchor_fact_text}\n\n"
         "ANCHORS JSON (use this as ground truth):\n"
         f"{anchor_json}\n\n"
         "OUTPUT JSON schema:\n"
