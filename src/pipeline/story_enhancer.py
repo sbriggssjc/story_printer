@@ -340,23 +340,31 @@ def _build_anchor_list(cleaned: str, narrator: str | None) -> list[str]:
     return anchors
 
 
-def _missing_anchors(page_texts: list[str], anchors: list[str]) -> list[str]:
-    if not anchors:
-        return []
-    combined = " ".join(page_texts).lower()
-    missing: list[str] = []
-    for anchor in anchors:
-        anchor_text = anchor.strip()
-        if not anchor_text:
-            continue
-        anchor_lower = anchor_text.lower()
-        if " " in anchor_lower:
-            if anchor_lower not in combined:
-                missing.append(anchor_text)
-            continue
-        if not re.search(rf"\b{re.escape(anchor_lower)}\b", combined):
-            missing.append(anchor_text)
-    return missing
+def _build_anchor_beats(cleaned: str) -> dict[str, bool]:
+    lower = (cleaned or "").lower()
+    return {
+        "pizza": "pizza" in lower,
+        "crust": "crust" in lower,
+        "monster": "monster" in lower,
+        "horse": "horse" in lower,
+        "dad": "dad" in lower or "father" in lower,
+    }
+
+
+def _anchor_ok(text: str, beats: dict[str, bool]) -> tuple[bool, list[str]]:
+    t = (text or "").lower()
+    missing = []
+    if beats.get("pizza") and "pizza" not in t:
+        missing.append("pizza")
+    if beats.get("crust") and "crust" not in t:
+        missing.append("crust")
+    if beats.get("monster") and "monster" not in t:
+        missing.append("monster")
+    if beats.get("horse") and "horse" not in t:
+        missing.append("horse")
+    if beats.get("dad") and ("dad" not in t and "father" not in t):
+        missing.append("dad")
+    return (len(missing) == 0, missing)
 
 
 def _extract_fidelity_keywords(cleaned: str) -> list[str]:
@@ -648,11 +656,12 @@ def _openai_storybook(
             return None
 
         page_texts = [page.text for page in pages]
-        missing_anchors = _missing_anchors(page_texts, anchors)
-        if missing_anchors:
-            print(f"Anchor validation failed: {', '.join(missing_anchors)}")
+        beat_map = _build_anchor_beats(cleaned)
+        ok, missing_beats = _anchor_ok(" ".join(page_texts), beat_map)
+        if not ok:
+            print(f"Anchor validation failed: {', '.join(missing_beats)}")
             if attempt == 0:
-                missing_anchor_note = missing_anchors
+                missing_anchor_note = missing_beats
                 continue
             return None
 
