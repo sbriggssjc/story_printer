@@ -90,14 +90,13 @@ def _apply_short_transcript_targets(cleaned_transcript: str) -> None:
 
 # --- Anti-boilerplate / faithfulness guards ---
 
-# Sentences we NEVER want in OpenAI output (these are showing up verbatim in your PDFs)
-_BLOCKLIST_SENTENCES = {
-    "The hallway smelled like crayons and toast, and Claire could hear sneakers squeaking nearby.",
-    "A breeze bumped the curtains, as if the room itself was leaning in to listen.",
-    "Someone whispered a guess, and another friend gasped, suddenly certain they knew the truth.",
-    "Sunlight puddled on the floor like warm butter, making the room glow.",
-    "The air felt fizzy, like soda bubbles popping with every new idea.",
-    "Even the clock sounded excited, ticking a little faster than usual.",
+_BOILERPLATE_OPENING_RE = re.compile(r"^On a (bright|sunny|rainy)\b", re.IGNORECASE)
+_FELT_LIKE_METAPHOR_RE = re.compile(r"\bfelt like ([^.!?]+)", re.IGNORECASE)
+_DUPLICATE_SENTENCE_MIN_WORDS = 8
+_DUPLICATE_SENTENCE_LONG_WORDS = 20
+_BOILERPLATE_PATTERN_HINTS = {
+    "On a bright/sunny/rainy ... (avoid repeating this opening across pages)",
+    "felt like <metaphor> (avoid repeating the same metaphor across pages)",
 }
 
 _BANNED_PHRASES = [
@@ -166,10 +165,41 @@ def _normalize_sentence_key(sentence: str) -> str:
     return re.sub(r"\s+", " ", sentence.strip()).lower()
 
 
-def _find_blocklisted_sentences(text: str) -> list[str]:
-    sents = set(_split_sentences_for_dedupe(text))
-    hits = [s for s in _BLOCKLIST_SENTENCES if s in sents]
-    return hits
+def _find_boilerplate_patterns_across_pages(page_texts: list[str]) -> list[str]:
+    issues: list[str] = []
+    opening_matches: list[str] = []
+    felt_like_by_page: list[set[str]] = []
+
+    for text in page_texts:
+        sentences = _split_sentences_for_dedupe(text)
+        if sentences:
+            first_sentence = sentences[0]
+            opening_match = _BOILERPLATE_OPENING_RE.match(first_sentence)
+            if opening_match:
+                opening_matches.append(opening_match.group(0).lower())
+
+        felt_like_phrases: set[str] = set()
+        for match in _FELT_LIKE_METAPHOR_RE.finditer(text):
+            phrase = re.sub(r"\s+", " ", match.group(1).strip().lower())
+            if phrase:
+                felt_like_phrases.add(phrase)
+        felt_like_by_page.append(felt_like_phrases)
+
+    if len(opening_matches) >= 2:
+        unique_openings = sorted(set(opening_matches))
+        formatted_openings = [f"'On a {opening.split(' ', 2)[-1]}'" for opening in unique_openings]
+        issues.append("repeated opening across pages: " + ", ".join(formatted_openings))
+
+    if felt_like_by_page:
+        phrase_counts: dict[str, int] = {}
+        for phrases in felt_like_by_page:
+            for phrase in phrases:
+                phrase_counts[phrase] = phrase_counts.get(phrase, 0) + 1
+        repeated_phrases = sorted([p for p, count in phrase_counts.items() if count >= 2])
+        if repeated_phrases:
+            issues.append(f"repeated 'felt like' metaphor across pages: felt like {repeated_phrases[0]}")
+
+    return issues
 
 
 def _find_duplicate_sentences_across_pages(page_texts: list[str]) -> list[str]:
@@ -178,13 +208,22 @@ def _find_duplicate_sentences_across_pages(page_texts: list[str]) -> list[str]:
     dupes: set[str] = set()
     for t in page_texts:
         for s in _split_sentences_for_dedupe(t):
-            if len(re.findall(r"[A-Za-z']+", s)) < 8:
+            if len(re.findall(r"[A-Za-z']+", s)) < _DUPLICATE_SENTENCE_MIN_WORDS:
                 continue
             key = s
             seen[key] = seen.get(key, 0) + 1
             if seen[key] >= 2:
                 dupes.add(s)
     return sorted(dupes)
+
+
+def _should_fail_duplicate_sentences(dupes: list[str]) -> bool:
+    if len(dupes) >= 2:
+        return True
+    if dupes:
+        word_count = len(re.findall(r"[A-Za-z']+", dupes[0]))
+        return word_count >= _DUPLICATE_SENTENCE_LONG_WORDS
+    return False
 
 
 def _extract_proper_names(cleaned: str, narrator: str | None) -> list[str]:
@@ -1823,9 +1862,9 @@ def _build_openai_prompts(
         "transcript's specific plot and objects.\n"
         "- Do NOT use any generic boilerplate sensory sentences.\n"
         "- Do NOT repeat any sentence verbatim across pages.\n"
-        "- Do NOT include these sentences (exactly as written):\n"
-        + "\n".join([f"  - {s}" for s in sorted(_BLOCKLIST_SENTENCES)])
-        + "\n- Never output these phrases (verbatim or near-verbatim):\n"
+        "- Avoid repeated openings like 'On a bright/sunny/rainy ...' across pages.\n"
+        "- Avoid repeating the same 'felt like <metaphor>' across pages.\n"
+        "- Never output these phrases (verbatim or near-verbatim):\n"
         + "\n".join([f"  - {s}" for s in _BANNED_PHRASES])
         + "\n"
     )
@@ -2466,14 +2505,13 @@ def _validate_story_data(data: Any, target_pages: int) -> tuple[bool, list[str]]
         total_dialogue += _count_dialogue_lines(text)
         page_texts.append(text)
 
-    for i, t in enumerate(page_texts, start=1):
-        hits = _find_blocklisted_sentences(t)
-        if hits:
-            reasons.append(f"page {i} contains boilerplate sentence(s): {hits[:2]}")
-            fatal_reasons.append(f"page {i} contains boilerplate sentence(s): {hits[:2]}")
+    boilerplate_issues = _find_boilerplate_patterns_across_pages(page_texts)
+    for issue in boilerplate_issues:
+        reasons.append(issue)
+        fatal_reasons.append(issue)
 
     dupes = _find_duplicate_sentences_across_pages(page_texts)
-    if dupes:
+    if dupes and _should_fail_duplicate_sentences(dupes):
         reasons.append(f"repeated sentence across pages: {dupes[0]}")
         fatal_reasons.append(f"repeated sentence across pages: {dupes[0]}")
 
@@ -2529,14 +2567,13 @@ def _validate_story_pages(
         total_dialogue += _count_dialogue_lines(text)
         page_texts.append(text)
 
-    for i, t in enumerate(page_texts, start=1):
-        hits = _find_blocklisted_sentences(t)
-        if hits:
-            reasons.append(f"page {i} contains boilerplate sentence(s): {hits[:2]}")
-            fatal_reasons.append(f"page {i} contains boilerplate sentence(s): {hits[:2]}")
+    boilerplate_issues = _find_boilerplate_patterns_across_pages(page_texts)
+    for issue in boilerplate_issues:
+        reasons.append(issue)
+        fatal_reasons.append(issue)
 
     dupes = _find_duplicate_sentences_across_pages(page_texts)
-    if dupes:
+    if dupes and _should_fail_duplicate_sentences(dupes):
         reasons.append(f"repeated sentence across pages: {dupes[0]}")
         fatal_reasons.append(f"repeated sentence across pages: {dupes[0]}")
 
@@ -2561,7 +2598,7 @@ def _build_repair_spec(
     fidelity_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     problems: set[str] = set()
-    avoid_phrases = set(_BLOCKLIST_SENTENCES)
+    avoid_phrases = set(_BOILERPLATE_PATTERN_HINTS)
     if banned_phrases:
         problems.add("banned_filler_phrases")
         avoid_phrases.update(banned_phrases)
@@ -2587,8 +2624,10 @@ def _build_repair_spec(
         if match:
             problems.add(f"page_{int(match.group(1))}_missing_illustration_prompt")
             continue
-        if "boilerplate sentence" in reason:
-            problems.add("boilerplate_sentence_used")
+        if reason.startswith("repeated opening across pages") or reason.startswith(
+            "repeated 'felt like' metaphor across pages"
+        ):
+            problems.add("boilerplate_pattern_used")
             continue
         if reason.startswith("repeated sentence across pages:"):
             problems.add("repeated_sentence_across_pages")
