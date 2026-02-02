@@ -1498,12 +1498,14 @@ def enhance_to_storybook(transcript: str, *, target_pages: int = 2) -> StoryBook
             target_pages,
         )
         if openai_story:
-            _maybe_generate_cover_image(openai_story, cleaned)
+            _apply_image_prompts(openai_story, anchor_spec, narrator)
+            _maybe_generate_cover_image(openai_story, anchor_spec, narrator)
             _maybe_generate_images(openai_story, cleaned)
             return openai_story
 
     local_story = _local_storybook(anchor_spec, title, narrator, target_pages)
-    _maybe_generate_cover_image(local_story, cleaned)
+    _apply_image_prompts(local_story, anchor_spec, narrator)
+    _maybe_generate_cover_image(local_story, anchor_spec, narrator)
     _maybe_generate_images(local_story, cleaned)
     return local_story
 
@@ -2412,15 +2414,94 @@ def _extract_beats(cleaned: str) -> dict[str, bool]:
     }
 
 
-def _cover_prompt(story: StoryBook, cleaned: str) -> str:
-    summary = _snippet_from_transcript(cleaned, max_words=18)
-    style = _DEFAULT_STYLE
-    return (
-        f"Cover illustration for a children's picture book titled '{story.title}'. "
-        f"Summary: {summary} "
-        f"Style: {style}. "
-        "Watercolor storybook composition, soft lighting, no text."
+def _build_style_seed(characters: list[str]) -> str:
+    if not characters:
+        return "Same character designs across all images: a curious child with short curly hair and a teal hoodie."
+
+    design_palette = [
+        ("short curly brown hair", "teal hoodie"),
+        ("long wavy black hair", "sunny yellow shirt"),
+        ("straight auburn hair", "red jacket"),
+        ("braided dark hair", "green cardigan"),
+    ]
+    descriptors: list[str] = []
+    for index, name in enumerate(characters):
+        hair, outfit = design_palette[index % len(design_palette)]
+        descriptors.append(f"{name} has {hair} and a {outfit}")
+    joined = "; ".join(descriptors)
+    return f"Same character designs across all images: {joined}."
+
+
+def _summarize_page_text(text: str, max_sentences: int = 2) -> str:
+    sentences = _split_sentences(text)
+    if not sentences:
+        return "A warm, kid-friendly moment in the story."
+    summary = " ".join(sentences[:max_sentences]).strip()
+    return summary
+
+
+def _cover_prompt(
+    story: StoryBook,
+    anchor_spec: AnchorSpec,
+    style_seed: str,
+) -> str:
+    characters = anchor_spec.characters or []
+    setting = anchor_spec.setting
+    key_objects = anchor_spec.key_objects or []
+
+    parts = [
+        f"Picture book cover art for '{story.title}'.",
+        "Whimsical, kid-friendly composition with space for title text (do not include actual text).",
+    ]
+    if characters:
+        parts.append(f"Main characters: {', '.join(characters)}.")
+    if setting:
+        parts.append(f"Setting: {setting}.")
+    if key_objects:
+        parts.append(f"Key objects: {', '.join(key_objects[:3])}.")
+    parts.append(f"Style: {_DEFAULT_STYLE}.")
+    parts.append("Watercolor storybook cover, soft lighting, clean outlines, no text, no watermark.")
+    parts.append(style_seed)
+    return " ".join(parts).strip()
+
+
+def _page_prompt(
+    page: StoryPage,
+    anchor_spec: AnchorSpec,
+    style_seed: str,
+) -> str:
+    characters = anchor_spec.characters or []
+    setting = anchor_spec.setting
+    key_objects = anchor_spec.key_objects or []
+    summary = _summarize_page_text(page.text, max_sentences=2)
+
+    parts = [
+        "Watercolor children's picture book illustration.",
+        f"Scene summary: {summary}",
+    ]
+    if characters:
+        parts.append(f"Characters: {', '.join(characters)}.")
+    if key_objects:
+        parts.append(f"Key objects: {', '.join(key_objects[:4])}.")
+    if setting:
+        parts.append(f"Setting: {setting}.")
+    parts.append(
+        "Match the cover's visual style: soft lighting, clean outlines, gentle shading, no text."
     )
+    parts.append(style_seed)
+    return " ".join(parts).strip()
+
+
+def _apply_image_prompts(
+    story: StoryBook,
+    anchor_spec: AnchorSpec,
+    narrator: str | None,
+) -> None:
+    characters = anchor_spec.characters or ([narrator] if narrator else [])
+    style_seed = _build_style_seed(characters)
+    story.cover_illustration_prompt = _cover_prompt(story, anchor_spec, style_seed)
+    for page in story.pages:
+        page.illustration_prompt = _page_prompt(page, anchor_spec, style_seed)
 
 
 def _local_storybook(
@@ -2986,7 +3067,11 @@ def _fallback_beat_expansions(cleaned: str, narrator: str | None) -> list[str]:
     return sentences
 
 
-def _maybe_generate_cover_image(story: StoryBook, cleaned: str) -> None:
+def _maybe_generate_cover_image(
+    story: StoryBook,
+    anchor_spec: AnchorSpec,
+    narrator: str | None,
+) -> None:
     if not _use_openai_image_mode():
         return
     client = _get_openai_client()
@@ -2997,8 +3082,12 @@ def _maybe_generate_cover_image(story: StoryBook, cleaned: str) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    cover_prompt = _cover_prompt(story, cleaned)
-    story.cover_illustration_prompt = cover_prompt
+    cover_prompt = story.cover_illustration_prompt
+    if not cover_prompt:
+        characters = anchor_spec.characters or ([narrator] if narrator else [])
+        style_seed = _build_style_seed(characters)
+        cover_prompt = _cover_prompt(story, anchor_spec, style_seed)
+        story.cover_illustration_prompt = cover_prompt
     try:
         cover_response = client.images.generate(
             model="gpt-image-1",
