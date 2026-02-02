@@ -70,6 +70,39 @@ def _split_sentences_for_dedupe(text: str) -> list[str]:
     return sents
 
 
+def _split_sentences(text: str) -> list[str]:
+    # Simple sentence split; good enough for children’s prose
+    parts = re.split(r"(?<=[.!?])\s+", (text or "").strip())
+    return [p.strip() for p in parts if p and p.strip()]
+
+
+def _dedupe_cross_page_sentences(pages: list[StoryPage]) -> bool:
+    """
+    Removes any sentence that appears verbatim on an earlier page.
+    Returns True if it modified anything.
+    """
+    seen: set[str] = set()
+    changed = False
+
+    for page in pages:
+        sents = _split_sentences(page.text)
+        out: list[str] = []
+        for s in sents:
+            key = re.sub(r"\s+", " ", s.strip())
+            if key in seen:
+                changed = True
+                continue
+            out.append(s)
+            seen.add(key)
+
+        # Rebuild paragraph-ish text
+        new_text = " ".join(out).strip()
+        if new_text and new_text != (page.text or "").strip():
+            page.text = new_text
+
+    return changed
+
+
 def _find_blocklisted_sentences(text: str) -> list[str]:
     sents = set(_split_sentences_for_dedupe(text))
     hits = [s for s in _BLOCKLIST_SENTENCES if s in sents]
@@ -556,6 +589,18 @@ def _openai_storybook(
         total_dialogue = sum(_count_dialogue_lines(page.text) for page in pages)
         if total_dialogue < 1:
             pages[-1].text = _ensure_dialogue_count(pages[-1].text, target_lines=1)
+
+        # Remove any verbatim repeated sentences across pages, then re-pad to hit min words.
+        if _dedupe_cross_page_sentences(pages):
+            topic = _infer_topic(cleaned)
+            name = narrator or "A young storyteller"
+            for page in pages:
+                page.text = _pad_to_min_words(
+                    page.text,
+                    _MIN_WORDS_PER_PAGE,
+                    topic,
+                    name,
+                )
 
         os.environ["__STORY_CLEANED_TRANSCRIPT__"] = cleaned or ""
         valid, reasons = _validate_story_pages(pages, target_pages)
