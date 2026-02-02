@@ -12,7 +12,6 @@ Environment variables:
 Optional robustness knobs:
 - STORY_DIALOGUE_MIN: minimum dialogue lines across the whole story (default: 1)
 - STORY_DIALOGUE_MAX: maximum dialogue lines across the whole story (default: 3)
-- STORY_ANCHOR_MIN_HITS: minimum keyword hits across story (default: 3)
 - STORY_ANCHOR_MAX_TERMS: number of extracted anchor terms (default: 8)
 """
 
@@ -46,9 +45,32 @@ _MAX_WORDS_PER_PAGE = min(340, _DEFAULT_WORDS_PER_PAGE + 80)
 _DIALOGUE_MIN = int(os.getenv("STORY_DIALOGUE_MIN", "1"))
 _DIALOGUE_MAX = int(os.getenv("STORY_DIALOGUE_MAX", "3"))
 
-_ANCHOR_MIN_HITS = int(os.getenv("STORY_ANCHOR_MIN_HITS", "3"))
 _ANCHOR_MAX_TERMS = int(os.getenv("STORY_ANCHOR_MAX_TERMS", "8"))
-_SHORT_TRANSCRIPT_WORDS = 40
+_ANCHOR_STOPWORDS = {
+    "a",
+    "an",
+    "the",
+    "and",
+    "or",
+    "but",
+    "so",
+    "then",
+    "when",
+    "one",
+    "day",
+    "about",
+    "story",
+    "comes",
+    "came",
+    "along",
+    "tries",
+    "tried",
+    "told",
+    "said",
+    "says",
+    "its",
+    "it's",
+}
 
 _STOPWORDS = {
     "the", "and", "then", "with", "from", "that", "this", "when", "they", "she", "he",
@@ -82,6 +104,32 @@ _BOILERPLATE_SENTENCES = {
     "The air felt fizzy, like soda bubbles popping with every new idea.",
     "Even the clock sounded excited, ticking a little faster than usual.",
 }
+
+
+def _normalize_anchor_terms(terms: list[str] | None, *, max_terms: int = 8) -> list[str]:
+    if not terms:
+        return []
+    cleaned: list[str] = []
+    for t in terms:
+        if not t:
+            continue
+        tok = re.sub(r"[^a-z0-9\s'-]+", "", str(t).strip().lower())
+        tok = re.sub(r"\s+", " ", tok).strip()
+        if not tok or tok in _ANCHOR_STOPWORDS:
+            continue
+        if len(tok) < 4 and tok not in {"dad", "mom", "kid"}:
+            continue
+        cleaned.append(tok)
+    out: list[str] = []
+    seen = set()
+    for t in cleaned:
+        if t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+        if len(out) >= max_terms:
+            break
+    return out
 
 
 def enhance_to_storybook(transcript: str, *, target_pages: int = 2) -> StoryBook:
@@ -463,6 +511,7 @@ def _extract_anchor_spec(transcript: str, max_terms: int = 8) -> AnchorSpec:
             keywords.append(w)
         if len(keywords) >= max_terms:
             break
+    keywords = _normalize_anchor_terms(keywords, max_terms=max_terms)
 
     creature_hits: list[str] = []
     for creature in sorted(_CREATURE_KEYWORDS):
@@ -742,8 +791,7 @@ def _validate_story_pages(
             reasons.append("anchor/fidelity missing proper-name match")
 
     if anchor_spec.keywords:
-        required_keyword_hits = 2 if anchor_spec.transcript_word_count < _SHORT_TRANSCRIPT_WORDS else _ANCHOR_MIN_HITS
-        required_keyword_hits = min(required_keyword_hits, len(anchor_spec.keywords))
+        required_keyword_hits = min(2, len(anchor_spec.keywords))
         keyword_hits = _count_term_hits(combined, anchor_spec.keywords)
         if keyword_hits < required_keyword_hits:
             reasons.append(
