@@ -1188,18 +1188,62 @@ def _extract_key_verbs(cleaned: str, *, max_count: int = 4) -> list[str]:
     return _dedupe_preserve_order(verbs)[:max_count]
 
 
-def _extract_anchor_tokens(cleaned: str, narrator: str | None) -> list[str]:
-    names = _extract_proper_names(cleaned, narrator) + _extract_role_characters(cleaned)
-    excluded = set(names)
-    nouns = _extract_noun_phrases(cleaned, min_count=4, max_count=8, excluded=excluded)
-    verbs = _extract_key_verbs(cleaned, max_count=4)
-    tokens = _dedupe_preserve_order(names + nouns + verbs)
+def _extract_lesson_tokens(cleaned: str) -> list[str]:
+    lesson = _extract_moral(cleaned)
+    if not lesson:
+        return []
+    moral_keywords = {
+        "lesson",
+        "learned",
+        "remember",
+        "should",
+        "shouldn't",
+        "must",
+        "promise",
+        "apologize",
+        "sorry",
+        "forgive",
+        "kind",
+        "share",
+        "listen",
+    }
+    tokens = [
+        token.lower()
+        for token in re.findall(r"[A-Za-z']+", lesson)
+        if token.lower() in moral_keywords
+    ]
+    return _dedupe_preserve_order(tokens)[:2]
+
+
+def _extract_anchor_tokens(
+    cleaned: str,
+    narrator: str | None,
+    anchor_spec: AnchorSpec,
+) -> list[str]:
+    characters = _dedupe_preserve_order(anchor_spec.characters or [])
+    if narrator and narrator not in characters:
+        characters = [narrator] + characters
+    if not characters:
+        characters = _extract_proper_names(cleaned, narrator) + _extract_role_characters(cleaned)
+    key_objects = _dedupe_preserve_order(anchor_spec.key_objects or [])
+    if not key_objects:
+        excluded = set(characters)
+        key_objects = _extract_noun_phrases(cleaned, min_count=3, max_count=8, excluded=excluded)
+    actions = _extract_core_actions(cleaned)
+    lesson_tokens = _extract_lesson_tokens(cleaned)
+
+    tokens = _dedupe_preserve_order(
+        characters[:3] + key_objects[:5] + actions[:3] + lesson_tokens[:1]
+    )
+
     if len(tokens) < 6:
-        extra_nouns = _extract_noun_phrases(cleaned, min_count=2, max_count=10, excluded=excluded)
-        tokens = _dedupe_preserve_order(tokens + extra_nouns)
+        extra_objects = key_objects[5:] + _extract_noun_phrases(
+            cleaned, min_count=2, max_count=10, excluded=set(characters)
+        )
+        tokens = _dedupe_preserve_order(tokens + extra_objects)
     if len(tokens) < 6:
-        tokens = _dedupe_preserve_order(tokens + verbs)
-    return tokens[:10]
+        tokens = _dedupe_preserve_order(tokens + actions)
+    return tokens[:12]
 
 
 def _anchor_token_coverage(
@@ -1246,6 +1290,106 @@ def _anchor_token_coverage(
         f"need at least {required}. Missing: {', '.join(missing)}."
     )
     return False, summary
+
+
+def _event_beat_coverage(
+    story_text: str,
+    cleaned_transcript: str,
+    *,
+    min_ratio: float = 0.6,
+    min_required: int = 2,
+) -> tuple[bool, str]:
+    beats = _extract_event_beats(cleaned_transcript)[:6]
+    if not beats:
+        return True, ""
+    stopwords = {
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "but",
+        "so",
+        "to",
+        "of",
+        "in",
+        "on",
+        "at",
+        "for",
+        "with",
+        "from",
+        "into",
+        "up",
+        "down",
+        "over",
+        "under",
+        "then",
+        "when",
+        "while",
+        "after",
+        "before",
+        "as",
+        "that",
+        "this",
+        "these",
+        "those",
+        "it",
+        "its",
+        "is",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "am",
+        "are",
+        "do",
+        "did",
+        "does",
+        "done",
+        "have",
+        "has",
+        "had",
+        "i",
+        "you",
+        "we",
+        "he",
+        "she",
+        "they",
+        "him",
+        "her",
+        "them",
+        "our",
+        "their",
+        "my",
+        "your",
+        "me",
+    }
+    text_lower = story_text.lower()
+
+    def beat_matches(beat: str) -> bool:
+        tokens = [
+            token.lower()
+            for token in re.findall(r"[A-Za-z']+", beat)
+            if token.lower() not in stopwords
+        ]
+        tokens = _dedupe_preserve_order(tokens)
+        if not tokens:
+            return False
+        required = max(min_required, math.ceil(len(tokens) * min_ratio))
+        required = min(required, len(tokens))
+        found = sum(
+            1
+            for token in tokens
+            if re.search(rf"\\b{re.escape(token)}\\b", text_lower)
+        )
+        return found >= required
+
+    for beat in beats:
+        if beat_matches(beat):
+            return True, ""
+
+    return False, "No transcript event beat appeared in the story."
 
 
 _NEGATION_TERMS = (
@@ -1680,8 +1824,9 @@ def _openai_storybook(
     )
     repair_spec: dict[str, Any] | None = None
     fidelity_note: str | None = None
-    anchor_tokens = _extract_anchor_tokens(cleaned_transcript, narrator)
+    anchor_tokens = _extract_anchor_tokens(cleaned_transcript, narrator, anchor_spec)
     coverage_note: str | None = None
+    beat_note: str | None = None
     for attempt in range(2):
         correction = ""
         if attempt == 1:
@@ -1699,6 +1844,12 @@ def _openai_storybook(
                     "\nAnchor token coverage fixes required (be surgical; keep tone and length):\n"
                     f"{coverage_note}\n"
                     "Improve coverage without adding new major plotlines."
+                )
+            if beat_note:
+                correction += (
+                    "\nTranscript beat coverage required:\n"
+                    f"{beat_note}\n"
+                    "Ensure at least one event beat from the transcript is reflected in the story."
                 )
         try:
             if client:
@@ -1875,6 +2026,18 @@ def _openai_storybook(
                     f"{user_prompt}\n\nIssues:\n- "
                     + coverage_summary
                     + "\n\nRewrite to include more of the anchor tokens from the transcript."
+                )
+                continue
+            return None
+        beat_ok, beat_summary = _event_beat_coverage(all_text, cleaned_transcript)
+        if not beat_ok:
+            beat_note = beat_summary
+            print("Fidelity failed via transcript beat coverage.")
+            if attempt == 0:
+                user_prompt = (
+                    f"{user_prompt}\n\nIssues:\n- "
+                    + beat_summary
+                    + "\n\nRewrite to include at least one event beat from the transcript."
                 )
                 continue
             return None
@@ -2412,13 +2575,6 @@ def _build_pages_from_data(data: dict[str, Any], target_pages: int) -> list[Stor
     return pages
 
 
-def _extract_beats(cleaned: str) -> dict[str, bool]:
-    lower = (cleaned or "").lower()
-    return {
-        "pizza": "pizza" in lower or "crust" in lower,
-        "monster": "monster" in lower,
-        "horse": "horse" in lower or "hooves" in lower,
-    }
 
 
 def _cover_prompt(story: StoryBook, cleaned: str) -> str:
