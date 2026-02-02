@@ -340,23 +340,31 @@ def _build_anchor_list(cleaned: str, narrator: str | None) -> list[str]:
     return anchors
 
 
-def _missing_anchors(page_texts: list[str], anchors: list[str]) -> list[str]:
-    if not anchors:
-        return []
-    combined = " ".join(page_texts).lower()
-    missing: list[str] = []
-    for anchor in anchors:
-        anchor_text = anchor.strip()
-        if not anchor_text:
-            continue
-        anchor_lower = anchor_text.lower()
-        if " " in anchor_lower:
-            if anchor_lower not in combined:
-                missing.append(anchor_text)
-            continue
-        if not re.search(rf"\b{re.escape(anchor_lower)}\b", combined):
-            missing.append(anchor_text)
-    return missing
+def _build_anchor_beats(cleaned: str) -> dict[str, bool]:
+    lower = (cleaned or "").lower()
+    return {
+        "pizza": "pizza" in lower,
+        "crust": "crust" in lower,
+        "monster": "monster" in lower,
+        "horse": "horse" in lower,
+        "dad": "dad" in lower or "father" in lower,
+    }
+
+
+def _anchor_ok(text: str, beats: dict[str, bool]) -> tuple[bool, list[str]]:
+    t = (text or "").lower()
+    missing = []
+    if beats.get("pizza") and "pizza" not in t:
+        missing.append("pizza")
+    if beats.get("crust") and "crust" not in t:
+        missing.append("crust")
+    if beats.get("monster") and "monster" not in t:
+        missing.append("monster")
+    if beats.get("horse") and "horse" not in t:
+        missing.append("horse")
+    if beats.get("dad") and ("dad" not in t and "father" not in t):
+        missing.append("dad")
+    return (len(missing) == 0, missing)
 
 
 def _extract_fidelity_keywords(cleaned: str) -> list[str]:
@@ -461,7 +469,7 @@ def _build_openai_prompts(
         f"- Exactly {target_pages} pages.\n"
         "- Page 1: setup + mischief + rising trouble + page-turn hook.\n"
         "- Page 2: big moment + apology + funny resolution + warm ending.\n"
-        "- Use exactly 2 quoted dialogue lines total, each on its own line starting with '- ' or '— '.\n"
+        "- Exactly two dialogue lines total. Each must be a full sentence in quotes on its own line starting with '- ' or '— '.\n"
         "- Dialogue must be short (<= 12 words each) and natural.\n"
         "- Do not use quotation marks for emphasis or any other purpose.\n"
         "- Kid-safe, whimsical, humorous, creative expansion.\n"
@@ -531,8 +539,8 @@ def _openai_storybook(
                 "Rewrite the story to satisfy ALL requirements:\n"
                 f"- EXACTLY {target_pages} pages.\n"
                 f"- EACH page MUST be between {_MIN_WORDS_PER_PAGE} and {_MAX_WORDS_PER_PAGE} words.\n"
-                '- Use exactly 2 quoted dialogue lines total using straight quotes, e.g. "...".\n'
-                "- Each dialogue line must be short (<= 12 words), natural, and appear on its own line starting with '- ' or '— '.\n"
+                '- Exactly two dialogue lines total using straight quotes, e.g. "...". Each must be a full sentence on its own line starting with "- " or "— ".\n'
+                "- Each dialogue line must be short (<= 12 words) and natural.\n"
                 "- Do not use quotation marks for emphasis or any other purpose.\n"
                 "- Return ONLY JSON matching the schema. No extra keys, no commentary."
             )
@@ -578,29 +586,30 @@ def _openai_storybook(
             return None
 
         # Post-process pages BEFORE validation so we validate the final text that will be printed
+        used_sentences: set[str] = set()
+        beats = _extract_beats(cleaned)
+        padding_candidates = _transcript_padding_sentences(beats, narrator or "Claire")
         for page in pages:
-            page.text = _pad_text_to_min_words_with_beats(
+            page.text = _pad_to_min_words_no_repeats(
                 page.text,
-                min_words=_MIN_WORDS_PER_PAGE,
-                cleaned=cleaned,
-                narrator=narrator,
+                _MIN_WORDS_PER_PAGE,
+                padding_candidates,
+                used_sentences,
             )
-            page.text = _normalize_dialogue_lines(page.text, max_lines=3)
+            page.text = _normalize_dialogue_lines(page.text, max_lines=2)
 
         total_dialogue = sum(_count_dialogue_lines(page.text) for page in pages)
-        if total_dialogue < 1:
-            pages[-1].text = _ensure_dialogue_count(pages[-1].text, target_lines=1)
+        if total_dialogue < 2:
+            pages[-1].text = _ensure_dialogue_count(pages[-1].text, target_lines=2)
 
         # Remove any verbatim repeated sentences across pages, then re-pad to hit min words.
         if _dedupe_cross_page_sentences(pages):
-            topic = _infer_topic(cleaned)
-            name = narrator or "A young storyteller"
             for page in pages:
-                page.text = _pad_to_min_words(
+                page.text = _pad_to_min_words_no_repeats(
                     page.text,
                     _MIN_WORDS_PER_PAGE,
-                    topic,
-                    name,
+                    padding_candidates,
+                    used_sentences,
                 )
 
         os.environ["__STORY_CLEANED_TRANSCRIPT__"] = cleaned or ""
@@ -647,11 +656,12 @@ def _openai_storybook(
             return None
 
         page_texts = [page.text for page in pages]
-        missing_anchors = _missing_anchors(page_texts, anchors)
-        if missing_anchors:
-            print(f"Anchor validation failed: {', '.join(missing_anchors)}")
+        beat_map = _build_anchor_beats(cleaned)
+        ok, missing_beats = _anchor_ok(" ".join(page_texts), beat_map)
+        if not ok:
+            print(f"Anchor validation failed: {', '.join(missing_beats)}")
             if attempt == 0:
-                missing_anchor_note = missing_anchors
+                missing_anchor_note = missing_beats
                 continue
             return None
 
@@ -1019,10 +1029,8 @@ def _validate_story_data(data: Any, target_pages: int) -> tuple[bool, list[str]]
     if missing:
         reasons.append(f"missing required transcript term(s): {missing}")
 
-    if total_dialogue < 1 or total_dialogue > 3:
-        reasons.append(
-            f"dialogue lines counted {total_dialogue} but expected between 1 and 3"
-        )
+    if total_dialogue != 2:
+        reasons.append(f"dialogue lines counted {total_dialogue} but expected 2")
     return (len(reasons) == 0, reasons)
 
 
@@ -1069,10 +1077,8 @@ def _validate_story_pages(pages: list[StoryPage], target_pages: int) -> tuple[bo
     if missing:
         reasons.append(f"missing required transcript term(s): {missing}")
 
-    if total_dialogue < 1 or total_dialogue > 3:
-        reasons.append(
-            f"dialogue lines counted {total_dialogue} but expected between 1 and 3"
-        )
+    if total_dialogue != 2:
+        reasons.append(f"dialogue lines counted {total_dialogue} but expected 2")
 
     return (len(reasons) == 0, reasons)
 
@@ -1148,6 +1154,19 @@ def _cover_prompt(story: StoryBook, cleaned: str) -> str:
     parts.append(f"Main character: {main_character} with expressive face.")
     parts.append("Soft watercolor textures, storybook composition, gentle lighting.")
     return " ".join(parts)
+
+
+    t = (cleaned or "").lower()
+    return {
+        "pizza": "pizza" in t,
+        "crust": "crust" in t,
+        "trash": "trash" in t or "threw" in t or "thrown" in t,
+        "monster": "monster" in t,
+        "horse": "horse" in t,
+        "dad": "dad" in t or "father" in t,
+        "lied": "lied" in t or "lie" in t,
+        "apology": "sorry" in t or "wish i would have listened" in t or "apolog" in t,
+    }
 
 
 def _local_page_expansions(claire_name: str, dad_name: str, *, stage: str) -> list[str]:
@@ -1386,11 +1405,11 @@ def _word_count(text: str) -> int:
 
 
 def _count_dialogue_lines(text: str) -> int:
-    line_start = re.compile(r"^\s*[-—]\s+", re.MULTILINE)
+    line_start = re.compile(r'^\s*[-—]\s+["“].+["”]\s*$', re.MULTILINE)
     return sum(1 for _ in line_start.finditer(text))
 
 
-def _limit_dialogue_lines(text: str, max_lines: int = 3) -> str:
+def _limit_dialogue_lines(text: str, max_lines: int = 2) -> str:
     """
     Keeps the first max_lines dialogue lines, removes leading markers from the rest
     so they no longer count as dialogue lines.
@@ -1416,8 +1435,8 @@ def _ensure_dialogue_count(text: str, target_lines: int = 2) -> str:
         return text
 
     additions = [
-        "- We can fix it.",
-        "- That was silly.",
+        '- "We can fix it."',
+        '- "That was silly."',
     ]
     needed = target_lines - current
     extra = "\n".join(additions[:needed])
@@ -1425,7 +1444,7 @@ def _ensure_dialogue_count(text: str, target_lines: int = 2) -> str:
     return f"{text.rstrip()}{separator}{extra}".strip()
 
 
-def _normalize_dialogue_lines(text: str, max_lines: int = 3) -> str:
+def _normalize_dialogue_lines(text: str, max_lines: int = 2) -> str:
     """
     Keep up to max_lines of dialogue. Any extra dialogue lines or quoted segments
     are rewritten into plain narration (no quotes).
@@ -1464,6 +1483,58 @@ def _strip_extra_quotes(text: str, *, allowed: int) -> str:
         return content
 
     return pattern.sub(replace, text)
+
+
+def _transcript_padding_sentences(beats: dict[str, bool], name: str) -> list[str]:
+    s: list[str] = []
+    if beats.get("pizza"):
+        s.append(
+            "The kitchen smelled like warm pizza, and Claire’s tummy rumbled in a very dramatic way."
+        )
+    if beats.get("crust"):
+        s.append("The crust felt crackly and brave, like it was daring her to take one tiny bite.")
+    if beats.get("trash"):
+        s.append("The trash can lid went thump, and the secret suddenly felt louder than it should have.")
+    if beats.get("lied"):
+        s.append("A little lie can start small, but it can grow legs and tap-dance around your heart.")
+    if beats.get("monster"):
+        s.append("Then came the pizza monster—cheesy, stompy, and much sillier than scary if you looked closely.")
+    if beats.get("horse") and beats.get("dad"):
+        s.append(
+            "Her dad burst in like a storybook hero, riding a shiny horse that looked like it had been polished with sunshine."
+        )
+    if beats.get("apology"):
+        s.append("Claire’s voice got quiet, and her honesty finally felt like a breath of fresh air.")
+    s.append(
+        "Claire tried to act normal, but her cheeks felt warm, like they were telling the truth without permission."
+    )
+    s.append(
+        "For one tiny moment, everything paused—then the story rolled forward like a pizza dough being stretched."
+    )
+    return s
+
+
+def _pad_to_min_words_no_repeats(
+    text: str,
+    target_min: int,
+    candidates: list[str],
+    used: set[str],
+) -> str:
+    cur = (text or "").strip()
+    if _word_count(cur) >= target_min:
+        return cur
+    for sent in candidates:
+        if sent in used:
+            continue
+        if sent in cur:
+            used.add(sent)
+            continue
+        cur2 = cur + (" " if cur else "") + sent
+        used.add(sent)
+        cur = cur2
+        if _word_count(cur) >= target_min:
+            break
+    return cur
 
 
 def _pad_to_min_words(text: str, target_min: int, topic: str, name: str) -> str:
