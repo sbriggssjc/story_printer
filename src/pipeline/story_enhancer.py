@@ -1434,8 +1434,8 @@ def _validate_story_data(data: Any, target_pages: int) -> tuple[bool, list[str]]
     if dupes:
         reasons.append(f"repeated sentence across pages: {dupes[0]}")
 
-    if total_dialogue != 2:
-        reasons.append(f"dialogue lines counted {total_dialogue} but expected 2")
+    if total_dialogue < 1 or total_dialogue > 3:
+        reasons.append(f"dialogue lines counted {total_dialogue} but expected 1-3")
     return (len(reasons) == 0, reasons)
 
 
@@ -1477,8 +1477,8 @@ def _validate_story_pages(pages: list[StoryPage], target_pages: int) -> tuple[bo
     if dupes:
         reasons.append(f"repeated sentence across pages: {dupes[0]}")
 
-    if total_dialogue != 2:
-        reasons.append(f"dialogue lines counted {total_dialogue} but expected 2")
+    if total_dialogue < 1 or total_dialogue > 3:
+        reasons.append(f"dialogue lines counted {total_dialogue} but expected 1-3")
 
     return (len(reasons) == 0, reasons)
 
