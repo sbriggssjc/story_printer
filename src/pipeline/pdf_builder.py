@@ -165,7 +165,7 @@ def render_story_pdf(
         page_number += 1
 
     def draw_illustration_box(page: StoryPage, box_x: float, box_y: float, box_w: float, box_h: float) -> None:
-        image_path = page.image_path or page.illustration_path
+        image_path = getattr(page, "image_path", None) or getattr(page, "illustration_path", None)
         if image_path and Path(image_path).exists():
             image = ImageReader(image_path)
             img_w, img_h = image.getSize()
