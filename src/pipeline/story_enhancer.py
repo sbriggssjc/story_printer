@@ -18,7 +18,6 @@ import json
 import os
 import random
 import re
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -37,16 +36,6 @@ _DEFAULT_STYLE = os.getenv("STORY_STYLE", "whimsical, funny, heartwarming")
 _DEFAULT_FIDELITY_MODEL = os.getenv("STORY_FIDELITY_MODEL", _DEFAULT_MODEL)
 _MIN_WORDS_PER_PAGE = max(240, _DEFAULT_WORDS_PER_PAGE - 40)
 _MAX_WORDS_PER_PAGE = min(320, _DEFAULT_WORDS_PER_PAGE + 40)
-
-
-@dataclass
-class AnchorSpec:
-    characters: list[str]
-    setting: list[str] | None
-    props: list[str]
-    events: list[str]
-    moral: str | None
-    non_negotiables: list[str]
 
 
 def _apply_short_transcript_targets(cleaned_transcript: str) -> None:
@@ -82,7 +71,6 @@ class AnchorSpec(BaseModel):
     setting: str | None
     beats: list[str]
     lesson: str | None = None
-    must_not_change: list[str] = []
 
 
 def _split_sentences_for_dedupe(text: str) -> list[str]:
@@ -97,32 +85,6 @@ def _split_sentences(text: str) -> list[str]:
     # Simple sentence split; good enough for children’s prose
     parts = re.split(r"(?<=[.!?])\s+", (text or "").strip())
     return [p.strip() for p in parts if p and p.strip()]
-
-
-def _split_transcript_into_beats(cleaned: str, *, min_beats: int = 4, max_beats: int = 10) -> list[str]:
-    if not cleaned:
-        return []
-    sentences = _split_sentences(cleaned)
-    beats: list[str] = []
-    for sentence in sentences:
-        chunk = sentence.strip()
-        if not chunk:
-            continue
-        pieces = re.split(r"\b(?:and then|then|and|but|so)\b", chunk, flags=re.IGNORECASE)
-        for piece in pieces:
-            trimmed = piece.strip(" ,;:").strip()
-            if len(trimmed.split()) < 3:
-                continue
-            beats.append(trimmed)
-        if len(beats) >= max_beats:
-            break
-    if len(beats) < min_beats:
-        for sentence in sentences:
-            if sentence not in beats:
-                beats.append(sentence)
-            if len(beats) >= min_beats:
-                break
-    return beats[:max_beats]
 
 
 def _dedupe_cross_page_sentences(pages: list[StoryPage]) -> bool:
@@ -171,32 +133,6 @@ def _find_duplicate_sentences_across_pages(page_texts: list[str]) -> list[str]:
             if seen[key] >= 2:
                 dupes.add(s)
     return sorted(dupes)
-
-
-def _infer_required_terms(cleaned_transcript: str) -> list[str]:
-    """Lightweight anchor terms derived from the transcript."""
-    lower = (cleaned_transcript or "").lower()
-    required: list[str] = []
-    # Hard anchors for your current use case; safe + simple
-    if "pizza" in lower:
-        required.extend(["pizza", "crust"])
-    if "monster" in lower:
-        required.append("monster")
-    # If transcript implies apology/laughter
-    if "sorry" in lower or "apolog" in lower:
-        required.append("sorry")
-    if "laugh" in lower or "giggl" in lower:
-        required.append("laug")
-    return sorted(set(required))
-
-
-def _missing_required_terms(page_texts: list[str], required_terms: list[str]) -> list[str]:
-    blob = " ".join(page_texts).lower()
-    missing = []
-    for term in required_terms:
-        if term not in blob:
-            missing.append(term)
-    return missing
 
 
 def _extract_proper_names(cleaned: str, narrator: str | None) -> list[str]:
@@ -465,46 +401,26 @@ def _extract_moral(cleaned: str) -> str | None:
     return None
 
 
-def _build_non_negotiables(spec: AnchorSpec) -> list[str]:
-    items: list[str] = []
-    for character in spec.characters:
-        items.append(f"Character: {character}")
-    for setting in spec.setting or []:
-        items.append(f"Setting: {setting}")
-    for prop in spec.props[:4]:
-        items.append(f"Key object: {prop}")
-    if spec.events:
-        items.append(f"Core event: {spec.events[0]}")
-        if len(spec.events) > 1:
-            items.append(f"Core event: {spec.events[-1]}")
-    if spec.moral:
-        items.append(f"Lesson: {spec.moral}")
-    return _dedupe_preserve_order(items)
-
-
 def _local_anchor_spec(cleaned: str) -> AnchorSpec:
     characters = _dedupe_preserve_order(
         _extract_proper_names(cleaned, None) + _extract_role_characters(cleaned)
     )
     settings = _extract_settings(cleaned)
     excluded = set(characters + settings)
-    props = _extract_noun_phrases(cleaned, min_count=3, max_count=10, excluded=excluded)
-    props = _dedupe_preserve_order(props)
-    events = _extract_event_beats(cleaned)
-    if len(events) < 4:
-        events = events + ["A key moment happens.", "The situation is resolved."][: 4 - len(events)]
-    events = events[:10]
-    moral = _extract_moral(cleaned)
-    spec = AnchorSpec(
+    key_objects = _extract_noun_phrases(cleaned, min_count=3, max_count=10, excluded=excluded)
+    key_objects = _dedupe_preserve_order(key_objects)
+    beats = _extract_event_beats(cleaned)
+    if len(beats) < 4:
+        beats = beats + ["A key moment happens.", "The situation is resolved."][: 4 - len(beats)]
+    beats = beats[:10]
+    lesson = _extract_moral(cleaned)
+    return AnchorSpec(
         characters=characters,
-        setting=settings or None,
-        props=props,
-        events=events,
-        moral=moral,
-        non_negotiables=[],
+        setting=settings[0] if settings else None,
+        key_objects=key_objects,
+        beats=beats,
+        lesson=lesson,
     )
-    spec.non_negotiables = _build_non_negotiables(spec)
-    return spec
 
 
 def _anchor_json_schema() -> dict[str, Any]:
@@ -512,19 +428,17 @@ def _anchor_json_schema() -> dict[str, Any]:
         "type": "object",
         "properties": {
             "characters": {"type": "array", "items": {"type": "string"}},
-            "setting": {"type": ["array", "null"], "items": {"type": "string"}},
-            "props": {"type": "array", "items": {"type": "string"}},
-            "events": {"type": "array", "items": {"type": "string"}},
-            "moral": {"type": ["string", "null"]},
-            "non_negotiables": {"type": "array", "items": {"type": "string"}},
+            "setting": {"type": ["string", "null"]},
+            "key_objects": {"type": "array", "items": {"type": "string"}},
+            "beats": {"type": "array", "items": {"type": "string"}},
+            "lesson": {"type": ["string", "null"]},
         },
         "required": [
             "characters",
             "setting",
-            "props",
-            "events",
-            "moral",
-            "non_negotiables",
+            "key_objects",
+            "beats",
+            "lesson",
         ],
         "additionalProperties": False,
     }
@@ -534,57 +448,38 @@ def _coerce_anchor_spec(data: Any) -> AnchorSpec | None:
     if not isinstance(data, dict):
         return None
     characters = data.get("characters")
-    props = data.get("props")
-    events = data.get("events")
-    if not isinstance(characters, list) or not isinstance(props, list) or not isinstance(events, list):
+    key_objects = data.get("key_objects")
+    beats = data.get("beats")
+    if not isinstance(characters, list) or not isinstance(key_objects, list) or not isinstance(beats, list):
         return None
     setting_value = data.get("setting")
-    if isinstance(setting_value, list):
-        setting = [item for item in setting_value if isinstance(item, str)]
-    elif isinstance(setting_value, str):
-        setting = [setting_value]
-    else:
-        setting = None
-    moral = data.get("moral") if isinstance(data.get("moral"), str) else None
-    non_negotiables_value = data.get("non_negotiables")
-    non_negotiables = (
-        [item for item in non_negotiables_value if isinstance(item, str)]
-        if isinstance(non_negotiables_value, list)
-        else []
-    )
+    setting = setting_value if isinstance(setting_value, str) else None
+    lesson = data.get("lesson") if isinstance(data.get("lesson"), str) else None
     return AnchorSpec(
         characters=[item for item in characters if isinstance(item, str)],
         setting=setting,
-        props=[item for item in props if isinstance(item, str)],
-        events=[item for item in events if isinstance(item, str)],
-        moral=moral,
-        non_negotiables=non_negotiables,
+        key_objects=[item for item in key_objects if isinstance(item, str)],
+        beats=[item for item in beats if isinstance(item, str)],
+        lesson=lesson,
     )
 
 
 def _normalize_anchor_spec(spec: AnchorSpec, fallback: AnchorSpec) -> AnchorSpec:
     characters = _dedupe_preserve_order(spec.characters or fallback.characters)
-    settings = _dedupe_preserve_order(spec.setting or fallback.setting or [])
-    props = _dedupe_preserve_order(spec.props or fallback.props)
-    events = _dedupe_preserve_order(spec.events or fallback.events)
-    if len(events) < 4:
-        events = _dedupe_preserve_order(events + fallback.events)
-    events = events[:10]
-    moral = spec.moral or fallback.moral
-    normalized = AnchorSpec(
+    setting = spec.setting or fallback.setting
+    key_objects = _dedupe_preserve_order(spec.key_objects or fallback.key_objects)
+    beats = _dedupe_preserve_order(spec.beats or fallback.beats)
+    if len(beats) < 4:
+        beats = _dedupe_preserve_order(beats + fallback.beats)
+    beats = beats[:10]
+    lesson = spec.lesson or fallback.lesson
+    return AnchorSpec(
         characters=characters,
-        setting=settings or None,
-        props=props,
-        events=events,
-        moral=moral,
-        non_negotiables=[],
+        setting=setting,
+        key_objects=key_objects,
+        beats=beats,
+        lesson=lesson,
     )
-    normalized.non_negotiables = (
-        _dedupe_preserve_order(spec.non_negotiables)
-        if spec.non_negotiables
-        else _build_non_negotiables(normalized)
-    )
-    return normalized
 
 
 def _request_openai_anchor_spec(
@@ -618,7 +513,7 @@ def _request_openai_anchor_spec(
             return json.dumps(parsed)
         return _extract_response_text(result)
 
-    if use_responses:
+    if use_responses and hasattr(client, "responses"):
         schema = _anchor_json_schema()
         response = client.responses.create(
             model=_DEFAULT_MODEL,
@@ -638,18 +533,7 @@ def _request_openai_anchor_spec(
             max_output_tokens=500,
         )
         return _extract_response_text(response)
-
-    response = client.chat.completions.create(
-        model=_DEFAULT_MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.2,
-        response_format={"type": "json_object"},
-        max_tokens=500,
-    )
-    return response.choices[0].message.content if response.choices else ""
+    return ""
 
 
 def _openai_http_anchor_spec(system_prompt: str, user_prompt: str) -> tuple[str, str]:
@@ -681,21 +565,7 @@ def _openai_http_anchor_spec(system_prompt: str, user_prompt: str) -> tuple[str,
             return content, "responses"
     except Exception as exc:
         print(f"OpenAI HTTP responses anchor call failed: {exc}")
-
-    chat_payload = {
-        "model": _DEFAULT_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": 0.2,
-    }
-    response_data = _post_openai_request(
-        "https://api.openai.com/v1/chat/completions",
-        chat_payload,
-    )
-    content = _extract_http_chat_text(response_data)
-    return content, "chat.completions"
+    return "", "responses"
 
 
 def _openai_anchor_spec(cleaned: str) -> AnchorSpec | None:
@@ -707,8 +577,8 @@ def _openai_anchor_spec(cleaned: str) -> AnchorSpec | None:
     )
     user_prompt = (
         "Extract canon anchors from this transcript. "
-        "Provide characters, setting, props, ordered events (4-10 beats), "
-        "optional moral/lesson, and non-negotiables.\n\n"
+        "Provide characters, setting, key_objects, ordered beats (4-10), "
+        "and an optional lesson.\n\n"
         f"TRANSCRIPT:\n{cleaned or 'Empty transcript.'}"
     )
     client = _get_openai_client()
@@ -733,110 +603,11 @@ def _openai_anchor_spec(cleaned: str) -> AnchorSpec | None:
 def extract_story_anchors(cleaned_transcript: str) -> AnchorSpec:
     cleaned = cleaned_transcript or ""
     local_spec = _local_anchor_spec(cleaned)
-    if _use_openai_story_mode():
+    if os.getenv("OPENAI_API_KEY"):
         openai_spec = _openai_anchor_spec(cleaned)
         if openai_spec:
             return _normalize_anchor_spec(openai_spec, local_spec)
     return local_spec
-
-
-def _build_anchor_list(cleaned: str, narrator: str | None) -> list[str]:
-    anchors: list[str] = []
-    seen: set[str] = set()
-
-    for name in _extract_proper_names(cleaned, narrator):
-        normalized = name.strip()
-        if not normalized:
-            continue
-        key = normalized.lower()
-        if key in seen:
-            continue
-        anchors.append(normalized)
-        seen.add(key)
-
-    apology_terms = []
-    lowered = (cleaned or "").lower()
-    if "sorry" in lowered:
-        apology_terms.append("sorry")
-    if "apolog" in lowered:
-        apology_terms.append("apologize")
-    if "fix" in lowered:
-        apology_terms.append("fix")
-
-    for term in apology_terms:
-        if term not in seen:
-            anchors.append(term)
-            seen.add(term)
-
-    phrase_exclusions = set(seen)
-    phrases = _extract_noun_phrases(
-        cleaned, min_count=3, max_count=8, excluded=phrase_exclusions
-    )
-    for phrase in phrases:
-        key = phrase.lower()
-        if key in seen:
-            continue
-        anchors.append(phrase)
-        seen.add(key)
-
-    return anchors
-
-
-def _infer_setting(cleaned: str) -> str | None:
-    lowered = (cleaned or "").lower()
-    for setting in ("kitchen", "yard", "garden", "classroom", "living room", "park", "school"):
-        if setting in lowered:
-            return setting
-    return None
-
-
-def _build_anchor_spec(cleaned: str, narrator: str | None) -> AnchorSpec:
-    characters: list[str] = []
-    seen_characters: set[str] = set()
-    for name in _extract_proper_names(cleaned, narrator):
-        if not name:
-            continue
-        key = name.lower()
-        if key in seen_characters:
-            continue
-        characters.append(name)
-        seen_characters.add(key)
-    lowered = (cleaned or "").lower()
-    if "dad" in lowered or "father" in lowered:
-        if "dad" not in seen_characters:
-            characters.append("Dad")
-            seen_characters.add("dad")
-    if "mom" in lowered or "mother" in lowered:
-        if "mom" not in seen_characters:
-            characters.append("Mom")
-            seen_characters.add("mom")
-
-    key_objects: list[str] = []
-    seen_objects: set[str] = set()
-    if "pizza" in lowered and "crust" in lowered:
-        key_objects.append("pizza crust")
-        seen_objects.add("pizza crust")
-    for phrase in _extract_noun_phrases(cleaned, min_count=2, max_count=6):
-        normalized = phrase.lower()
-        if normalized in seen_objects:
-            continue
-        key_objects.append(phrase)
-        seen_objects.add(normalized)
-
-    beats = _split_transcript_into_beats(cleaned)
-    lesson = "apology and honesty" if "sorry" in lowered or "apolog" in lowered else None
-    must_not_change = []
-    if characters:
-        must_not_change.append(f"Do not rename these characters: {', '.join(characters)}.")
-
-    return AnchorSpec(
-        characters=characters,
-        key_objects=key_objects,
-        setting=_infer_setting(cleaned),
-        beats=beats,
-        lesson=lesson,
-        must_not_change=must_not_change,
-    )
 
 
 def _fails_fidelity(pages_text: str, must_keywords: list[str]) -> tuple[list[str], list[str]]:
@@ -877,7 +648,7 @@ def _request_openai_fidelity_check(
     system_prompt = (
         "You are a strict story fidelity evaluator. Compare the story against the anchors. "
         "Check beat coverage (each anchor beat must appear in order), "
-        "entity consistency (names/props persist), and contradictions (no inversion of canon). "
+        "entity consistency (characters and key_objects persist), and contradictions (no inversion of canon). "
         "Return ONLY the JSON object that matches the schema."
     )
     anchor_json = json.dumps(anchor_spec.model_dump(), ensure_ascii=False, indent=2)
@@ -958,7 +729,7 @@ def _request_openai_fidelity_http(
     system_prompt = (
         "You are a strict story fidelity evaluator. Compare the story against the anchors. "
         "Check beat coverage (each anchor beat must appear in order), "
-        "entity consistency (names/props persist), and contradictions (no inversion of canon). "
+        "entity consistency (characters and key_objects persist), and contradictions (no inversion of canon). "
         "Return ONLY the JSON object that matches the schema."
     )
     anchor_json = json.dumps(anchor_spec.model_dump(), ensure_ascii=False, indent=2)
@@ -1035,15 +806,16 @@ def enhance_to_storybook(transcript: str, *, target_pages: int = 2) -> StoryBook
     title = _infer_title(cleaned) if cleaned else "My Story"
     subtitle = "A story told out loud"
     target_pages = target_pages or _DEFAULT_TARGET_PAGES
+    anchor_spec = extract_story_anchors(cleaned)
 
     if _is_openai_story_requested():
         print("STORY_ENHANCE_MODE=openai detected")
-        openai_story = _openai_storybook(cleaned, title, narrator, target_pages)
+        openai_story = _openai_storybook(anchor_spec, title, narrator, target_pages)
         if openai_story:
             _maybe_generate_images(openai_story, cleaned)
             return openai_story
 
-    local_story = _local_storybook(cleaned, title, narrator, target_pages)
+    local_story = _local_storybook(anchor_spec, title, narrator, target_pages)
     _maybe_generate_images(local_story, cleaned)
     return local_story
 
@@ -1072,7 +844,7 @@ def _get_openai_client():
 
 
 def _build_openai_prompts(
-    cleaned: str, narrator: str | None, target_pages: int
+    anchor_spec: AnchorSpec, narrator: str | None, target_pages: int
 ) -> tuple[str, str, AnchorSpec]:
     system_prompt = (
         "You are a celebrated children's picture-book author and editor. "
@@ -1082,31 +854,23 @@ def _build_openai_prompts(
     beat_sheet = (
         "Beat sheet:\n"
         "1) Warm opening with setting and sensory details.\n"
-        "2) Mischief/choice from the transcript idea.\n"
-        "3) Rising trouble and playful tension.\n"
+        "2) First anchor beat appears.\n"
+        "3) Rising tension that leads into the next beat.\n"
         "4) Page-turn hook ending page 1.\n"
-        "5) Big moment on page 2.\n"
-        "6) Sincere apology.\n"
-        "7) Funny resolution.\n"
+        "5) Biggest anchor beat on page 2.\n"
+        "6) Emotional response or realization.\n"
+        "7) Resolution that follows the remaining beats.\n"
         "8) Warm ending with emotional lift.\n"
     )
-    anchor_terms = _build_anchor_list(cleaned, narrator)
-    anchor_line = ", ".join(anchor_terms) if anchor_terms else "none"
-    anchor_spec = _build_anchor_spec(cleaned, narrator)
     anchor_json = json.dumps(anchor_spec.model_dump(), ensure_ascii=False, indent=2)
     user_prompt = (
-        "TRANSCRIPT (core plot MUST be preserved; you may rephrase sentences, but do not invent new major events):\n"
-        f"{cleaned or 'Empty transcript.'}\n\n"
-        "Non-negotiable story anchors (must appear clearly):\n"
-        "- Claire hides the pizza crust.\n"
-        "- A pizza monster shows up (real or pretend is fine).\n"
-        "- Claire apologizes.\n"
-        "- Everyone laughs / warm resolution.\n\n"
+        "Use the AnchorSpec JSON below as the ONLY source of plot truth. "
+        "Do not invent new major plotlines beyond what the anchors imply.\n\n"
         f"NARRATOR (keep name if present): {narrator or 'none'}\n\n"
         "Story requirements:\n"
         f"- Exactly {target_pages} pages.\n"
-        "- Page 1: setup + mischief + rising trouble + page-turn hook.\n"
-        "- Page 2: big moment + apology + funny resolution + warm ending.\n"
+        "- Page 1: setup + early beats + rising trouble + page-turn hook.\n"
+        "- Page 2: remaining beats + resolution + warm ending.\n"
         "- Exactly two dialogue lines total. Each must be a full sentence in quotes on its own line starting with '- ' or '— '.\n"
         "- Dialogue must be short (<= 12 words each) and natural.\n"
         "- Do not use quotation marks for emphasis or any other purpose.\n"
@@ -1115,8 +879,8 @@ def _build_openai_prompts(
         "- Avoid repeating filler sentences or stock phrases.\n"
         "- Do NOT repeat any exact sentence across pages. Each sentence must be unique.\n"
         "- Keep names consistent; use narrator if provided.\n"
-        f"- Your story MUST include all anchors exactly once or more: {anchor_line}.\n"
         "- You MUST include each anchor beat in order (paraphrase is allowed).\n"
+        "- Ensure entity consistency: characters, key_objects, and setting stay the same.\n"
         "- Do not change any character identities or swap roles.\n"
         "- You may add whimsical details, but do not add new major plotlines.\n"
         f"- {_MIN_WORDS_PER_PAGE}–{_MAX_WORDS_PER_PAGE} words per page (target {_DEFAULT_WORDS_PER_PAGE}).\n"
@@ -1135,12 +899,6 @@ def _build_openai_prompts(
         "}\n\n"
         f"Style: {_DEFAULT_STYLE}."
     )
-    required_terms = _infer_required_terms(cleaned)
-    if required_terms:
-        user_prompt += (
-            "\nFaithfulness requirements (must include these exact terms somewhere in the story):\n"
-            + "- " + ", ".join(required_terms) + "\n"
-        )
     user_prompt += (
         "\nHard bans:\n"
         "- Do NOT use any generic boilerplate sensory sentences.\n"
@@ -1153,7 +911,7 @@ def _build_openai_prompts(
 
 
 def _openai_storybook(
-    cleaned: str,
+    anchor_spec: AnchorSpec,
     title: str,
     narrator: str | None,
     target_pages: int,
@@ -1171,7 +929,7 @@ def _openai_storybook(
     print(f"OpenAI model: {_DEFAULT_MODEL}")
 
     system_prompt, user_prompt, anchor_spec = _build_openai_prompts(
-        cleaned, narrator, target_pages
+        anchor_spec, narrator, target_pages
     )
     fidelity_note: str | None = None
 
@@ -1179,6 +937,8 @@ def _openai_storybook(
         correction = ""
         if attempt == 1:
             correction = (
+                "Targeted repair only. Keep tone, page structure, and length stable.\n"
+                "Fix ONLY the missing beats or contradictions; do not add new major plotlines.\n"
                 "Rewrite the story to satisfy ALL requirements:\n"
                 f"- EXACTLY {target_pages} pages.\n"
                 f"- EACH page MUST be between {_MIN_WORDS_PER_PAGE} and {_MAX_WORDS_PER_PAGE} words.\n"
@@ -1191,7 +951,7 @@ def _openai_storybook(
                 correction += (
                     "\nFidelity fixes required (be surgical; keep tone and length):\n"
                     f"{fidelity_note}\n"
-                    "Fix the specific beats/contradictions without adding new major plotlines."
+                    "Fix the specific beats/contradictions only; keep page order and structure."
                 )
         try:
             if client:
@@ -1230,8 +990,7 @@ def _openai_storybook(
 
         # Post-process pages BEFORE validation so we validate the final text that will be printed
         used_sentences: set[str] = set()
-        beats = _extract_beats(cleaned)
-        padding_candidates = _transcript_padding_sentences(beats, narrator or "Claire")
+        padding_candidates = _anchor_padding_sentences(anchor_spec, narrator)
         for page in pages:
             page.text = _pad_to_min_words_no_repeats(
                 page.text,
@@ -1255,7 +1014,6 @@ def _openai_storybook(
                     used_sentences,
                 )
 
-        os.environ["__STORY_CLEANED_TRANSCRIPT__"] = cleaned or ""
         valid, reasons = _validate_story_pages(pages, target_pages)
         if not valid:
             print(f"Validation failed: {', '.join(reasons)}")
@@ -1279,7 +1037,7 @@ def _openai_storybook(
                 user_prompt = (
                     f"{user_prompt}\n\nIssues:\n- "
                     + "\n- ".join([f"contains banned filler phrase: {p}" for p in banned_phrases])
-                    + "\n\nRewrite while keeping the transcript’s core events EXACT."
+                    + "\n\nRewrite while keeping the anchor beats EXACT."
                 )
                 continue
             return None
@@ -1676,11 +1434,6 @@ def _validate_story_data(data: Any, target_pages: int) -> tuple[bool, list[str]]
     if dupes:
         reasons.append(f"repeated sentence across pages: {dupes[0]}")
 
-    required_terms = _infer_required_terms(os.getenv("__STORY_CLEANED_TRANSCRIPT__", "") or "")
-    missing = _missing_required_terms(page_texts, required_terms) if required_terms else []
-    if missing:
-        reasons.append(f"missing required transcript term(s): {missing}")
-
     if total_dialogue != 2:
         reasons.append(f"dialogue lines counted {total_dialogue} but expected 2")
     return (len(reasons) == 0, reasons)
@@ -1724,11 +1477,6 @@ def _validate_story_pages(pages: list[StoryPage], target_pages: int) -> tuple[bo
     if dupes:
         reasons.append(f"repeated sentence across pages: {dupes[0]}")
 
-    required_terms = _infer_required_terms(os.getenv("__STORY_CLEANED_TRANSCRIPT__", "") or "")
-    missing = _missing_required_terms(page_texts, required_terms) if required_terms else []
-    if missing:
-        reasons.append(f"missing required transcript term(s): {missing}")
-
     if total_dialogue != 2:
         reasons.append(f"dialogue lines counted {total_dialogue} but expected 2")
 
@@ -1748,37 +1496,6 @@ def _build_pages_from_data(data: dict[str, Any], target_pages: int) -> list[Stor
         if text and prompt:
             pages.append(StoryPage(text=text, illustration_prompt=prompt))
     return pages
-
-
-def _extract_story_beats(cleaned: str) -> dict[str, str]:
-    lower = (cleaned or "").lower()
-    claire_name = "Claire" if "claire" in lower else "Claire"
-    dad_name = "Dad" if any(token in lower for token in ("dad", "father")) else "Dad"
-    object_name = "pizza crust" if "crust" in lower or "pizza" in lower else "pizza crust"
-
-    deception_phrases = ("hide", "hid", "threw away", "throw away", "lied", "lie")
-    deception_action = "hid it under her napkin"
-    if any(phrase in lower for phrase in deception_phrases):
-        if "threw away" in lower or "throw away" in lower:
-            deception_action = "threw it away when no one was looking"
-        elif "lied" in lower or "lie" in lower:
-            deception_action = "tucked it away and told a small lie"
-        else:
-            deception_action = "hid it under her napkin"
-
-    lesson_line = "I wish I would have listened."
-    if "should've listened" in lower or "should have listened" in lower:
-        lesson_line = "I should have listened."
-    if "wish i listened" in lower or "wish i'd listened" in lower:
-        lesson_line = "I wish I listened."
-
-    return {
-        "claire_name": claire_name,
-        "dad_name": dad_name,
-        "object_name": object_name,
-        "deception_action": deception_action,
-        "lesson_line": lesson_line,
-    }
 
 
 def _extract_beats(cleaned: str) -> dict[str, bool]:
@@ -1808,104 +1525,69 @@ def _cover_prompt(story: StoryBook, cleaned: str) -> str:
     return " ".join(parts)
 
 
-def _local_page_expansions(claire_name: str, dad_name: str, *, stage: str) -> list[str]:
-    if stage == "resolution":
-        return [
-            f"{dad_name}'s horse snorted softly and stamped the ground, eager and brave.",
-            f"{claire_name} felt the knot in her chest loosen as the danger passed.",
-            "The kitchen smelled warm and buttery, and the plates clinked gently on the table.",
-            "A neighbor waved through the window, smiling at the excitement.",
-            "The wind carried away the last rumble of the monster.",
-            f"{dad_name} brushed {claire_name}'s hair back and listened closely.",
-            "The house felt safe again, like a blanket tucked around their shoulders.",
-            "They laughed in relief, the kind of laughter that turns fear into a story.",
-        ]
-    return [
-        "The afternoon light painted soft squares on the floor.",
-        f"{claire_name} shifted her feet, unsure, while the room grew still.",
-        "The pizza smelled cheesy and warm, but the air felt prickly with worry.",
-        f"{dad_name} looked up with a gentle question in his eyes.",
-        "A curtain fluttered, and a shadow slid across the wall.",
-        "The monster's footsteps thudded like drums outside.",
-        "The table vibrated with each stomp, making cups tremble.",
-        f"{claire_name}'s heart beat fast, like a small bird in her chest.",
-    ]
-
-
 def _local_storybook(
-    cleaned: str,
+    anchor_spec: AnchorSpec,
     title: str,
     narrator: str | None,
     target_pages: int,
 ) -> StoryBook:
-    beats = _extract_story_beats(cleaned)
-    claire_name = beats["claire_name"]
-    dad_name = beats["dad_name"]
-    object_name = beats["object_name"]
-    seed = abs(hash(cleaned or "storybook")) % (2**32)
-    rng = random.Random(seed)
     used_sentences: set[str] = set()
+    characters = anchor_spec.characters or ([narrator] if narrator else ["The child"])
+    key_objects = anchor_spec.key_objects or []
+    setting = anchor_spec.setting
+    beats = anchor_spec.beats or []
+    if not beats:
+        beats = ["Something important happens.", "Everyone feels the change."]
+    if len(beats) < target_pages:
+        beats = beats + [beats[-1]] * (target_pages - len(beats))
 
-    page1 = (
-        f"{claire_name} and {dad_name} shared a cozy pizza lunch at home. "
-        f"There was just one {object_name} left, and {claire_name} wanted it so badly her fingers curled. "
-        f"Instead of asking, she {beats['deception_action']}, and when {dad_name} asked about the missing crust, "
-        f"{claire_name} gave a tiny fib that felt like a pebble in her pocket. "
-        "The room went quiet for a moment, as if the house was holding its breath. "
-        "Outside the window, a shadow stretched long and a growl rumbled, soft at first and then louder. "
-        f"A pizza monster stomped into the yard, sniffing the air for {object_name}s, "
-        "and it peered in with hungry, googly eyes. "
-        f"{claire_name} froze, her stomach fluttering as the monster crept closer."
-    )
-    page1 = _expand_text_to_range(
-        page1,
-        _MIN_WORDS_PER_PAGE,
-        _MAX_WORDS_PER_PAGE,
-        _local_page_expansions(claire_name, dad_name, stage="setup"),
-        rng=rng,
-        used=used_sentences,
-    )
+    beats_per_page = max(1, (len(beats) + target_pages - 1) // target_pages)
+    padding_candidates = _anchor_padding_sentences(anchor_spec, narrator)
+    pages: list[StoryPage] = []
 
-    page2 = (
-        "The pizza monster lunged, and the table rattled as it swiped the air. "
-        f"Just then, {dad_name} burst through the gate riding a shiny horse, its mane glittering like coins. "
-        f"With one brave swing, {dad_name} sent the monster tumbling away and chased it from the yard. "
-        f"{claire_name}'s eyes filled with tears. She whispered, \"{beats['lesson_line']}\" "
-        f"and she told {dad_name} the truth about the {object_name}. "
-        f"{dad_name} knelt beside her, hugged her tight, and said mistakes could be mended with honesty. "
-        f"Together they shared fresh pizza, and {claire_name} promised to speak up next time. "
-        "The sun set warm and golden, and the house felt safe and peaceful again."
-    )
-    page2 = _expand_text_to_range(
-        page2,
-        _MIN_WORDS_PER_PAGE,
-        _MAX_WORDS_PER_PAGE,
-        _local_page_expansions(claire_name, dad_name, stage="resolution"),
-        rng=rng,
-        used=used_sentences,
-    )
-
-    pages = [
-        StoryPage(
-            text=page1,
-            illustration_prompt=(
-                f"A cozy kitchen storybook scene with {claire_name} and {dad_name} at a pizza lunch, "
-                f"a single {object_name} on the plate, and a silly pizza monster looming outside the window, "
-                "bright colors, gentle watercolor textures, warm afternoon light, and playful tension."
-            ),
-        ),
-        StoryPage(
-            text=page2,
-            illustration_prompt=(
-                f"A triumphant, heartwarming illustration of {dad_name} on a shiny horse chasing away a pizza monster, "
-                f"with {claire_name} relieved and hugging {dad_name} afterward, cozy home setting, "
-                "gentle watercolor textures, warm golden light, and a peaceful ending."
-            ),
-        ),
-    ]
-
-    if target_pages != 2:
-        pages = pages[:target_pages]
+    for index in range(target_pages):
+        page_beats = beats[index * beats_per_page : (index + 1) * beats_per_page]
+        if not page_beats:
+            page_beats = beats[-1:]
+        page_sentences: list[str] = []
+        if index == 0:
+            if setting:
+                page_sentences.append(
+                    f"In the {setting}, {', '.join(characters)} found themselves in a new moment."
+                )
+            if key_objects:
+                page_sentences.append(
+                    f"The {', '.join(key_objects[:2])} mattered more than they expected."
+                )
+        for beat in page_beats:
+            beat_line = beat.strip()
+            if beat_line and not beat_line.endswith((".", "!", "?")):
+                beat_line += "."
+            page_sentences.append(beat_line)
+        if index == target_pages - 1 and anchor_spec.lesson:
+            page_sentences.append(f"The lesson stayed with them: {anchor_spec.lesson}.")
+        page_text = " ".join(page_sentences).strip()
+        page_text = _pad_to_min_words_no_repeats(
+            page_text, _MIN_WORDS_PER_PAGE, padding_candidates, used_sentences
+        )
+        illustration_prompt_parts = [
+            "Watercolor children's picture book illustration",
+        ]
+        if setting:
+            illustration_prompt_parts.append(f"in a {setting}")
+        if characters:
+            illustration_prompt_parts.append(f"featuring {', '.join(characters[:3])}")
+        if key_objects:
+            illustration_prompt_parts.append(f"with {', '.join(key_objects[:3])}")
+        illustration_prompt_parts.append(
+            "gentle lighting, expressive faces, cozy storybook composition"
+        )
+        pages.append(
+            StoryPage(
+                text=page_text,
+                illustration_prompt=", ".join(illustration_prompt_parts) + ".",
+            )
+        )
 
     return StoryBook(
         title=title,
@@ -2124,33 +1806,36 @@ def _strip_extra_quotes(text: str, *, allowed: int) -> str:
     return pattern.sub(replace, text)
 
 
-def _transcript_padding_sentences(beats: dict[str, bool], name: str) -> list[str]:
-    s: list[str] = []
-    if beats.get("pizza"):
-        s.append(
-            "The kitchen smelled like warm pizza, and Claire’s tummy rumbled in a very dramatic way."
-        )
-    if beats.get("crust"):
-        s.append("The crust felt crackly and brave, like it was daring her to take one tiny bite.")
-    if beats.get("trash"):
-        s.append("The trash can lid went thump, and the secret suddenly felt louder than it should have.")
-    if beats.get("lied"):
-        s.append("A little lie can start small, but it can grow legs and tap-dance around your heart.")
-    if beats.get("monster"):
-        s.append("Then came the pizza monster—cheesy, stompy, and much sillier than scary if you looked closely.")
-    if beats.get("horse") and beats.get("dad"):
-        s.append(
-            "Her dad burst in like a storybook hero, riding a shiny horse that looked like it had been polished with sunshine."
-        )
-    if beats.get("apology"):
-        s.append("Claire’s voice got quiet, and her honesty finally felt like a breath of fresh air.")
-    s.append(
-        "Claire tried to act normal, but her cheeks felt warm, like they were telling the truth without permission."
-    )
-    s.append(
-        "For one tiny moment, everything paused—then the story rolled forward like a pizza dough being stretched."
-    )
-    return s
+def _anchor_padding_sentences(anchor_spec: AnchorSpec, narrator: str | None) -> list[str]:
+    sentences: list[str] = []
+    characters = anchor_spec.characters or ([narrator] if narrator else [])
+    primary_character = characters[0] if characters else (narrator or "The child")
+    key_objects = anchor_spec.key_objects or []
+    setting = anchor_spec.setting
+
+    if setting:
+        if key_objects:
+            sentences.append(
+                f"In the {setting}, {primary_character} kept noticing the {key_objects[0]}."
+            )
+        else:
+            sentences.append(f"In the {setting}, {primary_character} felt the moment settle in.")
+
+    for obj in key_objects[:3]:
+        sentences.append(f"The {obj} stayed important as the story moved forward.")
+
+    for beat in anchor_spec.beats[:4]:
+        trimmed = beat.strip().rstrip(".")
+        if trimmed:
+            sentences.append(f"This was the part where {trimmed}.")
+
+    if anchor_spec.lesson:
+        sentences.append(f"The lesson was gentle but clear: {anchor_spec.lesson}.")
+
+    for character in characters[1:3]:
+        sentences.append(f"{character} stayed close, keeping the plan honest and steady.")
+
+    return _dedupe_preserve_order(sentences)
 
 
 def _pad_to_min_words_no_repeats(
