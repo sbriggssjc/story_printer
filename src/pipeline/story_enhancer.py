@@ -1672,10 +1672,6 @@ def _openai_storybook(
     fidelity_note: str | None = None
     anchor_tokens = _extract_anchor_tokens(cleaned_transcript, narrator)
     coverage_note: str | None = None
-    padding_candidates = _anchor_padding_sentences(anchor_spec, narrator)
-    used_sentences: set[str] = set()
-
-    repeat_sentence_note: str | None = None
     for attempt in range(2):
         correction = ""
         if attempt == 1:
@@ -1737,24 +1733,39 @@ def _openai_storybook(
         if total_dialogue < 2:
             pages[-1].text = _ensure_dialogue_count(pages[-1].text, target_lines=2)
 
-        # Remove any verbatim repeated sentences across pages, then re-pad to hit min words.
-        if _dedupe_cross_page_sentences(pages, _MIN_WORDS_PER_PAGE):
-            for page in pages:
-                page.text = _pad_to_min_words_no_repeats(
-                    page.text,
-                    _MIN_WORDS_PER_PAGE,
-                    padding_candidates,
-                    used_sentences,
+        # Remove any verbatim repeated sentences across pages without local padding.
+        _dedupe_cross_page_sentences(pages, _MIN_WORDS_PER_PAGE)
+
+        _ensure_minimum_dialogue_lines(pages, target_pages)
+        _ensure_unique_sentences_across_pages(
+            pages,
+            anchor_spec,
+            cleaned_transcript,
+            narrator,
+            append_expansions=False,
+        )
+        _trim_pages_to_word_limit(pages, _MAX_WORDS_PER_PAGE)
+
+        low_word_pages = [
+            index + 1
+            for index, page in enumerate(pages)
+            if _word_count(page.text) < _MIN_WORDS_PER_PAGE
+        ]
+        if low_word_pages:
+            print(f"OpenAI enhancement retry: low word count on pages {low_word_pages}.")
+            if attempt == 0:
+                user_prompt = (
+                    f"{user_prompt}\n\n"
+                    "Add 60–100 words per page while keeping the same plot."
                 )
+                continue
+            return None
 
         valid, reasons = _validate_story_pages(pages, target_pages)
         if not valid:
             print(f"Validation failed: {', '.join(reasons)}")
             if attempt == 0:
                 repair_spec = _build_repair_spec(reasons, target_pages)
-        _ensure_minimum_dialogue_lines(pages, target_pages)
-        _ensure_unique_sentences_across_pages(pages, anchor_spec, cleaned_transcript, narrator)
-        _trim_pages_to_word_limit(pages, _MAX_WORDS_PER_PAGE)
 
         valid, reasons = _validate_story_pages(
             pages,
@@ -2777,6 +2788,8 @@ def _ensure_unique_sentences_across_pages(
     anchor_spec: AnchorSpec,
     cleaned: str,
     narrator: str | None,
+    *,
+    append_expansions: bool = True,
 ) -> None:
     used_sentences: set[str] = set()
     for page in pages:
@@ -2789,15 +2802,16 @@ def _ensure_unique_sentences_across_pages(
             unique.append(sentence.strip())
             used_sentences.add(key)
         page.text = " ".join(unique).strip()
-        page.text = _append_anchor_expansions(
-            page.text,
-            min_words=_MIN_WORDS_PER_PAGE,
-            anchor_spec=anchor_spec,
-            cleaned=cleaned,
-            narrator=narrator,
-            used=used_sentences,
-            max_sentences=3,
-        )
+        if append_expansions:
+            page.text = _append_anchor_expansions(
+                page.text,
+                min_words=_MIN_WORDS_PER_PAGE,
+                anchor_spec=anchor_spec,
+                cleaned=cleaned,
+                narrator=narrator,
+                used=used_sentences,
+                max_sentences=3,
+            )
 
 
 def _trim_pages_to_word_limit(pages: list[StoryPage], max_words: int) -> None:
