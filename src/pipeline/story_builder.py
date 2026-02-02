@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from collections import Counter
 
 
 @dataclass
@@ -9,7 +10,6 @@ class StoryPage:
     text: str
     illustration_prompt: str
     illustration_path: str | None = None
-    image_path: str | None = None
 
 
 @dataclass
@@ -19,42 +19,14 @@ class StoryBook:
     pages: list[StoryPage]
     narrator: str | None = None
     cover_image_path: str | None = None
-    cover_path: str | None = None
-    cover_illustration_prompt: str | None = None
-    cover_illustration_path: str | None = None
 
 
 _STOPWORDS = {
-    "The",
-    "A",
-    "An",
-    "Once",
-    "When",
-    "Then",
-    "After",
-    "Before",
-    "He",
-    "She",
-    "They",
-    "We",
-    "I",
-    "It",
-    "My",
-    "Our",
-    "Your",
-    "This",
-    "Dad",
-    "Her",
-    "One",
-    "And",
-    "But",
-    "Or",
-    "In",
-    "On",
-    "At",
-    "With",
-    "From",
-    "To",
+    "the", "a", "an", "once", "when", "then", "after", "before",
+    "he", "she", "they", "we", "i", "it", "my", "our", "your",
+    "and", "but", "or", "in", "on", "at", "with", "from", "to",
+    "of", "for", "as", "is", "was", "were", "be", "been", "being",
+    "this", "that", "these", "those", "there", "here",
 }
 
 
@@ -64,12 +36,12 @@ def _clean_transcript(transcript: str) -> str:
         return ""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[\t ]+", " ", text)
-    text = re.sub(r"^\s*(this|here)\s+is\s+(a\s+)?story\s+about\s+", "", text, flags=re.I)
     text = re.sub(r"\[(?:inaudible|noise|music|laughs?|crosstalk)\]", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s+([,;:.!?])", r"\1", text)
     text = re.sub(r"([,;:.!?])([^\s])", r"\1 \2", text)
     text = re.sub(r"([.!?]){2,}", r"\1", text)
     text = re.sub(r"\n\s*\n", "\n\n", text)
+
     paragraphs = []
     for part in text.split("\n\n"):
         collapsed = re.sub(r"\s+", " ", part.replace("\n", " ")).strip()
@@ -82,42 +54,52 @@ def _clean_transcript(transcript: str) -> str:
 
 
 def _find_name(transcript: str) -> str | None:
-    full_name_match = re.search(r"\b([A-Z][a-z]+)\s+([A-Z][a-z]+)\b", transcript)
-    if full_name_match:
-        first, last = full_name_match.groups()
-        if first not in _STOPWORDS and last not in _STOPWORDS:
-            return f"{first} {last}"
-
-    preferred_names = ["Claire", "Graham", "Jack"]
-    for name in preferred_names:
-        if re.search(rf"\b{name}\b", transcript):
-            return name
-
-    for match in re.finditer(r"\b[A-Z][a-z]{2,}\b", transcript):
+    """
+    Heuristic: pick the first likely proper name that isn't a stopword.
+    Works for many kids/parents, not story-specific.
+    """
+    for match in re.finditer(r"\b[A-Z][a-z]{2,}\b", transcript or ""):
         name = match.group(0)
-        if name in _STOPWORDS:
+        if name.lower() in _STOPWORDS:
             continue
         return name
     return None
 
 
 def _infer_title(transcript: str) -> str:
-    lowered = transcript.lower()
-    if "pizza" in lowered:
-        return "The Pizza Crust Mystery"
-    if "dragon" in lowered:
-        return "The Dragon's Tale"
-    if "monster" in lowered:
-        return "The Monster's Surprise"
-    if "castle" in lowered:
-        return "The Castle Adventure"
-    name = _find_name(transcript)
+    """
+    Generic title inference:
+    - If we see a strong noun like monster/dragon/pizza, use it.
+    - Else use first discovered name.
+    - Else pick a top keyword.
+    """
+    t = (transcript or "").strip()
+    if not t:
+        return "My Story"
+
+    lowered = t.lower()
+    for keyword, title in [
+        ("pizza", "The Pizza Mystery"),
+        ("dragon", "The Dragon Adventure"),
+        ("monster", "The Monster Surprise"),
+        ("castle", "The Castle Adventure"),
+        ("robot", "The Robot Mix-Up"),
+        ("unicorn", "The Unicorn Surprise"),
+        ("dinosaur", "The Dinosaur Day"),
+    ]:
+        if keyword in lowered:
+            return title
+
+    name = _find_name(t)
     if name:
-        return f"{name}'s Storybook Adventure"
-    tokens = re.findall(r"[A-Za-z']+", transcript)
-    for token in tokens:
-        if token.capitalize() not in _STOPWORDS and len(token) > 3:
-            return f"The {token.capitalize()} Adventure"
+        return f"{name}'s Story"
+
+    words = re.findall(r"[A-Za-z']+", lowered)
+    words = [w for w in words if w not in _STOPWORDS and len(w) > 3]
+    if words:
+        top = Counter(words).most_common(1)[0][0]
+        return f"The {top.capitalize()} Adventure"
+
     return "My Story"
 
 
@@ -218,9 +200,7 @@ def build_storybook(
     if not cleaned:
         raise ValueError("Empty transcript")
 
-    derived_pages = [
-        StoryPage(text=page, illustration_prompt="") for page in _chunk_transcript(cleaned)
-    ]
+    derived_pages = [StoryPage(text=page, illustration_prompt="") for page in _chunk_transcript(cleaned)]
     return StoryBook(
         title=_infer_title(cleaned),
         subtitle="A story told out loud",
