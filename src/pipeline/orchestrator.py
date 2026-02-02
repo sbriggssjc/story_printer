@@ -20,7 +20,7 @@ def run_once(transcript: str, pages: list[str] | None = None) -> Path:
         subtitle=book.subtitle,
         pages=book.pages,
         narrator=book.narrator,
-        cover_illustration_path=book.cover_illustration_path,
+        cover_image_path=book.cover_image_path or book.cover_illustration_path,
     )
 
 

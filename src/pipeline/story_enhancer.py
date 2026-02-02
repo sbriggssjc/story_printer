@@ -1498,10 +1498,12 @@ def enhance_to_storybook(transcript: str, *, target_pages: int = 2) -> StoryBook
             target_pages,
         )
         if openai_story:
+            _maybe_generate_cover_image(openai_story, cleaned)
             _maybe_generate_images(openai_story, cleaned)
             return openai_story
 
     local_story = _local_storybook(anchor_spec, title, narrator, target_pages)
+    _maybe_generate_cover_image(local_story, cleaned)
     _maybe_generate_images(local_story, cleaned)
     return local_story
 
@@ -2399,22 +2401,14 @@ def _extract_beats(cleaned: str) -> dict[str, bool]:
 
 
 def _cover_prompt(story: StoryBook, cleaned: str) -> str:
-    beats = _extract_beats(cleaned)
-    main_character = story.narrator or "a cheerful child"
-    parts = [
-        f"Cover illustration for a children's picture book titled '{story.title}'.",
-        "Include the main characters in a cozy, whimsical scene.",
-        "Watercolor style, storybook composition, no text.",
-    ]
-    if beats.get("pizza"):
-        parts.append("A pizza on a table, warm kitchen light.")
-    if beats.get("monster"):
-        parts.append("A friendly silly pizza monster made of toppings, not scary.")
-    if beats.get("horse"):
-        parts.append("A shiny heroic horse galloping in, playful not intense.")
-    parts.append(f"Main character: {main_character} with expressive face.")
-    parts.append("Soft watercolor textures, storybook composition, gentle lighting.")
-    return " ".join(parts)
+    summary = _snippet_from_transcript(cleaned, max_words=18)
+    style = _DEFAULT_STYLE
+    return (
+        f"Cover illustration for a children's picture book titled '{story.title}'. "
+        f"Summary: {summary} "
+        f"Style: {style}. "
+        "Watercolor storybook composition, soft lighting, no text."
+    )
 
 
 def _local_storybook(
@@ -2977,7 +2971,7 @@ def _fallback_beat_expansions(cleaned: str, narrator: str | None) -> list[str]:
     return sentences
 
 
-def _maybe_generate_images(story: StoryBook, cleaned: str) -> None:
+def _maybe_generate_cover_image(story: StoryBook, cleaned: str) -> None:
     if not _use_openai_image_mode():
         return
     client = _get_openai_client()
@@ -3000,21 +2994,36 @@ def _maybe_generate_images(story: StoryBook, cleaned: str) -> None:
         cover_response = None
 
     cover_data = cover_response.data[0] if cover_response and cover_response.data else None
-    if cover_data:
-        cover_path = out_dir / f"story_{timestamp}_cover.png"
-        if getattr(cover_data, "b64_json", None):
-            cover_bytes = base64.b64decode(cover_data.b64_json)
-            cover_path.write_bytes(cover_bytes)
-            story.cover_path = str(cover_path)
-            story.cover_illustration_path = str(cover_path)
-        elif getattr(cover_data, "url", None):
-            try:
-                request.urlretrieve(cover_data.url, cover_path)
-            except Exception:
-                cover_path = None
-            else:
-                story.cover_path = str(cover_path)
-                story.cover_illustration_path = str(cover_path)
+    if not cover_data:
+        return
+
+    cover_path = out_dir / f"{timestamp}_cover.png"
+    if getattr(cover_data, "b64_json", None):
+        cover_bytes = base64.b64decode(cover_data.b64_json)
+        cover_path.write_bytes(cover_bytes)
+    elif getattr(cover_data, "url", None):
+        try:
+            request.urlretrieve(cover_data.url, cover_path)
+        except Exception:
+            return
+    else:
+        return
+
+    story.cover_path = str(cover_path)
+    story.cover_image_path = str(cover_path)
+    story.cover_illustration_path = str(cover_path)
+
+
+def _maybe_generate_images(story: StoryBook, cleaned: str) -> None:
+    if not _use_openai_image_mode():
+        return
+    client = _get_openai_client()
+    if not client:
+        return
+
+    out_dir = Path("out/books/images")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     for index, page in enumerate(story.pages, start=1):
         prompt = page.illustration_prompt or "A cozy children's storybook illustration."
