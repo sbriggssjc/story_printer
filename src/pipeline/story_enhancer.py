@@ -553,6 +553,94 @@ def _extract_top_nounish_terms(
     return [term for term, _ in ranked[:max_terms]]
 
 
+def _extract_strong_bigrams(
+    cleaned: str,
+    *,
+    max_terms: int = 3,
+    excluded: set[str] | None = None,
+    min_count: int = 2,
+) -> list[str]:
+    if not cleaned:
+        return []
+    stopwords = {
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "but",
+        "so",
+        "to",
+        "of",
+        "in",
+        "on",
+        "at",
+        "for",
+        "with",
+        "from",
+        "into",
+        "up",
+        "down",
+        "over",
+        "under",
+        "then",
+        "when",
+        "while",
+        "after",
+        "before",
+        "as",
+        "that",
+        "this",
+        "these",
+        "those",
+        "it",
+        "its",
+        "is",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "am",
+        "are",
+        "do",
+        "did",
+        "does",
+        "done",
+        "have",
+        "has",
+        "had",
+        "i",
+        "you",
+        "we",
+        "he",
+        "she",
+        "they",
+        "him",
+        "her",
+        "them",
+        "our",
+        "their",
+        "my",
+        "your",
+    }
+    excluded = {term.lower() for term in (excluded or set())}
+    words = [word.lower() for word in re.findall(r"[A-Za-z']+", cleaned)]
+    counts: dict[str, int] = {}
+    for first, second in zip(words, words[1:]):
+        if first in stopwords or second in stopwords:
+            continue
+        if first in excluded or second in excluded:
+            continue
+        phrase = f"{first} {second}"
+        counts[phrase] = counts.get(phrase, 0) + 1
+    ranked = sorted(counts.items(), key=lambda item: (item[1], len(item[0])), reverse=True)
+    strong = [phrase for phrase, count in ranked if count >= min_count]
+    if not strong and ranked:
+        strong = [ranked[0][0]]
+    return strong[:max_terms]
+
+
 def _conjugate_third_person(verb: str) -> str:
     irregular = {
         "try": "tries",
@@ -1256,36 +1344,37 @@ def _extract_anchor_tokens(
         characters = [narrator] + characters
     if not characters:
         characters = _extract_proper_names(cleaned, narrator) + _extract_role_characters(cleaned)
+
     key_objects = _dedupe_preserve_order(anchor_spec.key_objects or [])
-    if not key_objects:
-        excluded = set(characters)
-        key_objects = _extract_noun_phrases(cleaned, min_count=3, max_count=8, excluded=excluded)
-    actions = _extract_core_actions(cleaned)
-    lesson_tokens = _extract_lesson_tokens(cleaned)
+    excluded = {name.lower() for name in characters}
+    noun_terms = _extract_top_nounish_terms(cleaned, max_terms=6, excluded=excluded)
+    if key_objects:
+        noun_terms = _dedupe_preserve_order(key_objects + noun_terms)
+    bigrams = _extract_strong_bigrams(cleaned, max_terms=3, excluded=excluded)
+    verbs = _extract_key_verbs(cleaned, max_count=3)
 
     tokens = _dedupe_preserve_order(
-        characters[:3] + key_objects[:5] + actions[:3] + lesson_tokens[:1]
+        characters[:3] + bigrams[:2] + noun_terms[:3] + verbs[:2]
     )
 
-    if len(tokens) < 6:
-        extra_objects = key_objects[5:] + _extract_noun_phrases(
-            cleaned, min_count=2, max_count=10, excluded=set(characters)
-        )
-        tokens = _dedupe_preserve_order(tokens + extra_objects)
-    if len(tokens) < 6:
-        tokens = _dedupe_preserve_order(tokens + actions)
-    return tokens[:12]
+    if len(tokens) < 5:
+        tokens = _dedupe_preserve_order(tokens + noun_terms + verbs)
+    if len(tokens) < 5:
+        tokens = _dedupe_preserve_order(tokens + _extract_core_actions(cleaned))
+
+    lesson_tokens = _extract_lesson_tokens(cleaned)
+    if lesson_tokens:
+        tokens = _dedupe_preserve_order(tokens + lesson_tokens[:1])
+
+    return tokens[:8]
 
 
-def _anchor_token_coverage(
+def _anchor_token_matches(
     story_text: str,
     anchor_tokens: list[str],
-    *,
-    min_ratio: float = 0.6,
-    min_required: int = 4,
-) -> tuple[bool, str]:
+) -> tuple[list[str], list[str]]:
     if not anchor_tokens:
-        return True, ""
+        return [], []
     text_lower = story_text.lower()
     group_map: dict[str, set[str]] = {}
     for group in _ANCHOR_SYNONYM_GROUPS:
@@ -1311,6 +1400,19 @@ def _anchor_token_coverage(
             found.append(token)
         else:
             missing.append(token)
+    return found, missing
+
+
+def _anchor_token_coverage(
+    story_text: str,
+    anchor_tokens: list[str],
+    *,
+    min_ratio: float = 0.6,
+    min_required: int = 4,
+) -> tuple[bool, str]:
+    if not anchor_tokens:
+        return True, ""
+    found, missing = _anchor_token_matches(story_text, anchor_tokens)
 
     required = max(min_required, math.ceil(len(anchor_tokens) * min_ratio))
     required = min(required, len(anchor_tokens))
@@ -1321,6 +1423,28 @@ def _anchor_token_coverage(
         f"need at least {required}. Missing: {', '.join(missing)}."
     )
     return False, summary
+
+
+def _anchor_token_page_coverage(
+    pages: list[StoryPage],
+    anchor_tokens: list[str],
+    *,
+    min_per_page: int = 1,
+) -> tuple[bool, str]:
+    if not anchor_tokens:
+        return True, ""
+    missing_pages: list[int] = []
+    for index, page in enumerate(pages, start=1):
+        found, _ = _anchor_token_matches(page.text, anchor_tokens)
+        if len(found) < min_per_page:
+            missing_pages.append(index)
+    if missing_pages:
+        summary = (
+            "Anchor token coverage too low per page: "
+            f"no anchors found on pages {', '.join(str(p) for p in missing_pages)}."
+        )
+        return False, summary
+    return True, ""
 
 
 def _event_beat_coverage(
@@ -1859,6 +1983,7 @@ def _openai_storybook(
     fidelity_note: str | None = None
     anchor_tokens = _extract_anchor_tokens(cleaned_transcript, narrator, anchor_spec)
     coverage_note: str | None = None
+    page_coverage_note: str | None = None
     beat_note: str | None = None
     for attempt in range(2):
         correction = ""
@@ -1877,6 +2002,12 @@ def _openai_storybook(
                     "\nAnchor token coverage fixes required (be surgical; keep tone and length):\n"
                     f"{coverage_note}\n"
                     "Improve coverage without adding new major plotlines."
+                )
+            if page_coverage_note:
+                correction += (
+                    "\nPer-page anchor coverage fixes required:\n"
+                    f"{page_coverage_note}\n"
+                    "Ensure each page mentions at least one anchor from the transcript."
                 )
             if beat_note:
                 correction += (
@@ -2060,6 +2191,20 @@ def _openai_storybook(
                     f"{user_prompt}\n\nIssues:\n- "
                     + coverage_summary
                     + "\n\nRewrite to include more of the anchor tokens from the transcript."
+                )
+                continue
+            return None
+        page_coverage_ok, page_coverage_summary = _anchor_token_page_coverage(
+            pages, anchor_tokens
+        )
+        if not page_coverage_ok:
+            page_coverage_note = page_coverage_summary
+            print("Fidelity failed via per-page anchor coverage.")
+            if attempt == 0:
+                user_prompt = (
+                    f"{user_prompt}\n\nIssues:\n- "
+                    + page_coverage_summary
+                    + "\n\nRewrite to include at least one anchor token on every page."
                 )
                 continue
             return None
