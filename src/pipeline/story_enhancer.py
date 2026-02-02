@@ -1156,19 +1156,6 @@ def _cover_prompt(story: StoryBook, cleaned: str) -> str:
     return " ".join(parts)
 
 
-    t = (cleaned or "").lower()
-    return {
-        "pizza": "pizza" in t,
-        "crust": "crust" in t,
-        "trash": "trash" in t or "threw" in t or "thrown" in t,
-        "monster": "monster" in t,
-        "horse": "horse" in t,
-        "dad": "dad" in t or "father" in t,
-        "lied": "lied" in t or "lie" in t,
-        "apology": "sorry" in t or "wish i would have listened" in t or "apolog" in t,
-    }
-
-
 def _local_page_expansions(claire_name: str, dad_name: str, *, stage: str) -> list[str]:
     if stage == "resolution":
         return [
