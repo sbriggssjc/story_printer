@@ -431,6 +431,8 @@ def _resolve_display_name(narrator: str | None) -> str | None:
     cleaned = " ".join(narrator.split()).strip()
     if not cleaned:
         return None
+    if _VOICE_MODE == "kid" and len(cleaned.split()) >= 2:
+        return cleaned.split()[0]
     if cleaned.lower() == "claire":
         return "Claire"
     parts = cleaned.split()
