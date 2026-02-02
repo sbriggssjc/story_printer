@@ -8,6 +8,7 @@ Environment variables:
 - STORY_TARGET_PAGES: number of pages to generate (default: "2").
 - STORY_WORDS_PER_PAGE: word count target per page (default: "280").
 - STORY_STYLE: story tone/style (default: "whimsical, funny, heartwarming").
+- STORY_STRICT_DIALOGUE: set to "1" to fail validation when dialogue count is outside range.
 """
 
 from __future__ import annotations
@@ -1925,6 +1926,10 @@ def _extract_json_block(text: str) -> Any:
     return None
 
 
+def _is_strict_dialogue() -> bool:
+    return os.getenv("STORY_STRICT_DIALOGUE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _validate_story_data(data: Any, target_pages: int) -> tuple[bool, list[str]]:
     if not isinstance(data, dict):
         return False, ["response is not a JSON object"]
@@ -1934,22 +1939,29 @@ def _validate_story_data(data: Any, target_pages: int) -> tuple[bool, list[str]]
     if len(pages) != target_pages:
         return False, [f"expected {target_pages} pages but got {len(pages)}"]
     reasons: list[str] = []
+    fatal_reasons: list[str] = []
     total_dialogue = 0
     page_texts: list[str] = []
     for index, page in enumerate(pages, start=1):
         if not isinstance(page, dict):
             reasons.append(f"page {index} is not an object")
+            fatal_reasons.append(f"page {index} is not an object")
             continue
         text = (page.get("text") or "").strip()
         prompt = (page.get("illustration_prompt") or "").strip()
         if not text:
             reasons.append(f"page {index} missing text")
+            fatal_reasons.append(f"page {index} missing text")
             continue
         if not prompt:
             reasons.append(f"page {index} missing illustration_prompt")
+            fatal_reasons.append(f"page {index} missing illustration_prompt")
         word_count = _word_count(text)
         if word_count < _MIN_WORDS_PER_PAGE or word_count > _MAX_WORDS_PER_PAGE:
             reasons.append(
+                f"page {index} word count {word_count} outside {_MIN_WORDS_PER_PAGE}-{_MAX_WORDS_PER_PAGE}"
+            )
+            fatal_reasons.append(
                 f"page {index} word count {word_count} outside {_MIN_WORDS_PER_PAGE}-{_MAX_WORDS_PER_PAGE}"
             )
         total_dialogue += _count_dialogue_lines(text)
@@ -1959,14 +1971,18 @@ def _validate_story_data(data: Any, target_pages: int) -> tuple[bool, list[str]]
         hits = _find_blocklisted_sentences(t)
         if hits:
             reasons.append(f"page {i} contains boilerplate sentence(s): {hits[:2]}")
+            fatal_reasons.append(f"page {i} contains boilerplate sentence(s): {hits[:2]}")
 
     dupes = _find_duplicate_sentences_across_pages(page_texts)
     if dupes:
         reasons.append(f"repeated sentence across pages: {dupes[0]}")
+        fatal_reasons.append(f"repeated sentence across pages: {dupes[0]}")
 
     if total_dialogue < 1 or total_dialogue > 3:
         reasons.append(f"dialogue lines counted {total_dialogue} but expected 1-3")
-    return (len(reasons) == 0, reasons)
+        if _is_strict_dialogue():
+            fatal_reasons.append(f"dialogue lines counted {total_dialogue} but expected 1-3")
+    return (len(fatal_reasons) == 0, reasons)
 
 
 def _validate_story_pages(
@@ -1982,6 +1998,7 @@ def _validate_story_pages(
         ]
 
     reasons: list[str] = []
+    fatal_reasons: list[str] = []
     total_dialogue = 0
     page_texts: list[str] = []
 
@@ -1991,13 +2008,18 @@ def _validate_story_pages(
 
         if not text:
             reasons.append(f"page {index} missing text")
+            fatal_reasons.append(f"page {index} missing text")
             continue
         if not prompt:
             reasons.append(f"page {index} missing illustration_prompt")
+            fatal_reasons.append(f"page {index} missing illustration_prompt")
 
         wc = _word_count(text)
         if enforce_word_count and (wc < _MIN_WORDS_PER_PAGE or wc > _MAX_WORDS_PER_PAGE):
             reasons.append(
+                f"page {index} word count {wc} outside {_MIN_WORDS_PER_PAGE}-{_MAX_WORDS_PER_PAGE}"
+            )
+            fatal_reasons.append(
                 f"page {index} word count {wc} outside {_MIN_WORDS_PER_PAGE}-{_MAX_WORDS_PER_PAGE}"
             )
 
@@ -2008,15 +2030,19 @@ def _validate_story_pages(
         hits = _find_blocklisted_sentences(t)
         if hits:
             reasons.append(f"page {i} contains boilerplate sentence(s): {hits[:2]}")
+            fatal_reasons.append(f"page {i} contains boilerplate sentence(s): {hits[:2]}")
 
     dupes = _find_duplicate_sentences_across_pages(page_texts)
     if dupes:
         reasons.append(f"repeated sentence across pages: {dupes[0]}")
+        fatal_reasons.append(f"repeated sentence across pages: {dupes[0]}")
 
     if enforce_dialogue and (total_dialogue < 1 or total_dialogue > 3):
         reasons.append(f"dialogue lines counted {total_dialogue} but expected 1-3")
+        if _is_strict_dialogue():
+            fatal_reasons.append(f"dialogue lines counted {total_dialogue} but expected 1-3")
 
-    return (len(reasons) == 0, reasons)
+    return (len(fatal_reasons) == 0, reasons)
 
 
 def _build_repair_spec(
