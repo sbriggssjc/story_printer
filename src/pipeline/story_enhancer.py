@@ -250,18 +250,17 @@ def _request_openai_story(
         if correction:
             input_messages.append({"role": "user", "content": correction})
 
-        # openai-python 2.x: responses.create supports response_format with json_schema
         response = client.responses.create(
             model=_DEFAULT_MODEL,
             input=input_messages,
             temperature=_DEFAULT_TEMPERATURE,
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
+            text={
+                "format": {
+                    "type": "json_schema",
                     "name": "storybook",
                     "schema": schema,
                     "strict": True,
-                },
+                }
             },
         )
         return _extract_response_text(response)
