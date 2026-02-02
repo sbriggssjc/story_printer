@@ -378,6 +378,224 @@ def _extract_settings(cleaned: str) -> list[str]:
     return _dedupe_preserve_order(found)
 
 
+def _extract_core_actions(cleaned: str) -> list[str]:
+    if not cleaned:
+        return []
+    action_map = {
+        "hide": "hide",
+        "hides": "hide",
+        "hid": "hide",
+        "hidden": "hide",
+        "lie": "lie",
+        "lies": "lie",
+        "lied": "lie",
+        "forget": "forget",
+        "forgets": "forget",
+        "forgot": "forget",
+        "forgotten": "forget",
+        "lose": "lose",
+        "loses": "lose",
+        "lost": "lose",
+        "find": "find",
+        "finds": "find",
+        "found": "find",
+        "help": "help",
+        "helps": "help",
+        "helped": "help",
+        "save": "save",
+        "saves": "save",
+        "saved": "save",
+        "arrive": "arrive",
+        "arrives": "arrive",
+        "arrived": "arrive",
+        "try": "try",
+        "tries": "try",
+        "tried": "try",
+        "eat": "eat",
+        "eats": "eat",
+        "ate": "eat",
+        "chase": "chase",
+        "chases": "chase",
+        "chased": "chase",
+        "scare": "scare",
+        "scares": "scare",
+        "scared": "scare",
+        "steal": "steal",
+        "steals": "steal",
+        "stole": "steal",
+        "take": "take",
+        "takes": "take",
+        "took": "take",
+        "rescue": "rescue",
+        "rescues": "rescue",
+        "rescued": "rescue",
+    }
+    actions: list[str] = []
+    seen: set[str] = set()
+    for token in re.findall(r"[A-Za-z']+", cleaned.lower()):
+        action = action_map.get(token)
+        if action and action not in seen:
+            seen.add(action)
+            actions.append(action)
+    return actions
+
+
+def _extract_top_nounish_terms(
+    cleaned: str,
+    *,
+    max_terms: int = 3,
+    excluded: set[str] | None = None,
+) -> list[str]:
+    if not cleaned:
+        return []
+    stopwords = {
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "but",
+        "so",
+        "to",
+        "of",
+        "in",
+        "on",
+        "at",
+        "for",
+        "with",
+        "from",
+        "into",
+        "up",
+        "down",
+        "over",
+        "under",
+        "then",
+        "when",
+        "while",
+        "after",
+        "before",
+        "as",
+        "that",
+        "this",
+        "these",
+        "those",
+        "it",
+        "its",
+        "is",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "am",
+        "are",
+        "do",
+        "did",
+        "does",
+        "done",
+        "have",
+        "has",
+        "had",
+        "i",
+        "you",
+        "we",
+        "he",
+        "she",
+        "they",
+        "him",
+        "her",
+        "them",
+        "our",
+        "their",
+        "my",
+        "your",
+    }
+    excluded = {term.lower() for term in (excluded or set())}
+    counts: dict[str, int] = {}
+    for token in re.findall(r"[A-Za-z']+", cleaned.lower()):
+        if token in stopwords or token in excluded:
+            continue
+        counts[token] = counts.get(token, 0) + 1
+    ranked = sorted(counts.items(), key=lambda item: (item[1], len(item[0])), reverse=True)
+    return [term for term, _ in ranked[:max_terms]]
+
+
+def _conjugate_third_person(verb: str) -> str:
+    irregular = {
+        "try": "tries",
+        "lie": "lies",
+    }
+    if verb in irregular:
+        return irregular[verb]
+    if verb.endswith("ch") or verb.endswith("sh") or verb.endswith("x") or verb.endswith("s"):
+        return f"{verb}es"
+    return f"{verb}s"
+
+
+def _with_article(phrase: str, *, default_article: str = "the") -> str:
+    if not phrase:
+        return phrase
+    lower = phrase.lower()
+    if lower.startswith(("the ", "a ", "an ", "their ", "his ", "her ", "our ", "my ", "your ")):
+        return phrase
+    return f"{default_article} {phrase}"
+
+
+def _extract_anchor_facts(cleaned: str) -> list[str]:
+    if not cleaned:
+        return []
+    characters = _dedupe_preserve_order(
+        _extract_proper_names(cleaned, None) + _extract_role_characters(cleaned)
+    )
+    actions = _extract_core_actions(cleaned)
+    excluded = set(characters)
+    objects = _extract_top_nounish_terms(cleaned, excluded=excluded, max_terms=3)
+    subject = characters[0] if characters else "Someone"
+    pronoun = "them"
+    facts: list[str] = []
+
+    if actions:
+        primary_object = objects[0] if objects else "something"
+        verb = _conjugate_third_person(actions[0])
+        facts.append(f"{subject} {verb} {_with_article(primary_object)}.")
+
+    antagonist_terms = ["monster", "villain", "thief", "dragon", "robot", "ghost", "troll", "pirate"]
+    antagonist = next((term for term in objects if any(t in term for t in antagonist_terms)), None)
+    if not antagonist:
+        lower = cleaned.lower()
+        for term in antagonist_terms:
+            if re.search(rf"\\b{re.escape(term)}\\b", lower):
+                antagonist = term
+                break
+    if antagonist:
+        action_for_antagonist = None
+        for candidate in ("eat", "chase", "scare", "steal", "take"):
+            if candidate in actions:
+                action_for_antagonist = candidate
+                break
+        if action_for_antagonist:
+            facts.append(
+                f"{_with_article(antagonist, default_article='a').capitalize()} tries to "
+                f"{action_for_antagonist} {pronoun}."
+            )
+
+    helper_candidates = [name for name in characters[1:] if name.lower() != subject.lower()]
+    helper = helper_candidates[0] if helper_candidates else None
+    if helper and any(action in actions for action in ("save", "help", "arrive")):
+        parts: list[str] = []
+        if "arrive" in actions:
+            parts.append("arrives")
+        if "save" in actions:
+            parts.append("saves")
+        elif "help" in actions:
+            parts.append("helps")
+        if parts:
+            verb_phrase = " and ".join(parts)
+            facts.append(f"{helper} {verb_phrase} {pronoun}.")
+
+    return _dedupe_preserve_order(facts)
+
+
 def _extract_event_beats(cleaned: str) -> list[str]:
     if not cleaned:
         return []
@@ -428,7 +646,10 @@ def _local_anchor_spec(cleaned: str) -> AnchorSpec:
     excluded = set(characters + settings)
     key_objects = _extract_noun_phrases(cleaned, min_count=3, max_count=10, excluded=excluded)
     key_objects = _dedupe_preserve_order(key_objects)
-    beats = _extract_event_beats(cleaned)
+    beats = _extract_anchor_facts(cleaned)
+    if len(beats) < 4:
+        fallback_beats = _extract_event_beats(cleaned)
+        beats = _dedupe_preserve_order(beats + fallback_beats)
     if len(beats) < 4:
         beats = beats + ["A key moment happens.", "The situation is resolved."][: 4 - len(beats)]
     beats = beats[:10]
