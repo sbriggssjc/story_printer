@@ -920,7 +920,7 @@ def _extract_anchor_spec(transcript: str, max_terms: int = 8) -> AnchorSpec:
 
     creature_hits: list[str] = []
     for creature in sorted(_CREATURE_KEYWORDS):
-        if re.search(rf"\\b{re.escape(creature)}s?\\b", t.lower()):
+        if re.search(rf"\b{re.escape(creature)}s?\b", t.lower()):
             creature_hits.append(creature)
 
     return AnchorSpec(
@@ -952,7 +952,7 @@ def _count_term_hits(text: str, terms: list[str]) -> int:
     for term in terms:
         if not term:
             continue
-        if re.search(rf"\\b{re.escape(term.lower())}s?\\b", lowered):
+        if re.search(rf"\b{re.escape(term.lower())}s?\b", lowered):
             hits += 1
     return hits
 
