@@ -2410,13 +2410,9 @@ def _dialogue_expected_label() -> str:
 
 def _dialogue_prompt_line() -> str:
     min_lines, max_lines = _dialogue_bounds()
-    if min_lines == max_lines:
-        return (
-            f"- Exactly {min_lines} dialogue lines total. Each must be a full sentence in quotes on "
-            "its own line starting with '- ' or '— '.\n"
-        )
+    range_label = f"{min_lines}–{max_lines}" if min_lines != max_lines else f"{min_lines}"
     return (
-        f"- Between {min_lines} and {max_lines} dialogue lines total. Each must be a full sentence in "
+        f"- Include {range_label} short lines of dialogue total. Each must be a full sentence in "
         "quotes on its own line starting with '- ' or '— '.\n"
     )
 
@@ -2940,7 +2936,7 @@ def _count_dialogue_lines(text: str) -> int:
     return sum(1 for _ in line_start.finditer(text))
 
 
-def _limit_dialogue_lines(text: str, max_lines: int = 2) -> str:
+def _limit_dialogue_lines(text: str, max_lines: int = 3) -> str:
     """
     Keeps the first max_lines dialogue lines, removes leading markers from the rest
     so they no longer count as dialogue lines.
@@ -2957,7 +2953,7 @@ def _limit_dialogue_lines(text: str, max_lines: int = 2) -> str:
     return "".join(updated)
 
 
-def _ensure_dialogue_count(text: str, target_lines: int = 2) -> str:
+def _ensure_dialogue_count(text: str, target_lines: int = _DIALOGUE_MIN_DEFAULT) -> str:
     """
     Ensure the text includes at least target_lines of dialogue by appending short lines.
     """
@@ -3001,7 +2997,7 @@ def _ensure_minimum_dialogue_lines(pages: list[StoryPage], target_pages: int) ->
         needed -= 1
 
 
-def _normalize_dialogue_lines(text: str, max_lines: int = 2) -> str:
+def _normalize_dialogue_lines(text: str, max_lines: int = 3) -> str:
     """
     Keep up to max_lines of dialogue. Any extra dialogue lines or quoted segments
     are rewritten into plain narration (no quotes).
@@ -3017,11 +3013,7 @@ def _normalize_dialogue_lines(text: str, max_lines: int = 2) -> str:
         updated.append(line)
 
     interim = "".join(updated)
-    remaining = max(0, max_lines - _count_dialogue_lines(interim))
-
-    if remaining == 0:
-        return _strip_extra_quotes(interim, allowed=0)
-    return _strip_extra_quotes(interim, allowed=remaining)
+    return _strip_extra_quotes(interim, allowed=max_lines)
 
 
 def _strip_extra_quotes(text: str, *, allowed: int) -> str:
@@ -3029,17 +3021,29 @@ def _strip_extra_quotes(text: str, *, allowed: int) -> str:
     Keep the first `allowed` quoted segments and rewrite the rest without quotes.
     """
     pattern = re.compile(r'"([^"\n]+)"|“([^”\n]+)”')
-    seen = 0
+    line_dialogue = re.compile(r'^\s*[-—]\s+["“].+["”]\s*$')
+    lines = text.splitlines(keepends=True)
+    dialogue_lines = sum(1 for line in lines if line_dialogue.match(line))
+    allowed_non_dialogue = max(0, allowed - dialogue_lines)
+    non_dialogue_quotes = 0
+    updated: list[str] = []
 
-    def replace(match: re.Match[str]) -> str:
-        nonlocal seen
-        seen += 1
-        content = match.group(1) or match.group(2) or ""
-        if seen <= allowed:
-            return match.group(0)
-        return content
+    for line in lines:
+        if line_dialogue.match(line):
+            updated.append(line)
+            continue
 
-    return pattern.sub(replace, text)
+        def replace(match: re.Match[str]) -> str:
+            nonlocal non_dialogue_quotes
+            content = match.group(1) or match.group(2) or ""
+            if non_dialogue_quotes < allowed_non_dialogue:
+                non_dialogue_quotes += 1
+                return match.group(0)
+            return content
+
+        updated.append(pattern.sub(replace, line))
+
+    return "".join(updated)
 
 
 def _build_anchor_expansion_sentences(
