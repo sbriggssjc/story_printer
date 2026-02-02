@@ -12,6 +12,7 @@ def make_book_pdf(
     subtitle: str,
     pages: list[str] | list[StoryPage],
     narrator: str | None = None,
+    cover_image_path: str | None = None,
     out_dir: Path = Path("out/books"),
 ) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -22,5 +23,6 @@ def make_book_pdf(
         subtitle=subtitle,
         pages=pages,
         narrator=narrator,
+        cover_image_path=cover_image_path,
         out_pdf=out_path,
     )
