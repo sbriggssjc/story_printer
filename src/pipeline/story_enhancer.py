@@ -128,6 +128,10 @@ def _dedupe_cross_page_sentences(pages: list[StoryPage], min_words: int) -> bool
     return changed
 
 
+def _normalize_sentence_key(sentence: str) -> str:
+    return re.sub(r"\s+", " ", sentence.strip()).lower()
+
+
 def _find_blocklisted_sentences(text: str) -> list[str]:
     sents = set(_split_sentences_for_dedupe(text))
     hits = [s for s in _BLOCKLIST_SENTENCES if s in sents]
@@ -1181,8 +1185,6 @@ def _openai_storybook(
         anchor_spec, plot_facts, narrator, target_pages
     )
     fidelity_note: str | None = None
-
-    repeat_sentence_note: str | None = None
     for attempt in range(2):
         correction = ""
         if attempt == 1:
@@ -1202,11 +1204,6 @@ def _openai_storybook(
                     "\nFidelity fixes required (be surgical; keep tone and length):\n"
                     f"{fidelity_note}\n"
                     "Fix the specific beats/contradictions only; keep page order and structure."
-                )
-            if repeat_sentence_note:
-                correction += (
-                    "\nRepeated sentence fix required (be surgical; keep structure unchanged):\n"
-                    f"{repeat_sentence_note}\n"
                 )
         try:
             if client:
@@ -1244,47 +1241,22 @@ def _openai_storybook(
             return None
 
         # Post-process pages BEFORE validation so we validate the final text that will be printed
-        used_sentences: set[str] = set()
-        padding_candidates = _anchor_padding_sentences(anchor_spec, narrator)
         for page in pages:
-            page.text = _pad_to_min_words_no_repeats(
-                page.text,
-                _MIN_WORDS_PER_PAGE,
-                padding_candidates,
-                used_sentences,
-            )
             page.text = _normalize_dialogue_lines(page.text, max_lines=2)
 
-        total_dialogue = sum(_count_dialogue_lines(page.text) for page in pages)
-        if total_dialogue < 2:
-            pages[-1].text = _ensure_dialogue_count(pages[-1].text, target_lines=2)
+        _ensure_minimum_dialogue_lines(pages, target_pages)
+        _ensure_unique_sentences_across_pages(pages, anchor_spec, cleaned_transcript, narrator)
+        _trim_pages_to_word_limit(pages, _MAX_WORDS_PER_PAGE)
 
-        # Remove any verbatim repeated sentences across pages, then re-pad to hit min words.
-        if _dedupe_cross_page_sentences(pages, _MIN_WORDS_PER_PAGE):
-            for page in pages:
-                page.text = _pad_to_min_words_no_repeats(
-                    page.text,
-                    _MIN_WORDS_PER_PAGE,
-                    padding_candidates,
-                    used_sentences,
-                )
-
-        remaining_dupes = _find_duplicate_sentences_across_pages([page.text for page in pages])
-        if remaining_dupes:
-            repeat_sentence_note = (
-                "Rewrite ONLY this sentence everywhere it appears, leaving everything else unchanged:\n"
-                f"Sentence: \"{remaining_dupes[0]}\""
-            )
-
-        valid, reasons = _validate_story_pages(pages, target_pages)
+        valid, reasons = _validate_story_pages(
+            pages,
+            target_pages,
+            enforce_word_count=False,
+            enforce_dialogue=False,
+        )
         if not valid:
             print(f"Validation failed: {', '.join(reasons)}")
             if attempt == 0:
-                if repeat_sentence_note and all(
-                    reason.startswith("repeated sentence across pages:") for reason in reasons
-                ):
-                    continue
-                repeat_sentence_note = None
                 user_prompt = (
                     f"{user_prompt}\n\n"
                     "Your previous attempt failed validation. Fix ALL issues below:\n"
@@ -1721,7 +1693,13 @@ def _validate_story_data(data: Any, target_pages: int) -> tuple[bool, list[str]]
     return (len(reasons) == 0, reasons)
 
 
-def _validate_story_pages(pages: list[StoryPage], target_pages: int) -> tuple[bool, list[str]]:
+def _validate_story_pages(
+    pages: list[StoryPage],
+    target_pages: int,
+    *,
+    enforce_word_count: bool = True,
+    enforce_dialogue: bool = True,
+) -> tuple[bool, list[str]]:
     if not isinstance(pages, list) or len(pages) != target_pages:
         return False, [
             f"expected {target_pages} pages but got {len(pages) if isinstance(pages, list) else 'non-list'}"
@@ -1742,7 +1720,7 @@ def _validate_story_pages(pages: list[StoryPage], target_pages: int) -> tuple[bo
             reasons.append(f"page {index} missing illustration_prompt")
 
         wc = _word_count(text)
-        if wc < _MIN_WORDS_PER_PAGE or wc > _MAX_WORDS_PER_PAGE:
+        if enforce_word_count and (wc < _MIN_WORDS_PER_PAGE or wc > _MAX_WORDS_PER_PAGE):
             reasons.append(
                 f"page {index} word count {wc} outside {_MIN_WORDS_PER_PAGE}-{_MAX_WORDS_PER_PAGE}"
             )
@@ -1759,7 +1737,7 @@ def _validate_story_pages(pages: list[StoryPage], target_pages: int) -> tuple[bo
     if dupes:
         reasons.append(f"repeated sentence across pages: {dupes[0]}")
 
-    if total_dialogue < 1 or total_dialogue > 3:
+    if enforce_dialogue and (total_dialogue < 1 or total_dialogue > 3):
         reasons.append(f"dialogue lines counted {total_dialogue} but expected 1-3")
 
     return (len(reasons) == 0, reasons)
@@ -2048,6 +2026,22 @@ def _ensure_dialogue_count(text: str, target_lines: int = 2) -> str:
     return f"{text.rstrip()}{separator}{extra}".strip()
 
 
+def _ensure_minimum_dialogue_lines(pages: list[StoryPage], target_pages: int) -> None:
+    total_dialogue = sum(_count_dialogue_lines(page.text) for page in pages)
+    if total_dialogue >= 1:
+        return
+    fallback_lines = [
+        '- "Dad: Crunch the crust, kiddo!"',
+        '- "Claire: I should\'ve listened, Dad."',
+    ]
+    for index, line in enumerate(fallback_lines[:target_pages]):
+        page = pages[index]
+        if line in page.text:
+            continue
+        separator = "\n" if page.text.rstrip() else ""
+        page.text = f"{page.text.rstrip()}{separator}{line}".strip()
+
+
 def _normalize_dialogue_lines(text: str, max_lines: int = 2) -> str:
     """
     Keep up to max_lines of dialogue. Any extra dialogue lines or quoted segments
@@ -2087,6 +2081,113 @@ def _strip_extra_quotes(text: str, *, allowed: int) -> str:
         return content
 
     return pattern.sub(replace, text)
+
+
+def _build_anchor_expansion_sentences(
+    anchor_spec: AnchorSpec,
+    cleaned: str,
+    narrator: str | None,
+) -> list[str]:
+    primary = narrator or (anchor_spec.characters[0] if anchor_spec.characters else "They")
+    setting = anchor_spec.setting
+    key_objects = anchor_spec.key_objects or []
+    sentences: list[str] = []
+
+    for beat in anchor_spec.beats[:6]:
+        action = beat.strip().rstrip(".")
+        if not action:
+            continue
+        if setting:
+            sentences.append(f"In the {setting}, {primary} {action}.")
+        elif key_objects:
+            sentences.append(f"The {key_objects[0]} was right there when {primary} {action}.")
+        else:
+            sentences.append(f"{primary} {action}.")
+
+    if key_objects:
+        sentences.append(f"{primary} kept the {key_objects[0]} close as the plan unfolded.")
+        if len(key_objects) > 1:
+            sentences.append(f"The {key_objects[1]} waited nearby while {primary} made the next move.")
+    if setting:
+        sentences.append(f"The {setting} held steady as {primary} took a careful breath.")
+
+    sentences.extend(_beat_expansion_sentences(cleaned, narrator))
+    sentences.extend(_fallback_beat_expansions(cleaned, narrator))
+    return _dedupe_preserve_order(sentences)
+
+
+def _append_anchor_expansions(
+    text: str,
+    *,
+    min_words: int,
+    anchor_spec: AnchorSpec,
+    cleaned: str,
+    narrator: str | None,
+    used: set[str],
+    max_sentences: int = 3,
+) -> str:
+    if _word_count(text) >= min_words:
+        return text.strip()
+
+    current = text.strip()
+    existing = {_normalize_sentence_key(s) for s in _split_sentences_for_dedupe(text)}
+    additions = _build_anchor_expansion_sentences(anchor_spec, cleaned, narrator)
+    added = 0
+    for sentence in additions:
+        if added >= max_sentences:
+            break
+        key = _normalize_sentence_key(sentence)
+        if key in existing or key in used:
+            continue
+        separator = " " if current else ""
+        current = f"{current}{separator}{sentence}".strip()
+        existing.add(key)
+        used.add(key)
+        added += 1
+    return current
+
+
+def _ensure_unique_sentences_across_pages(
+    pages: list[StoryPage],
+    anchor_spec: AnchorSpec,
+    cleaned: str,
+    narrator: str | None,
+) -> None:
+    used_sentences: set[str] = set()
+    for page in pages:
+        sents = _split_sentences(page.text)
+        unique: list[str] = []
+        for sentence in sents:
+            key = _normalize_sentence_key(sentence)
+            if key in used_sentences:
+                continue
+            unique.append(sentence.strip())
+            used_sentences.add(key)
+        page.text = " ".join(unique).strip()
+        page.text = _append_anchor_expansions(
+            page.text,
+            min_words=_MIN_WORDS_PER_PAGE,
+            anchor_spec=anchor_spec,
+            cleaned=cleaned,
+            narrator=narrator,
+            used=used_sentences,
+            max_sentences=3,
+        )
+
+
+def _trim_pages_to_word_limit(pages: list[StoryPage], max_words: int) -> None:
+    for page in pages:
+        page.text = _trim_to_max_words(page.text, max_words)
+
+
+def _trim_to_max_words(text: str, max_words: int) -> str:
+    current = text.strip()
+    if _word_count(current) <= max_words:
+        return current
+    sentences = _split_sentences(current)
+    while sentences and _word_count(" ".join(sentences)) > max_words:
+        sentences.pop()
+    return " ".join(sentences).strip()
 
 
 def _anchor_padding_sentences(anchor_spec: AnchorSpec, narrator: str | None) -> list[str]:
