@@ -40,10 +40,19 @@ _MAX_WORDS_PER_PAGE = min(320, _DEFAULT_WORDS_PER_PAGE + 40)
 
 def _apply_short_transcript_targets(cleaned_transcript: str) -> None:
     global _DEFAULT_WORDS_PER_PAGE, _MIN_WORDS_PER_PAGE, _MAX_WORDS_PER_PAGE
-    if _word_count(cleaned_transcript) < 40:
-        _DEFAULT_WORDS_PER_PAGE = 200
-        _MIN_WORDS_PER_PAGE = 180
-        _MAX_WORDS_PER_PAGE = 240
+    transcript_words = _word_count(cleaned_transcript)
+    if transcript_words < 70:
+        _MIN_WORDS_PER_PAGE = 160
+        _MAX_WORDS_PER_PAGE = 260
+        _DEFAULT_WORDS_PER_PAGE = 210
+    elif transcript_words < 140:
+        _MIN_WORDS_PER_PAGE = 200
+        _MAX_WORDS_PER_PAGE = 300
+        _DEFAULT_WORDS_PER_PAGE = 250
+    else:
+        _MIN_WORDS_PER_PAGE = 240
+        _MAX_WORDS_PER_PAGE = 320
+        _DEFAULT_WORDS_PER_PAGE = min(max(_DEFAULT_WORDS_PER_PAGE, 240), 320)
 
 # --- Anti-boilerplate / faithfulness guards ---
 
@@ -782,6 +791,61 @@ def _fails_fidelity(pages_text: str, must_keywords: list[str]) -> tuple[list[str
     return reasons, banned_phrases
 
 
+_NEGATION_TERMS = (
+    "didn't",
+    "did not",
+    "didnt",
+    "refused",
+    "refuse",
+    "refuses",
+    "refusing",
+    "wouldn't",
+    "would not",
+    "wouldnt",
+)
+_POSITIVE_DESIRE_TERMS = (
+    "want",
+    "wants",
+    "wanted",
+)
+
+
+def _has_term_near_object(text: str, term_pattern: str, obj_pattern: str, window: int = 40) -> bool:
+    chunk = text.lower()
+    near_patterns = (
+        rf"{term_pattern}[^.!?]{{0,{window}}}{obj_pattern}",
+        rf"{obj_pattern}[^.!?]{{0,{window}}}{term_pattern}",
+    )
+    return any(re.search(pattern, chunk) for pattern in near_patterns)
+
+
+def _rule_based_contradictions(
+    transcript: str,
+    story_text: str,
+    anchor_spec: AnchorSpec,
+) -> list[str]:
+    if not transcript or not story_text:
+        return []
+    key_objects = [obj.strip() for obj in (anchor_spec.key_objects or []) if obj.strip()]
+    if not key_objects:
+        return []
+
+    negation_pattern = r"(?:%s)" % "|".join(re.escape(term) for term in _NEGATION_TERMS)
+    positive_pattern = r"(?:%s)" % "|".join(re.escape(term) for term in _POSITIVE_DESIRE_TERMS)
+    contradictions: list[str] = []
+
+    for obj in key_objects:
+        obj_pattern = r"\b%s\b" % re.escape(obj.lower())
+        if not _has_term_near_object(transcript, negation_pattern, obj_pattern):
+            continue
+        if _has_term_near_object(story_text, positive_pattern, obj_pattern):
+            contradictions.append(
+                f"Transcript negates desire for '{obj}', but story expresses wanting it."
+            )
+
+    return contradictions
+
+
 def _fidelity_json_schema() -> dict[str, Any]:
     return {
         "type": "object",
@@ -970,6 +1034,7 @@ def enhance_to_storybook(transcript: str, *, target_pages: int = 2) -> StoryBook
     if _is_openai_story_requested():
         print("STORY_ENHANCE_MODE=openai detected")
         openai_story = _openai_storybook(anchor_spec, plot_facts, title, narrator, target_pages)
+        openai_story = _openai_storybook(anchor_spec, cleaned, title, narrator, target_pages)
         if openai_story:
             _maybe_generate_images(openai_story, cleaned)
             return openai_story
@@ -1084,6 +1149,7 @@ def _build_openai_prompts(
 def _openai_storybook(
     anchor_spec: AnchorSpec,
     plot_facts: dict[str, list[str]],
+    cleaned_transcript: str,
     title: str,
     narrator: str | None,
     target_pages: int,
@@ -1210,6 +1276,21 @@ def _openai_storybook(
                     f"{user_prompt}\n\nIssues:\n- "
                     + "\n- ".join([f"contains banned filler phrase: {p}" for p in banned_phrases])
                     + "\n\nRewrite while keeping the anchor beats EXACT."
+                )
+                continue
+            return None
+
+        rule_contradictions = _rule_based_contradictions(cleaned_transcript, all_text, anchor_spec)
+        if rule_contradictions:
+            print(
+                "Rule-based contradiction check failed: "
+                + "; ".join(rule_contradictions)
+            )
+            if attempt == 0:
+                user_prompt = (
+                    f"{user_prompt}\n\nIssues:\n- "
+                    + "\n- ".join(rule_contradictions)
+                    + "\n\nRewrite to avoid contradicting the transcript."
                 )
                 continue
             return None
@@ -1606,8 +1687,8 @@ def _validate_story_data(data: Any, target_pages: int) -> tuple[bool, list[str]]
     if dupes:
         reasons.append(f"repeated sentence across pages: {dupes[0]}")
 
-    if total_dialogue != 2:
-        reasons.append(f"dialogue lines counted {total_dialogue} but expected 2")
+    if total_dialogue < 1 or total_dialogue > 3:
+        reasons.append(f"dialogue lines counted {total_dialogue} but expected 1-3")
     return (len(reasons) == 0, reasons)
 
 
@@ -1649,8 +1730,8 @@ def _validate_story_pages(pages: list[StoryPage], target_pages: int) -> tuple[bo
     if dupes:
         reasons.append(f"repeated sentence across pages: {dupes[0]}")
 
-    if total_dialogue != 2:
-        reasons.append(f"dialogue lines counted {total_dialogue} but expected 2")
+    if total_dialogue < 1 or total_dialogue > 3:
+        reasons.append(f"dialogue lines counted {total_dialogue} but expected 1-3")
 
     return (len(reasons) == 0, reasons)
 
