@@ -453,6 +453,18 @@ def _anchor_json_schema() -> dict[str, Any]:
     }
 
 
+def _plot_facts_json_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "facts": {"type": "array", "items": {"type": "string"}},
+            "entities": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["facts", "entities"],
+        "additionalProperties": False,
+    }
+
+
 def _coerce_anchor_spec(data: Any) -> AnchorSpec | None:
     if not isinstance(data, dict):
         return None
@@ -473,6 +485,19 @@ def _coerce_anchor_spec(data: Any) -> AnchorSpec | None:
     )
 
 
+def _coerce_plot_facts(data: Any) -> dict[str, list[str]]:
+    if not isinstance(data, dict):
+        return {}
+    facts = data.get("facts")
+    entities = data.get("entities")
+    if not isinstance(facts, list) or not isinstance(entities, list):
+        return {}
+    return {
+        "facts": [item for item in facts if isinstance(item, str)],
+        "entities": [item for item in entities if isinstance(item, str)],
+    }
+
+
 def _normalize_anchor_spec(spec: AnchorSpec, fallback: AnchorSpec) -> AnchorSpec:
     characters = _dedupe_preserve_order(spec.characters or fallback.characters)
     setting = spec.setting or fallback.setting
@@ -489,6 +514,60 @@ def _normalize_anchor_spec(spec: AnchorSpec, fallback: AnchorSpec) -> AnchorSpec
         beats=beats,
         lesson=lesson,
     )
+
+
+def _request_openai_plot_facts(
+    client,
+    system_prompt: str,
+    user_prompt: str,
+    use_responses: bool,
+) -> str:
+    if use_responses and hasattr(client.responses, "parse"):
+        schema = _plot_facts_json_schema()
+        input_messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        result = client.responses.parse(
+            model=_DEFAULT_MODEL,
+            input=input_messages,
+            temperature=0.2,
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "plot_facts",
+                    "schema": schema,
+                    "strict": True,
+                }
+            },
+            max_output_tokens=400,
+        )
+        parsed = getattr(result, "output_parsed", None)
+        if parsed is not None:
+            return json.dumps(parsed)
+        return _extract_response_text(result)
+
+    if use_responses and hasattr(client, "responses"):
+        schema = _plot_facts_json_schema()
+        response = client.responses.create(
+            model=_DEFAULT_MODEL,
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "plot_facts",
+                    "schema": schema,
+                    "strict": True,
+                }
+            },
+            max_output_tokens=400,
+        )
+        return _extract_response_text(response)
+    return ""
 
 
 def _request_openai_anchor_spec(
@@ -545,6 +624,38 @@ def _request_openai_anchor_spec(
     return ""
 
 
+def _openai_http_plot_facts(system_prompt: str, user_prompt: str) -> tuple[str, str]:
+    schema = _plot_facts_json_schema()
+    responses_payload = {
+        "model": _DEFAULT_MODEL,
+        "input": [
+            {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
+            {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
+        ],
+        "temperature": 0.2,
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "plot_facts",
+                "schema": schema,
+                "strict": True,
+            }
+        },
+        "max_output_tokens": 400,
+    }
+    try:
+        response_data = _post_openai_request(
+            "https://api.openai.com/v1/responses",
+            responses_payload,
+        )
+        content = _extract_http_response_text(response_data)
+        if content:
+            return content, "responses"
+    except Exception as exc:
+        print(f"OpenAI HTTP responses plot facts call failed: {exc}")
+    return "", "responses"
+
+
 def _openai_http_anchor_spec(system_prompt: str, user_prompt: str) -> tuple[str, str]:
     schema = _anchor_json_schema()
     responses_payload = {
@@ -575,6 +686,53 @@ def _openai_http_anchor_spec(system_prompt: str, user_prompt: str) -> tuple[str,
     except Exception as exc:
         print(f"OpenAI HTTP responses anchor call failed: {exc}")
     return "", "responses"
+
+
+def _extract_plot_facts_openai(cleaned_transcript: str) -> dict[str, list[str]]:
+    cleaned = cleaned_transcript or ""
+    local_facts = _dedupe_preserve_order(_split_sentences(cleaned))[:12]
+    local_entities = _dedupe_preserve_order(
+        _extract_proper_names(cleaned, None) + _extract_role_characters(cleaned)
+    )
+    fallback = {"facts": local_facts, "entities": local_entities}
+    if not os.getenv("OPENAI_API_KEY"):
+        return fallback
+    system_prompt = (
+        "Extract plot facts and named entities from a story transcript. "
+        "Facts must be faithful, short statements drawn directly from the transcript. "
+        "Return ONLY strict JSON that follows the schema exactly."
+    )
+    user_prompt = (
+        "Extract plot facts and named entities from this transcript. "
+        "Facts should preserve negatives and motivations (e.g., 'did not want').\n\n"
+        f"TRANSCRIPT:\n{cleaned or 'Empty transcript.'}"
+    )
+    client = _get_openai_client()
+    try:
+        if client:
+            use_responses = hasattr(client, "responses")
+            content = _request_openai_plot_facts(
+                client, system_prompt, user_prompt, use_responses
+            )
+        else:
+            content, endpoint = _openai_http_plot_facts(system_prompt, user_prompt)
+            print(f"OpenAI endpoint: {endpoint} (HTTP)")
+    except Exception as exc:
+        print(f"OpenAI plot facts extraction failed: {exc}")
+        return fallback
+    if not content:
+        return fallback
+    data = _parse_json(content)
+    extracted = _coerce_plot_facts(data)
+    if not extracted:
+        return fallback
+    extracted["facts"] = _dedupe_preserve_order(extracted.get("facts", []))
+    extracted["entities"] = _dedupe_preserve_order(extracted.get("entities", []))
+    if not extracted["facts"]:
+        extracted["facts"] = fallback["facts"]
+    if not extracted["entities"]:
+        extracted["entities"] = fallback["entities"]
+    return extracted
 
 
 def _openai_anchor_spec(cleaned: str) -> AnchorSpec | None:
@@ -871,9 +1029,11 @@ def enhance_to_storybook(transcript: str, *, target_pages: int = 2) -> StoryBook
     subtitle = "A story told out loud"
     target_pages = target_pages or _DEFAULT_TARGET_PAGES
     anchor_spec = extract_story_anchors(cleaned)
+    plot_facts = _extract_plot_facts_openai(cleaned)
 
     if _is_openai_story_requested():
         print("STORY_ENHANCE_MODE=openai detected")
+        openai_story = _openai_storybook(anchor_spec, plot_facts, title, narrator, target_pages)
         openai_story = _openai_storybook(anchor_spec, cleaned, title, narrator, target_pages)
         if openai_story:
             _maybe_generate_images(openai_story, cleaned)
@@ -908,7 +1068,10 @@ def _get_openai_client():
 
 
 def _build_openai_prompts(
-    anchor_spec: AnchorSpec, narrator: str | None, target_pages: int
+    anchor_spec: AnchorSpec,
+    plot_facts: dict[str, list[str]],
+    narrator: str | None,
+    target_pages: int,
 ) -> tuple[str, str, AnchorSpec]:
     system_prompt = (
         "You are a celebrated children's picture-book author and editor. "
@@ -927,9 +1090,13 @@ def _build_openai_prompts(
         "8) Warm ending with emotional lift.\n"
     )
     anchor_json = json.dumps(anchor_spec.model_dump(), ensure_ascii=False, indent=2)
+    facts = plot_facts.get("facts", [])
+    entities = plot_facts.get("entities", [])
+    facts_lines = "\n".join([f"- {fact}" for fact in facts]) or "- (none)"
+    entity_lines = "\n".join([f"- {entity}" for entity in entities]) or "- (none)"
     user_prompt = (
-        "Use the AnchorSpec JSON below as the ONLY source of plot truth. "
-        "Do not invent new major plotlines beyond what the anchors imply.\n\n"
+        "Use the AnchorSpec JSON below and the plot facts as the ONLY sources of plot truth. "
+        "Do not invent new major plotlines beyond what the plot facts and anchors imply.\n\n"
         f"NARRATOR (keep name if present): {narrator or 'none'}\n\n"
         "Story requirements:\n"
         f"- Exactly {target_pages} pages.\n"
@@ -946,10 +1113,15 @@ def _build_openai_prompts(
         "- You MUST include each anchor beat in order (paraphrase is allowed).\n"
         "- Ensure entity consistency: characters, key_objects, and setting stay the same.\n"
         "- Do not change any character identities or swap roles.\n"
+        "- Do not invert motivations (explicitly: if transcript says “did not want X” you must not say “wanted X”).\n"
         "- You may add whimsical details, but do not add new major plotlines.\n"
         f"- {_MIN_WORDS_PER_PAGE}–{_MAX_WORDS_PER_PAGE} words per page (target {_DEFAULT_WORDS_PER_PAGE}).\n"
         "- Each page must include a rich illustration_prompt in consistent watercolor picture-book style.\n"
         f"{beat_sheet}\n"
+        "MUST KEEP TRUE FACTS (do not change these; list them verbatim):\n"
+        f"{facts_lines}\n\n"
+        "ENTITIES (names to keep consistent):\n"
+        f"{entity_lines}\n\n"
         "ANCHORS JSON (use this as ground truth):\n"
         f"{anchor_json}\n\n"
         "OUTPUT JSON schema:\n"
@@ -976,6 +1148,7 @@ def _build_openai_prompts(
 
 def _openai_storybook(
     anchor_spec: AnchorSpec,
+    plot_facts: dict[str, list[str]],
     cleaned_transcript: str,
     title: str,
     narrator: str | None,
@@ -994,7 +1167,7 @@ def _openai_storybook(
     print(f"OpenAI model: {_DEFAULT_MODEL}")
 
     system_prompt, user_prompt, anchor_spec = _build_openai_prompts(
-        anchor_spec, narrator, target_pages
+        anchor_spec, plot_facts, narrator, target_pages
     )
     fidelity_note: str | None = None
 
