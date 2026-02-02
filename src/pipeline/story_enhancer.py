@@ -102,6 +102,29 @@ def _get_openai_client():
     return openai_module.OpenAI()
 
 
+def _build_cover_prompt(title: str, narrator: str | None, cleaned: str) -> str:
+    # Generic: pull a couple of important nouns and proper nouns without theme-locking
+    proper = re.findall(r"\b[A-Z][a-z]{2,}\b", cleaned or "")
+    proper = [p for p in proper if p.lower() not in {"the", "and", "then", "after", "before"}]
+    main_name = narrator or (proper[0] if proper else "a child")
+
+    keywords = re.findall(r"[A-Za-z']+", (cleaned or "").lower())
+    stop = {
+        "the", "and", "then", "after", "before", "with", "from", "that", "this", "when", "they",
+        "she", "he", "her", "his", "dad", "mom", "a", "an", "to", "in", "on", "at", "of",
+    }
+    nouns = [w for w in keywords if w not in stop and len(w) > 3]
+    key_bits = ", ".join(dict.fromkeys(nouns[:6])) if nouns else "a whimsical adventure"
+
+    return (
+        "Children's picture book cover illustration, watercolor style, soft texture, warm lighting, "
+        "no text, no letters, no watermark. "
+        f"Main character: {main_name}. "
+        f"Theme elements: {key_bits}. "
+        "Centered composition, friendly expressive faces, cozy whimsical mood."
+    )
+
+
 def _build_openai_prompts(cleaned: str, narrator: str | None, target_pages: int) -> tuple[str, str]:
     system_prompt = (
         "You are a celebrated children's picture-book author and editor. "
@@ -227,6 +250,8 @@ def _openai_storybook(
             subtitle=(data.get("subtitle") or "A story told out loud").strip() or "A story told out loud",
             pages=pages,
             narrator=(data.get("narrator") or narrator),
+            cover_prompt=_build_cover_prompt(title, narrator, cleaned),
+            cover_image_path=None,
         )
 
     print("OpenAI enhancement failed: could not produce a valid story after retries.")
@@ -747,6 +772,8 @@ def _local_storybook(cleaned: str, title: str, narrator: str | None, target_page
         subtitle="A story told out loud",
         pages=pages,
         narrator=narrator,
+        cover_prompt=_build_cover_prompt(title, narrator, cleaned),
+        cover_image_path=None,
     )
     return story
 
@@ -765,46 +792,52 @@ def _maybe_generate_images(story: StoryBook) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # Cover art prompt
-    cover_prompt = (
-        "Children's picture-book cover illustration in watercolor style. "
-        f"Title concept: {story.title}. "
-        f"Include the main character ({story.narrator or 'a child'}) and the main story theme "
-        "in a cheerful, whimsical way. "
-        "Soft textures, warm lighting, friendly expressions, no scary realism."
-    )
-    try:
-        cover = client.images.generate(model="gpt-image-1", prompt=cover_prompt, size="1024x1024")
-        data = cover.data[0] if cover.data else None
-        if data and getattr(data, "b64_json", None):
-            cover_path = out_dir / f"story_{timestamp}_cover.png"
-            cover_path.write_bytes(base64.b64decode(data.b64_json))
-            story.cover_image_path = str(cover_path)
-    except Exception:
-        # non-fatal
-        pass
-
-    # Page illustrations
-    for index, page in enumerate(story.pages, start=1):
-        prompt = (page.illustration_prompt or "").strip() or "A cozy children's storybook illustration in watercolor."
+    # 1) Cover image
+    cover_prompt = (getattr(story, "cover_prompt", None) or "").strip()
+    if cover_prompt:
         try:
-            response = client.images.generate(model="gpt-image-1", prompt=prompt, size="1024x1024")
+            resp = client.images.generate(
+                model="gpt-image-1",
+                prompt=cover_prompt,
+                size="1024x1024",
+            )
+            data = resp.data[0] if resp.data else None
+            if data:
+                cover_path = out_dir / f"story_{timestamp}_cover.png"
+                if getattr(data, "b64_json", None):
+                    cover_path.write_bytes(base64.b64decode(data.b64_json))
+                    story.cover_image_path = str(cover_path)
+                elif getattr(data, "url", None):
+                    request.urlretrieve(data.url, cover_path)
+                    story.cover_image_path = str(cover_path)
+        except Exception:
+            pass
+
+    # 2) Page images
+    for index, page in enumerate(story.pages, start=1):
+        prompt = (page.illustration_prompt or "").strip()
+        if not prompt:
+            continue
+
+        try:
+            resp = client.images.generate(
+                model="gpt-image-1",
+                prompt=prompt,
+                size="1024x1024",
+            )
+            data = resp.data[0] if resp.data else None
+            if not data:
+                continue
+
+            image_path = out_dir / f"story_{timestamp}_p{index}.png"
+            if getattr(data, "b64_json", None):
+                image_path.write_bytes(base64.b64decode(data.b64_json))
+            elif getattr(data, "url", None):
+                request.urlretrieve(data.url, image_path)
+            else:
+                continue
+
+            page.illustration_path = str(image_path)
+            page.image_path = str(image_path)
         except Exception:
             continue
-
-        data = response.data[0] if response.data else None
-        if not data:
-            continue
-
-        image_path = out_dir / f"story_{timestamp}_p{index}.png"
-        if getattr(data, "b64_json", None):
-            image_path.write_bytes(base64.b64decode(data.b64_json))
-            page.illustration_path = str(image_path)
-            continue
-
-        if getattr(data, "url", None):
-            try:
-                request.urlretrieve(data.url, image_path)
-                page.illustration_path = str(image_path)
-            except Exception:
-                continue

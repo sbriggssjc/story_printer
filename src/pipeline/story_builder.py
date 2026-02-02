@@ -10,6 +10,7 @@ class StoryPage:
     text: str
     illustration_prompt: str
     illustration_path: str | None = None
+    image_path: str | None = None
 
 
 @dataclass
@@ -19,6 +20,7 @@ class StoryBook:
     pages: list[StoryPage]
     narrator: str | None = None
     cover_image_path: str | None = None
+    cover_prompt: str | None = None
 
 
 _STOPWORDS = {
