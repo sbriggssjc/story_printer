@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-import importlib
+import importlib.util as importlib_util
 import logging
 import os
 from pathlib import Path
+
+# Import the util submodule explicitly so static analyzers and packagers detect it.
 
 
 def transcribe_audio(path: str) -> str:
@@ -52,7 +54,7 @@ def transcribe_audio(path: str) -> str:
         )
         raise FileNotFoundError(msg)
 
-    if importlib.util.find_spec("openai") is None:
+    if importlib_util.find_spec("openai") is None:
         raise RuntimeError("openai package not installed")
 
     from openai import OpenAI
