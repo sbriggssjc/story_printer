@@ -1180,34 +1180,19 @@ def _openai_storybook(
     system_prompt, user_prompt, anchor_spec = _build_openai_prompts(
         anchor_spec, plot_facts, narrator, target_pages
     )
-    fidelity_note: str | None = None
-
-    repeat_sentence_note: str | None = None
+    repair_spec: dict[str, Any] | None = None
     for attempt in range(2):
         correction = ""
         if attempt == 1:
+            repair_payload = repair_spec or {}
             correction = (
-                "Targeted repair only. Keep tone, page structure, and length stable.\n"
-                "Fix ONLY the missing beats or contradictions; do not add new major plotlines.\n"
-                "Rewrite the story to satisfy ALL requirements:\n"
-                f"- EXACTLY {target_pages} pages.\n"
-                f"- EACH page MUST be between {_MIN_WORDS_PER_PAGE} and {_MAX_WORDS_PER_PAGE} words.\n"
-                '- Exactly two dialogue lines total using straight quotes, e.g. "...". Each must be a full sentence on its own line starting with "- " or "— ".\n'
-                "- Each dialogue line must be short (<= 12 words) and natural.\n"
-                "- Do not use quotation marks for emphasis or any other purpose.\n"
-                "- Return ONLY JSON matching the schema. No extra keys, no commentary."
+                "Second-pass rewrite required. Use ONLY the repair spec below.\n"
+                "Rewrite completely; do NOT reuse phrasing from any previous attempt.\n"
+                "Do not quote or paste any prior story text.\n"
+                "Return ONLY JSON matching the schema. No extra keys, no commentary.\n\n"
+                "Repair spec (machine-built JSON):\n"
+                f"{json.dumps(repair_payload, ensure_ascii=False, indent=2)}"
             )
-            if fidelity_note:
-                correction += (
-                    "\nFidelity fixes required (be surgical; keep tone and length):\n"
-                    f"{fidelity_note}\n"
-                    "Fix the specific beats/contradictions only; keep page order and structure."
-                )
-            if repeat_sentence_note:
-                correction += (
-                    "\nRepeated sentence fix required (be surgical; keep structure unchanged):\n"
-                    f"{repeat_sentence_note}\n"
-                )
         try:
             if client:
                 use_responses = hasattr(client, "responses")
@@ -1269,28 +1254,11 @@ def _openai_storybook(
                     used_sentences,
                 )
 
-        remaining_dupes = _find_duplicate_sentences_across_pages([page.text for page in pages])
-        if remaining_dupes:
-            repeat_sentence_note = (
-                "Rewrite ONLY this sentence everywhere it appears, leaving everything else unchanged:\n"
-                f"Sentence: \"{remaining_dupes[0]}\""
-            )
-
         valid, reasons = _validate_story_pages(pages, target_pages)
         if not valid:
             print(f"Validation failed: {', '.join(reasons)}")
             if attempt == 0:
-                if repeat_sentence_note and all(
-                    reason.startswith("repeated sentence across pages:") for reason in reasons
-                ):
-                    continue
-                repeat_sentence_note = None
-                user_prompt = (
-                    f"{user_prompt}\n\n"
-                    "Your previous attempt failed validation. Fix ALL issues below:\n"
-                    "- " + "\n- ".join(reasons) + "\n\n"
-                    "Rewrite from scratch. Do NOT reuse any sentences from the previous attempt.\n"
-                )
+                repair_spec = _build_repair_spec(reasons, target_pages)
                 continue
             print(f"OpenAI enhancement failed: invalid output ({'; '.join(reasons)}).")
             return None
@@ -1301,10 +1269,10 @@ def _openai_storybook(
         if banned_phrases:
             print(f"Fidelity failed: contains banned filler phrases: {', '.join(banned_phrases)}")
             if attempt == 0:
-                user_prompt = (
-                    f"{user_prompt}\n\nIssues:\n- "
-                    + "\n- ".join([f"contains banned filler phrase: {p}" for p in banned_phrases])
-                    + "\n\nRewrite while keeping the anchor beats EXACT."
+                repair_spec = _build_repair_spec(
+                    [],
+                    target_pages,
+                    banned_phrases=banned_phrases,
                 )
                 continue
             return None
@@ -1316,10 +1284,10 @@ def _openai_storybook(
                 + "; ".join(rule_contradictions)
             )
             if attempt == 0:
-                user_prompt = (
-                    f"{user_prompt}\n\nIssues:\n- "
-                    + "\n- ".join(rule_contradictions)
-                    + "\n\nRewrite to avoid contradicting the transcript."
+                repair_spec = _build_repair_spec(
+                    [],
+                    target_pages,
+                    rule_contradictions=rule_contradictions,
                 )
                 continue
             return None
@@ -1351,9 +1319,13 @@ def _openai_storybook(
             fidelity_result = {"pass": True}
 
         if not fidelity_result.get("pass", False):
-            fidelity_note = _summarize_fidelity_issues(fidelity_result)
             print("Fidelity failed via anchor check.")
             if attempt == 0:
+                repair_spec = _build_repair_spec(
+                    [],
+                    target_pages,
+                    fidelity_result=fidelity_result,
+                )
                 continue
             return None
 
@@ -1763,6 +1735,85 @@ def _validate_story_pages(pages: list[StoryPage], target_pages: int) -> tuple[bo
         reasons.append(f"dialogue lines counted {total_dialogue} but expected 1-3")
 
     return (len(reasons) == 0, reasons)
+
+
+def _build_repair_spec(
+    reasons: list[str],
+    target_pages: int,
+    *,
+    banned_phrases: list[str] | None = None,
+    rule_contradictions: list[str] | None = None,
+    fidelity_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    problems: set[str] = set()
+    avoid_phrases = set(_BLOCKLIST_SENTENCES)
+    if banned_phrases:
+        problems.add("banned_filler_phrases")
+        avoid_phrases.update(banned_phrases)
+
+    for reason in reasons:
+        if reason.startswith("expected ") and " pages but got " in reason:
+            problems.add("page_count_mismatch")
+            continue
+        match = re.search(r"page (\d+) word count (\d+) outside", reason)
+        if match:
+            page_num = int(match.group(1))
+            word_count = int(match.group(2))
+            if word_count < _MIN_WORDS_PER_PAGE:
+                problems.add(f"page_{page_num}_too_short")
+            else:
+                problems.add(f"page_{page_num}_too_long")
+            continue
+        match = re.search(r"page (\d+) missing text", reason)
+        if match:
+            problems.add(f"page_{int(match.group(1))}_missing_text")
+            continue
+        match = re.search(r"page (\d+) missing illustration_prompt", reason)
+        if match:
+            problems.add(f"page_{int(match.group(1))}_missing_illustration_prompt")
+            continue
+        if "boilerplate sentence" in reason:
+            problems.add("boilerplate_sentence_used")
+            continue
+        if reason.startswith("repeated sentence across pages:"):
+            problems.add("repeated_sentence_across_pages")
+            continue
+        if reason.startswith("dialogue lines counted"):
+            problems.add("dialogue_lines_out_of_range")
+            continue
+
+    constraints: dict[str, Any] = {
+        "exact_pages": target_pages,
+        "min_words_per_page": _MIN_WORDS_PER_PAGE,
+        "max_words_per_page": _MAX_WORDS_PER_PAGE,
+        "dialogue_lines_total": [1, 3],
+        "avoid_meta_phrases": sorted(avoid_phrases),
+    }
+
+    if rule_contradictions:
+        problems.add("rule_contradiction")
+        constraints["avoid_contradictions"] = rule_contradictions
+
+    if fidelity_result:
+        missing_beats = [str(item) for item in fidelity_result.get("missing_beats") or []]
+        contradictions = [str(item) for item in fidelity_result.get("contradictions") or []]
+        issues = [str(item) for item in fidelity_result.get("issues") or []]
+        if missing_beats:
+            problems.add("missing_anchor_beats")
+            constraints["missing_beats"] = missing_beats
+        if contradictions:
+            problems.add("anchor_contradictions")
+            constraints["avoid_contradictions"] = sorted(
+                set(constraints.get("avoid_contradictions", [])) | set(contradictions)
+            )
+        if issues:
+            problems.add("fidelity_issues")
+            constraints["fidelity_issues"] = issues
+
+    return {
+        "problems": sorted(problems),
+        "constraints": constraints,
+    }
 
 
 def _build_pages_from_data(data: dict[str, Any], target_pages: int) -> list[StoryPage]:
