@@ -396,11 +396,11 @@ def enhance_to_storybook(transcript: str, *, target_pages: int = 2) -> StoryBook
         print("STORY_ENHANCE_MODE=openai detected")
         openai_story = _openai_storybook(cleaned, title, narrator, target_pages)
         if openai_story:
-            _maybe_generate_images(openai_story)
+            _maybe_generate_images(openai_story, cleaned)
             return openai_story
 
     local_story = _local_storybook(cleaned, title, narrator, target_pages)
-    _maybe_generate_images(local_story)
+    _maybe_generate_images(local_story, cleaned)
     return local_story
 
 
@@ -1123,6 +1123,33 @@ def _extract_story_beats(cleaned: str) -> dict[str, str]:
     }
 
 
+def _extract_beats(cleaned: str) -> dict[str, bool]:
+    lower = (cleaned or "").lower()
+    return {
+        "pizza": "pizza" in lower or "crust" in lower,
+        "monster": "monster" in lower,
+        "horse": "horse" in lower or "hooves" in lower,
+    }
+
+
+def _cover_prompt(story: StoryBook, cleaned: str) -> str:
+    beats = _extract_beats(cleaned)
+    main_character = story.narrator or "a cheerful child"
+    parts = [
+        "Watercolor children's picture book cover illustration, cozy and whimsical, no text.",
+        f"Theme: {story.title}.",
+    ]
+    if beats.get("pizza"):
+        parts.append("A pizza on a table, warm kitchen light.")
+    if beats.get("monster"):
+        parts.append("A friendly silly pizza monster made of toppings, not scary.")
+    if beats.get("horse"):
+        parts.append("A shiny heroic horse galloping in, playful not intense.")
+    parts.append(f"Main character: {main_character} with expressive face.")
+    parts.append("Soft watercolor textures, storybook composition, gentle lighting.")
+    return " ".join(parts)
+
+
 def _local_page_expansions(claire_name: str, dad_name: str, *, stage: str) -> list[str]:
     if stage == "resolution":
         return [
@@ -1540,7 +1567,7 @@ def _fallback_beat_expansions(cleaned: str, narrator: str | None) -> list[str]:
     return sentences
 
 
-def _maybe_generate_images(story: StoryBook) -> None:
+def _maybe_generate_images(story: StoryBook, cleaned: str) -> None:
     if not _use_openai_image_mode():
         return
     client = _get_openai_client()
@@ -1550,6 +1577,31 @@ def _maybe_generate_images(story: StoryBook) -> None:
     out_dir = Path("out/books/images")
     out_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    cover_prompt = _cover_prompt(story, cleaned)
+    try:
+        cover_response = client.images.generate(
+            model="gpt-image-1",
+            prompt=cover_prompt,
+            size="1024x1024",
+        )
+    except Exception:
+        cover_response = None
+
+    cover_data = cover_response.data[0] if cover_response and cover_response.data else None
+    if cover_data:
+        cover_path = out_dir / f"story_{timestamp}_cover.png"
+        if getattr(cover_data, "b64_json", None):
+            cover_bytes = base64.b64decode(cover_data.b64_json)
+            cover_path.write_bytes(cover_bytes)
+            story.cover_path = str(cover_path)
+        elif getattr(cover_data, "url", None):
+            try:
+                request.urlretrieve(cover_data.url, cover_path)
+            except Exception:
+                cover_path = None
+            else:
+                story.cover_path = str(cover_path)
 
     for index, page in enumerate(story.pages, start=1):
         prompt = page.illustration_prompt or "A cozy children's storybook illustration."

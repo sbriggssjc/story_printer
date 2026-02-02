@@ -17,6 +17,7 @@ class StoryBook:
     subtitle: str
     pages: list[StoryPage]
     narrator: str | None = None
+    cover_path: str | None = None
 
 
 _STOPWORDS = {
