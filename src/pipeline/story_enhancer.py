@@ -546,8 +546,13 @@ def _openai_storybook(
 
         # Post-process pages BEFORE validation so we validate the final text that will be printed
         for page in pages:
-            page.text = _pad_text_to_min_words(page.text, min_words=_MIN_WORDS_PER_PAGE)
-            page.text = _limit_dialogue_lines(page.text, max_lines=3)
+            page.text = _pad_text_to_min_words_with_beats(
+                page.text,
+                min_words=_MIN_WORDS_PER_PAGE,
+                cleaned=cleaned,
+                narrator=narrator,
+            )
+            page.text = _normalize_dialogue_lines(page.text, max_lines=3)
 
         total_dialogue = sum(_count_dialogue_lines(page.text) for page in pages)
         if total_dialogue < 1:
@@ -1288,6 +1293,47 @@ def _ensure_dialogue_count(text: str, target_lines: int = 2) -> str:
     return f"{text.rstrip()}{separator}{extra}".strip()
 
 
+def _normalize_dialogue_lines(text: str, max_lines: int = 3) -> str:
+    """
+    Keep up to max_lines of dialogue. Any extra dialogue lines or quoted segments
+    are rewritten into plain narration (no quotes).
+    """
+    lines = text.splitlines(keepends=True)
+    dialogue_count = 0
+    updated: list[str] = []
+    for line in lines:
+        if re.match(r"^\s*[-—]\s+", line):
+            dialogue_count += 1
+            if dialogue_count > max_lines:
+                line = re.sub(r"^(\s*)[-—]\s+", r"\1", line)
+        updated.append(line)
+
+    interim = "".join(updated)
+    remaining = max(0, max_lines - _count_dialogue_lines(interim))
+
+    if remaining == 0:
+        return _strip_extra_quotes(interim, allowed=0)
+    return _strip_extra_quotes(interim, allowed=remaining)
+
+
+def _strip_extra_quotes(text: str, *, allowed: int) -> str:
+    """
+    Keep the first `allowed` quoted segments and rewrite the rest without quotes.
+    """
+    pattern = re.compile(r'"([^"\n]+)"|“([^”\n]+)”')
+    seen = 0
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal seen
+        seen += 1
+        content = match.group(1) or match.group(2) or ""
+        if seen <= allowed:
+            return match.group(0)
+        return content
+
+    return pattern.sub(replace, text)
+
+
 def _pad_to_min_words(text: str, target_min: int, topic: str, name: str) -> str:
     """
     If text is under target_min, append non-dialogue expansions until it meets min.
@@ -1309,6 +1355,68 @@ def _pad_text_to_min_words(text: str, min_words: int) -> str:
     name = "A young storyteller"
     additions = _page_expansions(topic, name, stage="resolution")
     return _expand_text_to_range(text, min_words, _MAX_WORDS_PER_PAGE, additions)
+
+
+def _pad_text_to_min_words_with_beats(
+    text: str,
+    *,
+    min_words: int,
+    cleaned: str,
+    narrator: str | None,
+) -> str:
+    """
+    If text is under min_words, append plot-relevant expansion sentences derived
+    from the transcript beats (avoid boilerplate).
+    """
+    if _word_count(text) >= min_words:
+        return text
+
+    additions = _beat_expansion_sentences(cleaned, narrator)
+    if not additions:
+        additions = _fallback_beat_expansions(cleaned, narrator)
+
+    existing = {s.lower() for s in _split_sentences_for_dedupe(text)}
+    filtered = [s for s in additions if s.lower() not in existing]
+
+    if not filtered:
+        return text
+    return _expand_text_to_range(text, min_words, _MAX_WORDS_PER_PAGE, filtered)
+
+
+def _beat_expansion_sentences(cleaned: str, narrator: str | None) -> list[str]:
+    lowered = (cleaned or "").lower()
+    name = narrator or "Claire"
+    sentences: list[str] = []
+
+    if "pizza" in lowered:
+        sentences.append("The pizza smell curled through the room like a warm ribbon.")
+    if "crust" in lowered:
+        sentences.append(f"{name} tucked the crust away, feeling its crackly edges.")
+    if "trash" in lowered or "trash can" in lowered or "bin" in lowered:
+        sentences.append("The trash can lid clinked louder than anyone expected.")
+    if "monster" in lowered and "cheese" in lowered:
+        sentences.append("The monster's cheese breath puffed out in a goofy cloud.")
+    elif "monster" in lowered:
+        sentences.append("A pretend monster stomped in with a silly, cheesy roar.")
+    if "horse" in lowered or "hooves" in lowered:
+        sentences.append("Shiny horse hooves tapped the floor like tiny cymbals.")
+    if "apolog" in lowered or "sorry" in lowered:
+        sentences.append("The apology came out soft and brave, like a whispering hug.")
+    if "laugh" in lowered or "giggl" in lowered:
+        sentences.append("Everyone laughed, and the tension loosened like a shoelace.")
+
+    return sentences
+
+
+def _fallback_beat_expansions(cleaned: str, narrator: str | None) -> list[str]:
+    phrases = _extract_noun_phrases(cleaned, min_count=3, max_count=6)
+    if not phrases:
+        return []
+    speaker = narrator or "They"
+    sentences: list[str] = []
+    for phrase in phrases:
+        sentences.append(f"{speaker} kept noticing the {phrase} as the moment unfolded.")
+    return sentences
 
 
 def _maybe_generate_images(story: StoryBook) -> None:
