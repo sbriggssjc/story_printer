@@ -18,6 +18,7 @@ import json
 import os
 import random
 import re
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,16 @@ _DEFAULT_WORDS_PER_PAGE = int(os.getenv("STORY_WORDS_PER_PAGE", "280"))
 _DEFAULT_STYLE = os.getenv("STORY_STYLE", "whimsical, funny, heartwarming")
 _MIN_WORDS_PER_PAGE = max(240, _DEFAULT_WORDS_PER_PAGE - 40)
 _MAX_WORDS_PER_PAGE = min(320, _DEFAULT_WORDS_PER_PAGE + 40)
+
+
+@dataclass
+class AnchorSpec:
+    characters: list[str]
+    setting: list[str] | None
+    props: list[str]
+    events: list[str]
+    moral: str | None
+    non_negotiables: list[str]
 
 
 def _apply_short_transcript_targets(cleaned_transcript: str) -> None:
@@ -296,6 +307,399 @@ def _extract_noun_phrases(
                 break
 
     return phrases[:max_count]
+
+
+def _dedupe_preserve_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for item in items:
+        normalized = item.strip()
+        if not normalized:
+            continue
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(normalized)
+    return deduped
+
+
+def _extract_role_characters(cleaned: str) -> list[str]:
+    if not cleaned:
+        return []
+    lower = cleaned.lower()
+    roles = [
+        ("dad", "Dad"),
+        ("father", "Dad"),
+        ("mom", "Mom"),
+        ("mother", "Mom"),
+        ("grandma", "Grandma"),
+        ("grandmother", "Grandma"),
+        ("grandpa", "Grandpa"),
+        ("grandfather", "Grandpa"),
+        ("sister", "Sister"),
+        ("brother", "Brother"),
+        ("teacher", "Teacher"),
+        ("coach", "Coach"),
+        ("friend", "Friend"),
+        ("dog", "dog"),
+        ("cat", "cat"),
+        ("puppy", "puppy"),
+        ("kitten", "kitten"),
+    ]
+    found = []
+    for token, label in roles:
+        if re.search(rf"\b{re.escape(token)}\b", lower):
+            found.append(label)
+    return _dedupe_preserve_order(found)
+
+
+def _extract_settings(cleaned: str) -> list[str]:
+    if not cleaned:
+        return []
+    lower = cleaned.lower()
+    settings = [
+        "kitchen",
+        "school",
+        "park",
+        "playground",
+        "classroom",
+        "bedroom",
+        "living room",
+        "backyard",
+        "yard",
+        "house",
+        "home",
+        "forest",
+        "beach",
+        "garden",
+        "library",
+        "store",
+        "cafe",
+        "restaurant",
+    ]
+    found = []
+    for setting in settings:
+        if re.search(rf"\b{re.escape(setting)}\b", lower):
+            found.append(setting)
+    return _dedupe_preserve_order(found)
+
+
+def _extract_event_beats(cleaned: str) -> list[str]:
+    if not cleaned:
+        return []
+    sentences = _split_sentences(cleaned)
+    events = [sentence for sentence in sentences if sentence]
+    if len(events) < 4:
+        fragments = re.split(r"[;,]|\band then\b", cleaned, flags=re.IGNORECASE)
+        for fragment in fragments:
+            fragment = fragment.strip()
+            if fragment and fragment not in events:
+                events.append(fragment)
+    events = _dedupe_preserve_order(events)
+    if len(events) > 10:
+        events = events[:10]
+    return events
+
+
+def _extract_moral(cleaned: str) -> str | None:
+    if not cleaned:
+        return None
+    moral_keywords = [
+        "lesson",
+        "learned",
+        "remember",
+        "should",
+        "shouldn't",
+        "must",
+        "promise",
+        "apologize",
+        "sorry",
+        "forgive",
+        "kind",
+        "share",
+        "listen",
+    ]
+    for sentence in _split_sentences(cleaned):
+        lower = sentence.lower()
+        if any(keyword in lower for keyword in moral_keywords):
+            return sentence.strip()
+    return None
+
+
+def _build_non_negotiables(spec: AnchorSpec) -> list[str]:
+    items: list[str] = []
+    for character in spec.characters:
+        items.append(f"Character: {character}")
+    for setting in spec.setting or []:
+        items.append(f"Setting: {setting}")
+    for prop in spec.props[:4]:
+        items.append(f"Key object: {prop}")
+    if spec.events:
+        items.append(f"Core event: {spec.events[0]}")
+        if len(spec.events) > 1:
+            items.append(f"Core event: {spec.events[-1]}")
+    if spec.moral:
+        items.append(f"Lesson: {spec.moral}")
+    return _dedupe_preserve_order(items)
+
+
+def _local_anchor_spec(cleaned: str) -> AnchorSpec:
+    characters = _dedupe_preserve_order(
+        _extract_proper_names(cleaned, None) + _extract_role_characters(cleaned)
+    )
+    settings = _extract_settings(cleaned)
+    excluded = set(characters + settings)
+    props = _extract_noun_phrases(cleaned, min_count=3, max_count=10, excluded=excluded)
+    props = _dedupe_preserve_order(props)
+    events = _extract_event_beats(cleaned)
+    if len(events) < 4:
+        events = events + ["A key moment happens.", "The situation is resolved."][: 4 - len(events)]
+    events = events[:10]
+    moral = _extract_moral(cleaned)
+    spec = AnchorSpec(
+        characters=characters,
+        setting=settings or None,
+        props=props,
+        events=events,
+        moral=moral,
+        non_negotiables=[],
+    )
+    spec.non_negotiables = _build_non_negotiables(spec)
+    return spec
+
+
+def _anchor_json_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "characters": {"type": "array", "items": {"type": "string"}},
+            "setting": {"type": ["array", "null"], "items": {"type": "string"}},
+            "props": {"type": "array", "items": {"type": "string"}},
+            "events": {"type": "array", "items": {"type": "string"}},
+            "moral": {"type": ["string", "null"]},
+            "non_negotiables": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": [
+            "characters",
+            "setting",
+            "props",
+            "events",
+            "moral",
+            "non_negotiables",
+        ],
+        "additionalProperties": False,
+    }
+
+
+def _coerce_anchor_spec(data: Any) -> AnchorSpec | None:
+    if not isinstance(data, dict):
+        return None
+    characters = data.get("characters")
+    props = data.get("props")
+    events = data.get("events")
+    if not isinstance(characters, list) or not isinstance(props, list) or not isinstance(events, list):
+        return None
+    setting_value = data.get("setting")
+    if isinstance(setting_value, list):
+        setting = [item for item in setting_value if isinstance(item, str)]
+    elif isinstance(setting_value, str):
+        setting = [setting_value]
+    else:
+        setting = None
+    moral = data.get("moral") if isinstance(data.get("moral"), str) else None
+    non_negotiables_value = data.get("non_negotiables")
+    non_negotiables = (
+        [item for item in non_negotiables_value if isinstance(item, str)]
+        if isinstance(non_negotiables_value, list)
+        else []
+    )
+    return AnchorSpec(
+        characters=[item for item in characters if isinstance(item, str)],
+        setting=setting,
+        props=[item for item in props if isinstance(item, str)],
+        events=[item for item in events if isinstance(item, str)],
+        moral=moral,
+        non_negotiables=non_negotiables,
+    )
+
+
+def _normalize_anchor_spec(spec: AnchorSpec, fallback: AnchorSpec) -> AnchorSpec:
+    characters = _dedupe_preserve_order(spec.characters or fallback.characters)
+    settings = _dedupe_preserve_order(spec.setting or fallback.setting or [])
+    props = _dedupe_preserve_order(spec.props or fallback.props)
+    events = _dedupe_preserve_order(spec.events or fallback.events)
+    if len(events) < 4:
+        events = _dedupe_preserve_order(events + fallback.events)
+    events = events[:10]
+    moral = spec.moral or fallback.moral
+    normalized = AnchorSpec(
+        characters=characters,
+        setting=settings or None,
+        props=props,
+        events=events,
+        moral=moral,
+        non_negotiables=[],
+    )
+    normalized.non_negotiables = (
+        _dedupe_preserve_order(spec.non_negotiables)
+        if spec.non_negotiables
+        else _build_non_negotiables(normalized)
+    )
+    return normalized
+
+
+def _request_openai_anchor_spec(
+    client,
+    system_prompt: str,
+    user_prompt: str,
+    use_responses: bool,
+) -> str:
+    if use_responses and hasattr(client.responses, "parse"):
+        schema = _anchor_json_schema()
+        input_messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        result = client.responses.parse(
+            model=_DEFAULT_MODEL,
+            input=input_messages,
+            temperature=0.2,
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "anchor_spec",
+                    "schema": schema,
+                    "strict": True,
+                }
+            },
+            max_output_tokens=500,
+        )
+        parsed = getattr(result, "output_parsed", None)
+        if parsed is not None:
+            return json.dumps(parsed)
+        return _extract_response_text(result)
+
+    if use_responses:
+        schema = _anchor_json_schema()
+        response = client.responses.create(
+            model=_DEFAULT_MODEL,
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "anchor_spec",
+                    "schema": schema,
+                    "strict": True,
+                }
+            },
+            max_output_tokens=500,
+        )
+        return _extract_response_text(response)
+
+    response = client.chat.completions.create(
+        model=_DEFAULT_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.2,
+        response_format={"type": "json_object"},
+        max_tokens=500,
+    )
+    return response.choices[0].message.content if response.choices else ""
+
+
+def _openai_http_anchor_spec(system_prompt: str, user_prompt: str) -> tuple[str, str]:
+    schema = _anchor_json_schema()
+    responses_payload = {
+        "model": _DEFAULT_MODEL,
+        "input": [
+            {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
+            {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
+        ],
+        "temperature": 0.2,
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "anchor_spec",
+                "schema": schema,
+                "strict": True,
+            }
+        },
+        "max_output_tokens": 500,
+    }
+    try:
+        response_data = _post_openai_request(
+            "https://api.openai.com/v1/responses",
+            responses_payload,
+        )
+        content = _extract_http_response_text(response_data)
+        if content:
+            return content, "responses"
+    except Exception as exc:
+        print(f"OpenAI HTTP responses anchor call failed: {exc}")
+
+    chat_payload = {
+        "model": _DEFAULT_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.2,
+    }
+    response_data = _post_openai_request(
+        "https://api.openai.com/v1/chat/completions",
+        chat_payload,
+    )
+    content = _extract_http_chat_text(response_data)
+    return content, "chat.completions"
+
+
+def _openai_anchor_spec(cleaned: str) -> AnchorSpec | None:
+    if not os.getenv("OPENAI_API_KEY"):
+        return None
+    system_prompt = (
+        "You extract canon anchors from a transcript for a children's story. "
+        "Return ONLY strict JSON that follows the schema exactly."
+    )
+    user_prompt = (
+        "Extract canon anchors from this transcript. "
+        "Provide characters, setting, props, ordered events (4-10 beats), "
+        "optional moral/lesson, and non-negotiables.\n\n"
+        f"TRANSCRIPT:\n{cleaned or 'Empty transcript.'}"
+    )
+    client = _get_openai_client()
+    try:
+        if client:
+            use_responses = hasattr(client, "responses")
+            content = _request_openai_anchor_spec(
+                client, system_prompt, user_prompt, use_responses
+            )
+        else:
+            content, endpoint = _openai_http_anchor_spec(system_prompt, user_prompt)
+            print(f"OpenAI endpoint: {endpoint} (HTTP)")
+    except Exception as exc:
+        print(f"OpenAI anchor extraction failed: {exc}")
+        return None
+    if not content:
+        return None
+    data = _parse_json(content)
+    return _coerce_anchor_spec(data)
+
+
+def extract_story_anchors(cleaned_transcript: str) -> AnchorSpec:
+    cleaned = cleaned_transcript or ""
+    local_spec = _local_anchor_spec(cleaned)
+    if _use_openai_story_mode():
+        openai_spec = _openai_anchor_spec(cleaned)
+        if openai_spec:
+            return _normalize_anchor_spec(openai_spec, local_spec)
+    return local_spec
 
 
 def _build_anchor_list(cleaned: str, narrator: str | None) -> list[str]:
