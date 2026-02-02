@@ -2527,7 +2527,7 @@ def _story_json_schema(target_pages: int) -> dict[str, Any]:
                 },
             },
         },
-        "required": ["title", "subtitle", "pages"],
+        "required": ["title", "subtitle", "narrator", "pages"],
         "additionalProperties": False,
     }
 
