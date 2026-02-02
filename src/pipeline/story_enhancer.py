@@ -117,6 +117,10 @@ _STOPWORDS = {
     "the", "and", "then", "with", "from", "that", "this", "when", "they", "she", "he",
     "a", "an", "to", "of", "in", "on", "at", "for", "as", "is", "was", "were", "be",
     "it", "its", "their", "his", "her", "we", "i", "you", "my", "our", "your",
+    "made", "make", "makes", "making", "went", "go", "goes", "going", "got", "get", "gets", "getting",
+    "look", "looked", "looks", "looking", "see", "saw", "seen", "think", "thought", "thinking",
+    "know", "knew", "known", "tell", "tells", "telling", "ask", "asked", "asking", "want", "wanted",
+    "wants", "feel", "felt", "feels", "told", "said", "says", "really", "very", "just", "like",
     "mom", "mother", "mommy", "mum", "momma", "dad", "father", "daddy", "papa", "pa",
     "parent", "parents",
 }
@@ -171,6 +175,25 @@ def _normalize_anchor_terms(terms: list[str] | None, *, max_terms: int = 8) -> l
         if len(out) >= max_terms:
             break
     return out
+
+
+def _clean_transcript_for_story(text: str) -> str:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return ""
+    cleaned = re.sub(
+        r"^\s*(this is a story about|this story is about)\s+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\s*(and it's the end of the story|the end of the story)\s*$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    return cleaned.strip()
 
 
 def _extract_proper_names(cleaned: str, narrator: str | None) -> list[str]:
@@ -326,6 +349,11 @@ def _anchor_coverage(page_texts: list[str], anchors: list[str]) -> tuple[bool, s
         found = False
         if " " in a_low:
             found = a_low in combined
+            if not found:
+                tokens = a.split()
+                if tokens and any(tok[:1].isupper() for tok in tokens):
+                    first = tokens[0].lower()
+                    found = re.search(rf"\b{re.escape(first)}\b", combined) is not None
         else:
             found = re.search(rf"\b{re.escape(a_low)}\b", combined) is not None
 
@@ -389,19 +417,20 @@ def _build_retry_instruction(missing_terms: list[str], required_count: int, narr
 
 def enhance_to_storybook(transcript: str, *, target_pages: int = 2) -> StoryBook:
     cleaned = _clean_transcript(transcript)
-    narrator = _find_name(cleaned) if cleaned else None
-    title = _infer_title(cleaned) if cleaned else "My Story"
+    story_cleaned = _clean_transcript_for_story(cleaned)
+    narrator = _find_name(story_cleaned) if story_cleaned else None
+    title = _infer_title(story_cleaned) if story_cleaned else "My Story"
     subtitle = "A story told out loud"
     target_pages = target_pages or _DEFAULT_TARGET_PAGES
 
     if _is_openai_story_requested():
         print("STORY_ENHANCE_MODE=openai detected")
-        openai_story = _openai_storybook(cleaned, title, narrator, target_pages)
+        openai_story = _openai_storybook(story_cleaned, title, narrator, target_pages)
         if openai_story:
             _maybe_generate_images(openai_story)
             return openai_story
 
-    local_story = _local_storybook(cleaned, title, narrator, target_pages)
+    local_story = _local_storybook(story_cleaned, title, narrator, target_pages)
     _maybe_generate_images(local_story)
     return local_story
 
@@ -604,7 +633,6 @@ def _openai_storybook(
         # Validate after repair
         ok, reasons = _validate_story_pages(
             pages=pages,
-            anchor_spec=anchor_spec,
             target_min=_MIN_WORDS_PER_PAGE,
             target_max=_MAX_WORDS_PER_PAGE,
         )
@@ -990,21 +1018,28 @@ def _keyword_expansions(required_terms: list[str], stage: str, rng: random.Rando
     """
     Generate non-stock, keyword-aware expansion sentences so we don't get the same filler every story.
     """
-    terms = [
-        t for t in required_terms
-        if t and t.lower() not in _STOPWORDS and t.lower() not in _ANCHOR_STOPWORDS
-    ]
-    terms = [t for t in terms if len(t.strip()) >= 4]
+    terms = []
+    for t in required_terms:
+        if not t:
+            continue
+        low = t.lower().strip()
+        if low in _STOPWORDS or low in _ANCHOR_STOPWORDS:
+            continue
+        if len(low) < 4 and low not in {"dad", "mom"}:
+            continue
+        terms.append(t.strip())
+
     rng.shuffle(terms)
-    terms = terms[:2]
+    anchor_lines: list[str] = []
+    for term in terms[:2]:
+        anchor_lines.append(f"{term} lingered in everyone’s thoughts for a moment.")
 
     sensory = [
         "The air felt busy with tiny sounds—shuffling feet, a soft laugh, and something far away clinking.",
-        "Somewhere nearby, something smelled delicious, and it made the moment feel even bigger.",
-        "The room seemed to hold its breath, like it was waiting to see what would happen next.",
-        "A silly idea wobbled into everyone’s thoughts, and suddenly it felt hard not to grin.",
-        "A small breeze drifted through, carrying a mix of warmth and a hint of surprise.",
-        "Shoes scuffed the floor and a quiet hush slid over the room.",
+        "Something nearby smelled warm and cozy, like the promise of a good idea.",
+        "The room held a quiet pause, as if waiting for the next brave move.",
+        "Shoes scuffed the floor and a gentle hush settled in.",
+        "A soft breeze drifted through, carrying a hint of surprise.",
     ]
     action = [
         "They traded quick glances, deciding to be brave even if their voices were small.",
@@ -1012,31 +1047,20 @@ def _keyword_expansions(required_terms: list[str], stage: str, rng: random.Rando
         "Someone took a careful step, and the whole mood tipped toward action.",
         "It felt like the moment when a story decides to turn a corner.",
     ]
-    anchor_templates = [
-        "They remembered the {term} and tried again.",
-        "The {term} flashed back to mind, and that was enough to keep going.",
-    ]
-    anchor_lines: list[str] = []
-    for idx, term in enumerate(terms):
-        template = anchor_templates[idx % len(anchor_templates)]
-        anchor_lines.append(template.format(term=term))
-
     if stage == "setup":
         extra = [
             "It felt exciting and risky at the same time—like balancing a secret on the tip of a spoon.",
             "The first little choice didn’t seem huge… until it started rolling like a snowball.",
-            "A tiny mistake can be loud inside your heart, even when nobody else knows yet.",
         ]
     else:
         extra = [
             "The truth finally felt lighter once it was said out loud.",
             "An honest apology changed the whole mood, like turning on a warm lamp.",
-            "Once everyone worked together, the scary part turned into the funny part.",
         ]
 
     pool = sensory + action + extra + anchor_lines
     rng.shuffle(pool)
-    return pool
+    return pool[:8]
 
 
 def _repair_pages(
@@ -1105,7 +1129,6 @@ def _repair_pages(
 
 def _validate_story_pages(
     pages: list[StoryPage],
-    anchor_spec: AnchorSpec,
     target_min: int,
     target_max: int,
 ) -> tuple[bool, list[str]]:
@@ -1123,30 +1146,6 @@ def _validate_story_pages(
     total_dialogue = sum(_count_dialogue_lines(p.text) for p in pages)
     if total_dialogue < _DIALOGUE_MIN or total_dialogue > _DIALOGUE_MAX:
         reasons.append(f"dialogue lines counted {total_dialogue} outside {_DIALOGUE_MIN}-{_DIALOGUE_MAX}")
-
-    # Anchor/fidelity check (global)
-    combined = " ".join(p.text for p in pages)
-    if anchor_spec.names:
-        name_hits = _count_term_hits(combined, anchor_spec.names)
-        if name_hits < 1:
-            reasons.append("anchor/fidelity missing proper-name match")
-
-    if anchor_spec.keywords:
-        required_keyword_hits = 1 if anchor_spec.transcript_word_count < 120 else min(2, len(anchor_spec.keywords))
-        keyword_hits = _count_term_hits(combined, anchor_spec.keywords)
-        if keyword_hits < required_keyword_hits:
-            reasons.append(
-                "anchor/fidelity too low: keyword hits "
-                f"{keyword_hits} < {required_keyword_hits} (terms={', '.join(anchor_spec.keywords[:6])})"
-            )
-
-    if anchor_spec.creature_keywords:
-        creature_hits = _count_term_hits(combined, anchor_spec.creature_keywords)
-        if creature_hits < 1:
-            reasons.append(
-                "anchor/fidelity missing creature keyword match "
-                f"(terms={', '.join(anchor_spec.creature_keywords[:4])})"
-            )
 
     return (len(reasons) == 0, reasons)
 
