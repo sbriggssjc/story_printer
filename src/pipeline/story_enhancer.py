@@ -1419,6 +1419,8 @@ def _openai_storybook(
     fidelity_note: str | None = None
     anchor_tokens = _extract_anchor_tokens(cleaned_transcript, narrator)
     coverage_note: str | None = None
+    padding_candidates = _anchor_padding_sentences(anchor_spec, narrator)
+    used_sentences: set[str] = set()
 
     repeat_sentence_note: str | None = None
     for attempt in range(2):
@@ -1530,6 +1532,7 @@ def _openai_storybook(
                     [],
                     target_pages,
                     banned_phrases=banned_phrases,
+                )
                 user_prompt = (
                     f"{user_prompt}\n\nIssues:\n- "
                     + "\n- ".join([f"contains banned filler phrase: {p}" for p in banned_phrases])
@@ -1586,6 +1589,9 @@ def _openai_storybook(
                     [],
                     target_pages,
                     fidelity_result=fidelity_result,
+                )
+                continue
+            return None
         coverage_ok, coverage_summary = _anchor_token_coverage(all_text, anchor_tokens)
         if not coverage_ok:
             coverage_note = coverage_summary
