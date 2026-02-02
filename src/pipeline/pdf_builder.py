@@ -168,7 +168,10 @@ def render_story_pdf(
         if hasattr(page, "get_image_path"):
             image_path = page.get_image_path()
         if not image_path:
-            image_path = getattr(page, "image_path", None) or getattr(page, "illustration_path", None)
+            image_path = (
+                getattr(page, "image_path", None)
+                or getattr(page, "illustration_path", None)
+            )
         if image_path and Path(image_path).exists():
             image = ImageReader(image_path)
             img_w, img_h = image.getSize()
