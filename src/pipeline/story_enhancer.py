@@ -24,6 +24,8 @@ from typing import Any
 from urllib import request
 from urllib.error import HTTPError
 
+from pydantic import BaseModel
+
 from src.pipeline.story_builder import StoryBook, StoryPage, _clean_transcript, _find_name, _infer_title
 
 _DEFAULT_MODEL = os.getenv("STORY_MODEL", "gpt-4o-mini")
@@ -31,6 +33,7 @@ _DEFAULT_TEMPERATURE = float(os.getenv("STORY_TEMPERATURE", "0.8"))
 _DEFAULT_TARGET_PAGES = int(os.getenv("STORY_TARGET_PAGES", "2"))
 _DEFAULT_WORDS_PER_PAGE = int(os.getenv("STORY_WORDS_PER_PAGE", "280"))
 _DEFAULT_STYLE = os.getenv("STORY_STYLE", "whimsical, funny, heartwarming")
+_DEFAULT_FIDELITY_MODEL = os.getenv("STORY_FIDELITY_MODEL", _DEFAULT_MODEL)
 _MIN_WORDS_PER_PAGE = max(240, _DEFAULT_WORDS_PER_PAGE - 40)
 _MAX_WORDS_PER_PAGE = min(320, _DEFAULT_WORDS_PER_PAGE + 40)
 
@@ -62,6 +65,15 @@ _BANNED_PHRASES = [
 ]
 
 
+class AnchorSpec(BaseModel):
+    characters: list[str]
+    key_objects: list[str]
+    setting: str | None
+    beats: list[str]
+    lesson: str | None = None
+    must_not_change: list[str] = []
+
+
 def _split_sentences_for_dedupe(text: str) -> list[str]:
     if not text:
         return []
@@ -74,6 +86,32 @@ def _split_sentences(text: str) -> list[str]:
     # Simple sentence split; good enough for children’s prose
     parts = re.split(r"(?<=[.!?])\s+", (text or "").strip())
     return [p.strip() for p in parts if p and p.strip()]
+
+
+def _split_transcript_into_beats(cleaned: str, *, min_beats: int = 4, max_beats: int = 10) -> list[str]:
+    if not cleaned:
+        return []
+    sentences = _split_sentences(cleaned)
+    beats: list[str] = []
+    for sentence in sentences:
+        chunk = sentence.strip()
+        if not chunk:
+            continue
+        pieces = re.split(r"\b(?:and then|then|and|but|so)\b", chunk, flags=re.IGNORECASE)
+        for piece in pieces:
+            trimmed = piece.strip(" ,;:").strip()
+            if len(trimmed.split()) < 3:
+                continue
+            beats.append(trimmed)
+        if len(beats) >= max_beats:
+            break
+    if len(beats) < min_beats:
+        for sentence in sentences:
+            if sentence not in beats:
+                beats.append(sentence)
+            if len(beats) >= min_beats:
+                break
+    return beats[:max_beats]
 
 
 def _dedupe_cross_page_sentences(pages: list[StoryPage]) -> bool:
@@ -340,42 +378,61 @@ def _build_anchor_list(cleaned: str, narrator: str | None) -> list[str]:
     return anchors
 
 
-def _build_anchor_beats(cleaned: str) -> dict[str, bool]:
-    lower = (cleaned or "").lower()
-    return {
-        "pizza": "pizza" in lower,
-        "crust": "crust" in lower,
-        "monster": "monster" in lower,
-        "horse": "horse" in lower,
-        "dad": "dad" in lower or "father" in lower,
-    }
-
-
-def _anchor_ok(text: str, beats: dict[str, bool]) -> tuple[bool, list[str]]:
-    t = (text or "").lower()
-    missing = []
-    if beats.get("pizza") and "pizza" not in t:
-        missing.append("pizza")
-    if beats.get("crust") and "crust" not in t:
-        missing.append("crust")
-    if beats.get("monster") and "monster" not in t:
-        missing.append("monster")
-    if beats.get("horse") and "horse" not in t:
-        missing.append("horse")
-    if beats.get("dad") and ("dad" not in t and "father" not in t):
-        missing.append("dad")
-    return (len(missing) == 0, missing)
-
-
-def _extract_fidelity_keywords(cleaned: str) -> list[str]:
-    # small, pragmatic: keep the “story spine”
+def _infer_setting(cleaned: str) -> str | None:
     lowered = (cleaned or "").lower()
-    must = []
-    for k in ["pizza", "crust", "monster", "apolog", "laugh"]:
-        if k in lowered:
-            must.append(k)
-    # if transcript is tiny, at least demand 2 anchors
-    return must[:4]
+    for setting in ("kitchen", "yard", "garden", "classroom", "living room", "park", "school"):
+        if setting in lowered:
+            return setting
+    return None
+
+
+def _build_anchor_spec(cleaned: str, narrator: str | None) -> AnchorSpec:
+    characters: list[str] = []
+    seen_characters: set[str] = set()
+    for name in _extract_proper_names(cleaned, narrator):
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen_characters:
+            continue
+        characters.append(name)
+        seen_characters.add(key)
+    lowered = (cleaned or "").lower()
+    if "dad" in lowered or "father" in lowered:
+        if "dad" not in seen_characters:
+            characters.append("Dad")
+            seen_characters.add("dad")
+    if "mom" in lowered or "mother" in lowered:
+        if "mom" not in seen_characters:
+            characters.append("Mom")
+            seen_characters.add("mom")
+
+    key_objects: list[str] = []
+    seen_objects: set[str] = set()
+    if "pizza" in lowered and "crust" in lowered:
+        key_objects.append("pizza crust")
+        seen_objects.add("pizza crust")
+    for phrase in _extract_noun_phrases(cleaned, min_count=2, max_count=6):
+        normalized = phrase.lower()
+        if normalized in seen_objects:
+            continue
+        key_objects.append(phrase)
+        seen_objects.add(normalized)
+
+    beats = _split_transcript_into_beats(cleaned)
+    lesson = "apology and honesty" if "sorry" in lowered or "apolog" in lowered else None
+    must_not_change = []
+    if characters:
+        must_not_change.append(f"Do not rename these characters: {', '.join(characters)}.")
+
+    return AnchorSpec(
+        characters=characters,
+        key_objects=key_objects,
+        setting=_infer_setting(cleaned),
+        beats=beats,
+        lesson=lesson,
+        must_not_change=must_not_change,
+    )
 
 
 def _fails_fidelity(pages_text: str, must_keywords: list[str]) -> tuple[list[str], list[str]]:
@@ -390,6 +447,181 @@ def _fails_fidelity(pages_text: str, must_keywords: list[str]) -> tuple[list[str
             reasons.append(f"contains banned filler phrase: {phrase}")
             banned_phrases.append(phrase)
     return reasons, banned_phrases
+
+
+def _fidelity_json_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "pass": {"type": "boolean"},
+            "issues": {"type": "array", "items": {"type": "string"}},
+            "missing_beats": {"type": "array", "items": {"type": "string"}},
+            "contradictions": {"type": "array", "items": {"type": "string"}},
+            "drift_score": {"type": "number", "minimum": 0, "maximum": 1},
+        },
+        "required": ["pass", "issues", "missing_beats", "contradictions", "drift_score"],
+        "additionalProperties": False,
+    }
+
+
+def _request_openai_fidelity_check(
+    client,
+    anchor_spec: AnchorSpec,
+    story_payload: dict[str, Any],
+    use_responses: bool,
+) -> dict[str, Any]:
+    system_prompt = (
+        "You are a strict story fidelity evaluator. Compare the story against the anchors. "
+        "Check beat coverage (each anchor beat must appear in order), "
+        "entity consistency (names/props persist), and contradictions (no inversion of canon). "
+        "Return ONLY the JSON object that matches the schema."
+    )
+    anchor_json = json.dumps(anchor_spec.model_dump(), ensure_ascii=False, indent=2)
+    story_json = json.dumps(story_payload, ensure_ascii=False, indent=2)
+    user_prompt = (
+        "ANCHORS JSON:\n"
+        f"{anchor_json}\n\n"
+        "STORY JSON:\n"
+        f"{story_json}\n"
+    )
+
+    if use_responses and hasattr(client, "responses") and hasattr(client.responses, "parse"):
+        schema = _fidelity_json_schema()
+        result = client.responses.parse(
+            model=_DEFAULT_FIDELITY_MODEL,
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0,
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "fidelity_check",
+                    "schema": schema,
+                    "strict": True,
+                }
+            },
+            max_output_tokens=600,
+        )
+        parsed = getattr(result, "output_parsed", None)
+        if parsed is not None:
+            return parsed
+        raw = _extract_response_text(result)
+        return json.loads(raw) if raw else {}
+
+    if use_responses and hasattr(client, "responses"):
+        schema = _fidelity_json_schema()
+        response = client.responses.create(
+            model=_DEFAULT_FIDELITY_MODEL,
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0,
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "fidelity_check",
+                    "schema": schema,
+                    "strict": True,
+                }
+            },
+            max_output_tokens=600,
+        )
+        raw = _extract_response_text(response)
+        return json.loads(raw) if raw else {}
+
+    response = client.chat.completions.create(
+        model=_DEFAULT_FIDELITY_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0,
+        response_format={"type": "json_object"},
+        max_tokens=600,
+    )
+    content = response.choices[0].message.content if response.choices else "{}"
+    return json.loads(content)
+
+
+def _request_openai_fidelity_http(
+    anchor_spec: AnchorSpec,
+    story_payload: dict[str, Any],
+) -> tuple[dict[str, Any], str]:
+    schema = _fidelity_json_schema()
+    system_prompt = (
+        "You are a strict story fidelity evaluator. Compare the story against the anchors. "
+        "Check beat coverage (each anchor beat must appear in order), "
+        "entity consistency (names/props persist), and contradictions (no inversion of canon). "
+        "Return ONLY the JSON object that matches the schema."
+    )
+    anchor_json = json.dumps(anchor_spec.model_dump(), ensure_ascii=False, indent=2)
+    story_json = json.dumps(story_payload, ensure_ascii=False, indent=2)
+    user_prompt = (
+        "ANCHORS JSON:\n"
+        f"{anchor_json}\n\n"
+        "STORY JSON:\n"
+        f"{story_json}\n"
+    )
+
+    responses_payload = {
+        "model": _DEFAULT_FIDELITY_MODEL,
+        "input": [
+            {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
+            {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
+        ],
+        "temperature": 0,
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "fidelity_check",
+                "schema": schema,
+                "strict": True,
+            }
+        },
+        "max_output_tokens": 600,
+    }
+    try:
+        response_data = _post_openai_request(
+            "https://api.openai.com/v1/responses",
+            responses_payload,
+        )
+        content = _extract_http_response_text(response_data)
+        if content:
+            return json.loads(content), "responses"
+    except Exception as exc:
+        print(f"OpenAI HTTP fidelity responses call failed: {exc}")
+
+    chat_payload = {
+        "model": _DEFAULT_FIDELITY_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0,
+    }
+    response_data = _post_openai_request(
+        "https://api.openai.com/v1/chat/completions",
+        chat_payload,
+    )
+    content = _extract_http_chat_text(response_data)
+    return json.loads(content) if content else {}, "chat.completions"
+
+
+def _summarize_fidelity_issues(result: dict[str, Any]) -> str:
+    issues = [str(item) for item in result.get("issues") or []]
+    missing_beats = [str(item) for item in result.get("missing_beats") or []]
+    contradictions = [str(item) for item in result.get("contradictions") or []]
+    parts: list[str] = []
+    if missing_beats:
+        parts.append("Missing beats:\n- " + "\n- ".join(missing_beats))
+    if contradictions:
+        parts.append("Contradictions:\n- " + "\n- ".join(contradictions))
+    if issues:
+        parts.append("Other issues:\n- " + "\n- ".join(issues))
+    return "\n".join(parts).strip()
 
 
 def enhance_to_storybook(transcript: str, *, target_pages: int = 2) -> StoryBook:
@@ -437,7 +669,7 @@ def _get_openai_client():
 
 def _build_openai_prompts(
     cleaned: str, narrator: str | None, target_pages: int
-) -> tuple[str, str, list[str]]:
+) -> tuple[str, str, AnchorSpec]:
     system_prompt = (
         "You are a celebrated children's picture-book author and editor. "
         "Expand the transcript into a rich, creative, kid-safe story (not a summary). "
@@ -454,8 +686,10 @@ def _build_openai_prompts(
         "7) Funny resolution.\n"
         "8) Warm ending with emotional lift.\n"
     )
-    anchors = _build_anchor_list(cleaned, narrator)
-    anchor_line = ", ".join(anchors) if anchors else "none"
+    anchor_terms = _build_anchor_list(cleaned, narrator)
+    anchor_line = ", ".join(anchor_terms) if anchor_terms else "none"
+    anchor_spec = _build_anchor_spec(cleaned, narrator)
+    anchor_json = json.dumps(anchor_spec.model_dump(), ensure_ascii=False, indent=2)
     user_prompt = (
         "TRANSCRIPT (core plot MUST be preserved; you may rephrase sentences, but do not invent new major events):\n"
         f"{cleaned or 'Empty transcript.'}\n\n"
@@ -478,9 +712,14 @@ def _build_openai_prompts(
         "- Do NOT repeat any exact sentence across pages. Each sentence must be unique.\n"
         "- Keep names consistent; use narrator if provided.\n"
         f"- Your story MUST include all anchors exactly once or more: {anchor_line}.\n"
+        "- You MUST include each anchor beat in order (paraphrase is allowed).\n"
+        "- Do not change any character identities or swap roles.\n"
+        "- You may add whimsical details, but do not add new major plotlines.\n"
         f"- {_MIN_WORDS_PER_PAGE}–{_MAX_WORDS_PER_PAGE} words per page (target {_DEFAULT_WORDS_PER_PAGE}).\n"
         "- Each page must include a rich illustration_prompt in consistent watercolor picture-book style.\n"
         f"{beat_sheet}\n"
+        "ANCHORS JSON (use this as ground truth):\n"
+        f"{anchor_json}\n\n"
         "OUTPUT JSON schema:\n"
         "{"
         '"title": string, '
@@ -506,7 +745,7 @@ def _build_openai_prompts(
         + "\n".join([f"  - {s}" for s in sorted(_BLOCKLIST_SENTENCES)])
         + "\n"
     )
-    return system_prompt, user_prompt, anchors
+    return system_prompt, user_prompt, anchor_spec
 
 
 def _openai_storybook(
@@ -527,10 +766,10 @@ def _openai_storybook(
 
     print(f"OpenAI model: {_DEFAULT_MODEL}")
 
-    system_prompt, user_prompt, anchors = _build_openai_prompts(
+    system_prompt, user_prompt, anchor_spec = _build_openai_prompts(
         cleaned, narrator, target_pages
     )
-    missing_anchor_note: list[str] = []
+    fidelity_note: str | None = None
 
     for attempt in range(2):
         correction = ""
@@ -544,11 +783,11 @@ def _openai_storybook(
                 "- Do not use quotation marks for emphasis or any other purpose.\n"
                 "- Return ONLY JSON matching the schema. No extra keys, no commentary."
             )
-            if missing_anchor_note:
+            if fidelity_note:
                 correction += (
-                    "\nMissing anchors from previous attempt:\n- "
-                    + "\n- ".join(missing_anchor_note)
-                    + "\nEnsure every anchor appears at least once."
+                    "\nFidelity fixes required (be surgical; keep tone and length):\n"
+                    f"{fidelity_note}\n"
+                    "Fix the specific beats/contradictions without adding new major plotlines."
                 )
         try:
             if client:
@@ -627,41 +866,50 @@ def _openai_storybook(
             print(f"OpenAI enhancement failed: invalid output ({'; '.join(reasons)}).")
             return None
 
-        all_text = " ".join(
-            [
-                (p.get("text") or "")
-                for p in (data.get("pages") or [])
-                if isinstance(p, dict)
-            ]
-        )
-        must = _extract_fidelity_keywords(cleaned)
-        fidelity_reasons, banned_phrases = _fails_fidelity(all_text, must)
-        if fidelity_reasons:
-            print(f"Fidelity failed: {', '.join(fidelity_reasons)}")
+        page_texts = [page.text for page in pages]
+        all_text = " ".join(page_texts)
+        _, banned_phrases = _fails_fidelity(all_text, [])
+        if banned_phrases:
+            print(f"Fidelity failed: contains banned filler phrases: {', '.join(banned_phrases)}")
             if attempt == 0:
-                retry_instruction = ""
-                if banned_phrases:
-                    retry_instruction = (
-                        "\nDo not use any of these phrases: "
-                        + "; ".join(banned_phrases)
-                        + ". Replace them with fresh, specific detail from the transcript."
-                    )
                 user_prompt = (
                     f"{user_prompt}\n\nIssues:\n- "
-                    + "\n- ".join(fidelity_reasons)
+                    + "\n- ".join([f"contains banned filler phrase: {p}" for p in banned_phrases])
                     + "\n\nRewrite while keeping the transcript’s core events EXACT."
-                    + retry_instruction
                 )
                 continue
             return None
 
-        page_texts = [page.text for page in pages]
-        beat_map = _build_anchor_beats(cleaned)
-        ok, missing_beats = _anchor_ok(" ".join(page_texts), beat_map)
-        if not ok:
-            print(f"Anchor validation failed: {', '.join(missing_beats)}")
+        story_payload = {
+            "title": (data.get("title") or title).strip() or title,
+            "subtitle": (data.get("subtitle") or "A story told out loud").strip()
+            or "A story told out loud",
+            "narrator": data.get("narrator") or narrator,
+            "pages": [
+                {"text": page.text, "illustration_prompt": page.illustration_prompt}
+                for page in pages
+            ],
+        }
+        try:
+            if client:
+                use_responses = hasattr(client, "responses")
+                fidelity_result = _request_openai_fidelity_check(
+                    client, anchor_spec, story_payload, use_responses
+                )
+                print("OpenAI fidelity check: SDK")
+            else:
+                fidelity_result, fidelity_endpoint = _request_openai_fidelity_http(
+                    anchor_spec, story_payload
+                )
+                print(f"OpenAI fidelity check: HTTP ({fidelity_endpoint})")
+        except Exception as exc:
+            print(f"OpenAI fidelity check failed: {exc}")
+            fidelity_result = {"pass": True}
+
+        if not fidelity_result.get("pass", False):
+            fidelity_note = _summarize_fidelity_issues(fidelity_result)
+            print("Fidelity failed via anchor check.")
             if attempt == 0:
-                missing_anchor_note = missing_beats
                 continue
             return None
 
