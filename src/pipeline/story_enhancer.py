@@ -96,22 +96,27 @@ def _split_sentences(text: str) -> list[str]:
     return [p.strip() for p in parts if p and p.strip()]
 
 
-def _dedupe_cross_page_sentences(pages: list[StoryPage]) -> bool:
+def _dedupe_cross_page_sentences(pages: list[StoryPage], min_words: int) -> bool:
     """
-    Removes any sentence that appears verbatim on an earlier page.
+    Removes any sentence that appears verbatim on an earlier page if the page
+    still stays above the minimum word count.
     Returns True if it modified anything.
     """
     seen: set[str] = set()
     changed = False
 
     for page in pages:
+        page_word_count = _word_count(page.text)
         sents = _split_sentences(page.text)
         out: list[str] = []
         for s in sents:
             key = re.sub(r"\s+", " ", s.strip())
             if key in seen:
-                changed = True
-                continue
+                sentence_words = _word_count(s)
+                if page_word_count - sentence_words >= min_words:
+                    changed = True
+                    page_word_count -= sentence_words
+                    continue
             out.append(s)
             seen.add(key)
 
@@ -1171,6 +1176,7 @@ def _openai_storybook(
     )
     fidelity_note: str | None = None
 
+    repeat_sentence_note: str | None = None
     for attempt in range(2):
         correction = ""
         if attempt == 1:
@@ -1190,6 +1196,11 @@ def _openai_storybook(
                     "\nFidelity fixes required (be surgical; keep tone and length):\n"
                     f"{fidelity_note}\n"
                     "Fix the specific beats/contradictions only; keep page order and structure."
+                )
+            if repeat_sentence_note:
+                correction += (
+                    "\nRepeated sentence fix required (be surgical; keep structure unchanged):\n"
+                    f"{repeat_sentence_note}\n"
                 )
         try:
             if client:
@@ -1243,7 +1254,7 @@ def _openai_storybook(
             pages[-1].text = _ensure_dialogue_count(pages[-1].text, target_lines=2)
 
         # Remove any verbatim repeated sentences across pages, then re-pad to hit min words.
-        if _dedupe_cross_page_sentences(pages):
+        if _dedupe_cross_page_sentences(pages, _MIN_WORDS_PER_PAGE):
             for page in pages:
                 page.text = _pad_to_min_words_no_repeats(
                     page.text,
@@ -1252,10 +1263,22 @@ def _openai_storybook(
                     used_sentences,
                 )
 
+        remaining_dupes = _find_duplicate_sentences_across_pages([page.text for page in pages])
+        if remaining_dupes:
+            repeat_sentence_note = (
+                "Rewrite ONLY this sentence everywhere it appears, leaving everything else unchanged:\n"
+                f"Sentence: \"{remaining_dupes[0]}\""
+            )
+
         valid, reasons = _validate_story_pages(pages, target_pages)
         if not valid:
             print(f"Validation failed: {', '.join(reasons)}")
             if attempt == 0:
+                if repeat_sentence_note and all(
+                    reason.startswith("repeated sentence across pages:") for reason in reasons
+                ):
+                    continue
+                repeat_sentence_note = None
                 user_prompt = (
                     f"{user_prompt}\n\n"
                     "Your previous attempt failed validation. Fix ALL issues below:\n"
