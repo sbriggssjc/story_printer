@@ -1737,7 +1737,6 @@ def _build_openai_prompts(
     anchor_json = json.dumps(anchor_spec.model_dump(), ensure_ascii=False, indent=2)
     facts = plot_facts.get("facts", [])
     entities = plot_facts.get("entities", [])
-    facts_lines = "\n".join([f"- {fact}" for fact in facts]) or "- (none)"
     entity_lines = "\n".join([f"- {entity}" for entity in entities]) or "- (none)"
     anchor_fact_lines: list[str] = []
     if anchor_spec.characters:
@@ -1758,9 +1757,8 @@ def _build_openai_prompts(
             anchor_fact_lines.append(f"The plot includes this beat: {trimmed}")
     if anchor_spec.lesson:
         anchor_fact_lines.append(f"The underlying lesson is: {anchor_spec.lesson}.")
-    anchor_fact_text = (
-        "\n".join([f"- {fact}" for fact in anchor_fact_lines]) or "- (none)"
-    )
+    anchor_lines = _dedupe_preserve_order([*facts, *anchor_fact_lines])
+    anchor_fact_text = "\n".join([f"- {fact}" for fact in anchor_lines]) or "- (none)"
     user_prompt = (
         "Use the AnchorSpec JSON below and the plot facts as the ONLY sources of plot truth. "
         "Do not invent new major plotlines beyond what the plot facts and anchors imply.\n\n"
@@ -1778,6 +1776,7 @@ def _build_openai_prompts(
         "- Do NOT repeat any exact sentence across pages. Each sentence must be unique.\n"
         "- Keep names consistent; use narrator if provided.\n"
         "- You MUST include each anchor beat in order (paraphrase is allowed).\n"
+        "- MUST include these plot anchors (paraphrase ok).\n"
         "- Ensure entity consistency: characters, key_objects, and setting stay the same.\n"
         "- Do not change any character identities or swap roles.\n"
         "- Do not invert motivations (explicitly: if transcript says “did not want X” you must not say “wanted X”).\n"
@@ -1797,19 +1796,17 @@ def _build_openai_prompts(
         "- The story must read like a real picture-book narrative, not an outline or recap.\n"
         "- Use anchors as facts to weave into the plot naturally.\n\n"
         f"{beat_sheet}\n"
-        "MUST KEEP TRUE FACTS (do not change these; list them verbatim):\n"
-        f"{facts_lines}\n\n"
+        "ANCHORS (must include these plot facts, paraphrase ok):\n"
+        f"{anchor_fact_text}\n\n"
         "ENTITIES (names to keep consistent):\n"
         f"{entity_lines}\n\n"
-        "Must-keep story facts to weave in naturally (do NOT list these in the story):\n"
-        f"{anchor_fact_text}\n\n"
         "ANCHORS JSON (use this as ground truth):\n"
         f"{anchor_json}\n\n"
         "OUTPUT JSON schema:\n"
         "{"
         '"title": string, '
         '"subtitle": string, '
-        '"narrator": string|null, '
+        '"narrator": string|null (optional), '
         '"pages": ['
         '{"text": string, "illustration_prompt": string}'
         "]"
@@ -2340,7 +2337,7 @@ def _story_json_schema(target_pages: int) -> dict[str, Any]:
                 },
             },
         },
-        "required": ["title", "subtitle", "narrator", "pages"],
+        "required": ["title", "subtitle", "pages"],
         "additionalProperties": False,
     }
 
