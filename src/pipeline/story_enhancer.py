@@ -1038,8 +1038,14 @@ def enhance_to_storybook(transcript: str, *, target_pages: int = 2) -> StoryBook
 
     if _is_openai_story_requested():
         print("STORY_ENHANCE_MODE=openai detected")
-        openai_story = _openai_storybook(anchor_spec, plot_facts, title, narrator, target_pages)
-        openai_story = _openai_storybook(anchor_spec, cleaned, title, narrator, target_pages)
+        openai_story = _openai_storybook(
+            anchor_spec,
+            plot_facts,
+            cleaned,
+            title,
+            narrator,
+            target_pages,
+        )
         if openai_story:
             _maybe_generate_images(openai_story, cleaned)
             return openai_story
