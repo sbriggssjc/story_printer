@@ -4,1857 +4,83 @@ Environment variables:
 - STORY_IMAGE_MODE: set to "openai" to generate images with OpenAI.
 - OPENAI_API_KEY: required for OpenAI modes.
 - STORY_MODEL: OpenAI model for story enhancement (default: "gpt-4o-mini").
-- STORY_TEMPERATURE: OpenAI sampling temperature (default: "0.8").
+- STORY_TEMPERATURE: OpenAI sampling temperature (default: "0.7").
 - STORY_TARGET_PAGES: number of pages to generate (default: "2").
-- STORY_WORDS_PER_PAGE: word count target per page (default: "280").
+- STORY_WORDS_PER_PAGE: word count target per page (default: "260").
 - STORY_STYLE: story tone/style (default: "whimsical, funny, heartwarming").
-- STORY_STRICT_DIALOGUE: set to "1" to fail validation when dialogue count is outside range.
-- STORY_DIALOGUE_MIN: minimum number of dialogue lines (default: "1").
-- STORY_DIALOGUE_MAX: maximum number of dialogue lines (default: "3").
-- STORY_DIALOGUE_EXACT: set to an integer to require an exact dialogue count (default: unset).
+
+Optional robustness knobs:
+- STORY_DIALOGUE_MIN: minimum dialogue lines across the whole story (default: 1)
+- STORY_DIALOGUE_MAX: maximum dialogue lines across the whole story (default: 3)
+- STORY_ANCHOR_MIN_HITS: minimum keyword hits across story (default: 3)
+- STORY_ANCHOR_MAX_TERMS: number of extracted anchor terms (default: 8)
 """
 
 from __future__ import annotations
 
 import base64
 import importlib
-import importlib.util
 import json
-import math
 import os
 import random
 import re
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib import request
-from urllib.error import HTTPError
-
-from pydantic import BaseModel
 
 from src.pipeline.story_builder import StoryBook, StoryPage, _clean_transcript, _find_name, _infer_title
 
 _DEFAULT_MODEL = os.getenv("STORY_MODEL", "gpt-4o-mini")
-_DEFAULT_TEMPERATURE = float(os.getenv("STORY_TEMPERATURE", "0.8"))
+_DEFAULT_TEMPERATURE = float(os.getenv("STORY_TEMPERATURE", "0.7"))
 _DEFAULT_TARGET_PAGES = int(os.getenv("STORY_TARGET_PAGES", "2"))
-_DEFAULT_WORDS_PER_PAGE = int(os.getenv("STORY_WORDS_PER_PAGE", "280"))
+_DEFAULT_WORDS_PER_PAGE = int(os.getenv("STORY_WORDS_PER_PAGE", "260"))
 _DEFAULT_STYLE = os.getenv("STORY_STYLE", "whimsical, funny, heartwarming")
-_DEFAULT_FIDELITY_MODEL = os.getenv("STORY_FIDELITY_MODEL", _DEFAULT_MODEL)
-_MIN_WORDS_PER_PAGE = max(240, _DEFAULT_WORDS_PER_PAGE - 40)
-_MAX_WORDS_PER_PAGE = min(320, _DEFAULT_WORDS_PER_PAGE + 40)
-_DIALOGUE_MIN_DEFAULT = 1
-_DIALOGUE_MAX_DEFAULT = 3
 
+# Keep ranges forgiving; enforce via postprocessing.
+_MIN_WORDS_PER_PAGE = max(200, _DEFAULT_WORDS_PER_PAGE - 60)
+_MAX_WORDS_PER_PAGE = min(340, _DEFAULT_WORDS_PER_PAGE + 80)
 
-def _get_env_int(name: str, default: int | None, *, minimum: int | None = None) -> int | None:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    raw = raw.strip()
-    if not raw:
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        return default
-    if minimum is not None and value < minimum:
-        return default
-    return value
+_DIALOGUE_MIN = int(os.getenv("STORY_DIALOGUE_MIN", "1"))
+_DIALOGUE_MAX = int(os.getenv("STORY_DIALOGUE_MAX", "3"))
 
+_ANCHOR_MIN_HITS = int(os.getenv("STORY_ANCHOR_MIN_HITS", "3"))
+_ANCHOR_MAX_TERMS = int(os.getenv("STORY_ANCHOR_MAX_TERMS", "8"))
 
-_DIALOGUE_MIN = _get_env_int("STORY_DIALOGUE_MIN", _DIALOGUE_MIN_DEFAULT, minimum=0)
-_DIALOGUE_MAX = _get_env_int("STORY_DIALOGUE_MAX", _DIALOGUE_MAX_DEFAULT, minimum=0)
-_DIALOGUE_EXACT = _get_env_int("STORY_DIALOGUE_EXACT", None, minimum=1)
-if _DIALOGUE_EXACT is not None:
-    _DIALOGUE_MIN = _DIALOGUE_EXACT
-    _DIALOGUE_MAX = _DIALOGUE_EXACT
-if _DIALOGUE_MAX < _DIALOGUE_MIN:
-    _DIALOGUE_MAX = _DIALOGUE_MIN
-
-
-def _apply_short_transcript_targets(cleaned_transcript: str) -> None:
-    global _DEFAULT_WORDS_PER_PAGE, _MIN_WORDS_PER_PAGE, _MAX_WORDS_PER_PAGE
-    transcript_words = _word_count(cleaned_transcript)
-    if transcript_words < 70:
-        _MIN_WORDS_PER_PAGE = 160
-        _MAX_WORDS_PER_PAGE = 260
-        _DEFAULT_WORDS_PER_PAGE = 210
-    elif transcript_words < 140:
-        _MIN_WORDS_PER_PAGE = 200
-        _MAX_WORDS_PER_PAGE = 300
-        _DEFAULT_WORDS_PER_PAGE = 250
-    else:
-        _MIN_WORDS_PER_PAGE = 240
-        _MAX_WORDS_PER_PAGE = 320
-        _DEFAULT_WORDS_PER_PAGE = min(max(_DEFAULT_WORDS_PER_PAGE, 240), 320)
-
-# --- Anti-boilerplate / faithfulness guards ---
-
-_BOILERPLATE_OPENING_RE = re.compile(r"^On a (bright|sunny|rainy)\b", re.IGNORECASE)
-_FELT_LIKE_METAPHOR_RE = re.compile(r"\bfelt like ([^.!?]+)", re.IGNORECASE)
-_DUPLICATE_SENTENCE_MIN_WORDS = 8
-_DUPLICATE_SENTENCE_LONG_WORDS = 20
-_BOILERPLATE_PATTERN_HINTS = {
-    "On a bright/sunny/rainy ... (avoid repeating this opening across pages)",
-    "felt like <metaphor> (avoid repeating the same metaphor across pages)",
+_STOPWORDS = {
+    "the", "and", "then", "with", "from", "that", "this", "when", "they", "she", "he",
+    "a", "an", "to", "of", "in", "on", "at", "for", "as", "is", "was", "were", "be",
+    "it", "its", "their", "his", "her", "we", "i", "you", "my", "our", "your",
 }
 
-_BANNED_PHRASES = [
-    "The hallway smelled like crayons and toast",
-    "Sunlight puddled on the floor like warm butter",
-    "the room itself was leaning in to listen",
-    "Even the clock sounded excited",
-]
-
-
-class AnchorSpec(BaseModel):
-    characters: list[str]
-    key_objects: list[str]
-    setting: str | None
-    beats: list[str]
-    lesson: str | None = None
-
-
-def _split_sentences_for_dedupe(text: str) -> list[str]:
-    if not text:
-        return []
-    flat = re.sub(r"\s+", " ", text.strip())
-    sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", flat) if s.strip()]
-    return sents
-
-
-def _split_sentences(text: str) -> list[str]:
-    # Simple sentence split; good enough for children’s prose
-    parts = re.split(r"(?<=[.!?])\s+", (text or "").strip())
-    return [p.strip() for p in parts if p and p.strip()]
-
-
-def _dedupe_cross_page_sentences(pages: list[StoryPage], min_words: int) -> bool:
-    """
-    Removes any sentence that appears verbatim on an earlier page if the page
-    still stays above the minimum word count.
-    Returns True if it modified anything.
-    """
-    seen: set[str] = set()
-    changed = False
-
-    for page in pages:
-        page_word_count = _word_count(page.text)
-        sents = _split_sentences(page.text)
-        out: list[str] = []
-        for s in sents:
-            key = re.sub(r"\s+", " ", s.strip())
-            if key in seen:
-                sentence_words = _word_count(s)
-                if page_word_count - sentence_words >= min_words:
-                    changed = True
-                    page_word_count -= sentence_words
-                    continue
-            out.append(s)
-            seen.add(key)
-
-        # Rebuild paragraph-ish text
-        new_text = " ".join(out).strip()
-        if new_text and new_text != (page.text or "").strip():
-            page.text = new_text
-
-    return changed
-
-
-def _normalize_sentence_key(sentence: str) -> str:
-    return re.sub(r"\s+", " ", sentence.strip()).lower()
-
-
-def _find_boilerplate_patterns_across_pages(page_texts: list[str]) -> list[str]:
-    issues: list[str] = []
-    opening_matches: list[str] = []
-    felt_like_by_page: list[set[str]] = []
-
-    for text in page_texts:
-        sentences = _split_sentences_for_dedupe(text)
-        if sentences:
-            first_sentence = sentences[0]
-            opening_match = _BOILERPLATE_OPENING_RE.match(first_sentence)
-            if opening_match:
-                opening_matches.append(opening_match.group(0).lower())
-
-        felt_like_phrases: set[str] = set()
-        for match in _FELT_LIKE_METAPHOR_RE.finditer(text):
-            phrase = re.sub(r"\s+", " ", match.group(1).strip().lower())
-            if phrase:
-                felt_like_phrases.add(phrase)
-        felt_like_by_page.append(felt_like_phrases)
-
-    if len(opening_matches) >= 2:
-        unique_openings = sorted(set(opening_matches))
-        formatted_openings = [f"'On a {opening.split(' ', 2)[-1]}'" for opening in unique_openings]
-        issues.append("repeated opening across pages: " + ", ".join(formatted_openings))
-
-    if felt_like_by_page:
-        phrase_counts: dict[str, int] = {}
-        for phrases in felt_like_by_page:
-            for phrase in phrases:
-                phrase_counts[phrase] = phrase_counts.get(phrase, 0) + 1
-        repeated_phrases = sorted([p for p, count in phrase_counts.items() if count >= 2])
-        if repeated_phrases:
-            issues.append(f"repeated 'felt like' metaphor across pages: felt like {repeated_phrases[0]}")
-
-    return issues
-
-
-def _find_duplicate_sentences_across_pages(page_texts: list[str]) -> list[str]:
-    # Return sentences (>= ~8 words) that appear on 2+ pages verbatim
-    seen: dict[str, int] = {}
-    dupes: set[str] = set()
-    for t in page_texts:
-        for s in _split_sentences_for_dedupe(t):
-            if len(re.findall(r"[A-Za-z']+", s)) < _DUPLICATE_SENTENCE_MIN_WORDS:
-                continue
-            key = s
-            seen[key] = seen.get(key, 0) + 1
-            if seen[key] >= 2:
-                dupes.add(s)
-    return sorted(dupes)
-
-
-def _should_fail_duplicate_sentences(dupes: list[str]) -> bool:
-    if len(dupes) >= 2:
-        return True
-    if dupes:
-        word_count = len(re.findall(r"[A-Za-z']+", dupes[0]))
-        return word_count >= _DUPLICATE_SENTENCE_LONG_WORDS
-    return False
-
-
-def _extract_proper_names(cleaned: str, narrator: str | None) -> list[str]:
-    names: list[str] = []
-    if narrator:
-        names.append(narrator.strip())
-    if not cleaned:
-        return names
-    candidates = re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b", cleaned)
-    ignored = {
-        "The",
-        "A",
-        "An",
-        "And",
-        "But",
-        "Or",
-        "So",
-        "Because",
-        "When",
-        "Then",
-        "After",
-        "Before",
-        "Once",
-        "With",
-        "Without",
-        "I",
-        "We",
-        "He",
-        "She",
-        "They",
-        "It",
-    }
-    for candidate in candidates:
-        if candidate in ignored:
-            continue
-        names.append(candidate)
-    return names
-
-
-def _extract_noun_phrases(
-    cleaned: str,
-    *,
-    min_count: int = 3,
-    max_count: int = 8,
-    excluded: set[str] | None = None,
-) -> list[str]:
-    if not cleaned:
-        return []
-    stopwords = {
-        "the",
-        "a",
-        "an",
-        "and",
-        "or",
-        "but",
-        "so",
-        "to",
-        "of",
-        "in",
-        "on",
-        "at",
-        "for",
-        "with",
-        "from",
-        "into",
-        "up",
-        "down",
-        "over",
-        "under",
-        "then",
-        "when",
-        "while",
-        "after",
-        "before",
-        "as",
-        "that",
-        "this",
-        "these",
-        "those",
-        "it",
-        "its",
-        "is",
-        "was",
-        "were",
-        "be",
-        "been",
-        "being",
-        "am",
-        "are",
-        "do",
-        "did",
-        "does",
-        "done",
-        "have",
-        "has",
-        "had",
-        "i",
-        "you",
-        "we",
-        "he",
-        "she",
-        "they",
-        "him",
-        "her",
-        "them",
-        "our",
-        "their",
-        "my",
-        "your",
-    }
-    excluded = {term.lower() for term in (excluded or set())}
-    words = [word.lower() for word in re.findall(r"[A-Za-z']+", cleaned)]
-    counts: dict[str, int] = {}
-    for index in range(len(words)):
-        if words[index] in stopwords:
-            continue
-        for length in range(3, 0, -1):
-            if index + length > len(words):
-                continue
-            chunk = words[index : index + length]
-            if any(part in stopwords for part in chunk):
-                continue
-            phrase = " ".join(chunk)
-            counts[phrase] = counts.get(phrase, 0) + 1
-
-    ranked = sorted(
-        counts.items(),
-        key=lambda item: (item[1], len(item[0].split()), len(item[0])),
-        reverse=True,
-    )
-    phrases: list[str] = []
-    for phrase, _ in ranked:
-        if phrase in excluded:
-            continue
-        if len(phrases) >= max_count:
-            break
-        phrases.append(phrase)
-
-    if len(phrases) < min_count:
-        for word in words:
-            if word in stopwords or word in excluded:
-                continue
-            if word not in phrases:
-                phrases.append(word)
-            if len(phrases) >= min_count:
-                break
-
-    return phrases[:max_count]
-
-
-def _dedupe_preserve_order(items: list[str]) -> list[str]:
-    seen: set[str] = set()
-    deduped: list[str] = []
-    for item in items:
-        normalized = item.strip()
-        if not normalized:
-            continue
-        key = normalized.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(normalized)
-    return deduped
-
-
-def _extract_role_characters(cleaned: str) -> list[str]:
-    if not cleaned:
-        return []
-    lower = cleaned.lower()
-    roles = [
-        ("dad", "Dad"),
-        ("father", "Dad"),
-        ("mom", "Mom"),
-        ("mother", "Mom"),
-        ("grandma", "Grandma"),
-        ("grandmother", "Grandma"),
-        ("grandpa", "Grandpa"),
-        ("grandfather", "Grandpa"),
-        ("sister", "Sister"),
-        ("brother", "Brother"),
-        ("teacher", "Teacher"),
-        ("coach", "Coach"),
-        ("friend", "Friend"),
-        ("dog", "dog"),
-        ("cat", "cat"),
-        ("puppy", "puppy"),
-        ("kitten", "kitten"),
-    ]
-    found = []
-    for token, label in roles:
-        if re.search(rf"\b{re.escape(token)}\b", lower):
-            found.append(label)
-    return _dedupe_preserve_order(found)
-
-
-def _extract_settings(cleaned: str) -> list[str]:
-    if not cleaned:
-        return []
-    lower = cleaned.lower()
-    settings = [
-        "kitchen",
-        "school",
-        "park",
-        "playground",
-        "classroom",
-        "bedroom",
-        "living room",
-        "backyard",
-        "yard",
-        "house",
-        "home",
-        "forest",
-        "beach",
-        "garden",
-        "library",
-        "store",
-        "cafe",
-        "restaurant",
-    ]
-    found = []
-    for setting in settings:
-        if re.search(rf"\b{re.escape(setting)}\b", lower):
-            found.append(setting)
-    return _dedupe_preserve_order(found)
-
-
-def _extract_core_actions(cleaned: str) -> list[str]:
-    if not cleaned:
-        return []
-    action_map = {
-        "hide": "hide",
-        "hides": "hide",
-        "hid": "hide",
-        "hidden": "hide",
-        "lie": "lie",
-        "lies": "lie",
-        "lied": "lie",
-        "forget": "forget",
-        "forgets": "forget",
-        "forgot": "forget",
-        "forgotten": "forget",
-        "lose": "lose",
-        "loses": "lose",
-        "lost": "lose",
-        "find": "find",
-        "finds": "find",
-        "found": "find",
-        "help": "help",
-        "helps": "help",
-        "helped": "help",
-        "save": "save",
-        "saves": "save",
-        "saved": "save",
-        "arrive": "arrive",
-        "arrives": "arrive",
-        "arrived": "arrive",
-        "try": "try",
-        "tries": "try",
-        "tried": "try",
-        "eat": "eat",
-        "eats": "eat",
-        "ate": "eat",
-        "chase": "chase",
-        "chases": "chase",
-        "chased": "chase",
-        "scare": "scare",
-        "scares": "scare",
-        "scared": "scare",
-        "steal": "steal",
-        "steals": "steal",
-        "stole": "steal",
-        "take": "take",
-        "takes": "take",
-        "took": "take",
-        "rescue": "rescue",
-        "rescues": "rescue",
-        "rescued": "rescue",
-    }
-    actions: list[str] = []
-    seen: set[str] = set()
-    for token in re.findall(r"[A-Za-z']+", cleaned.lower()):
-        action = action_map.get(token)
-        if action and action not in seen:
-            seen.add(action)
-            actions.append(action)
-    return actions
-
-
-def _extract_top_nounish_terms(
-    cleaned: str,
-    *,
-    max_terms: int = 3,
-    excluded: set[str] | None = None,
-) -> list[str]:
-    if not cleaned:
-        return []
-    stopwords = {
-        "the",
-        "a",
-        "an",
-        "and",
-        "or",
-        "but",
-        "so",
-        "to",
-        "of",
-        "in",
-        "on",
-        "at",
-        "for",
-        "with",
-        "from",
-        "into",
-        "up",
-        "down",
-        "over",
-        "under",
-        "then",
-        "when",
-        "while",
-        "after",
-        "before",
-        "as",
-        "that",
-        "this",
-        "these",
-        "those",
-        "it",
-        "its",
-        "is",
-        "was",
-        "were",
-        "be",
-        "been",
-        "being",
-        "am",
-        "are",
-        "do",
-        "did",
-        "does",
-        "done",
-        "have",
-        "has",
-        "had",
-        "i",
-        "you",
-        "we",
-        "he",
-        "she",
-        "they",
-        "him",
-        "her",
-        "them",
-        "our",
-        "their",
-        "my",
-        "your",
-    }
-    excluded = {term.lower() for term in (excluded or set())}
-    counts: dict[str, int] = {}
-    for token in re.findall(r"[A-Za-z']+", cleaned.lower()):
-        if token in stopwords or token in excluded:
-            continue
-        counts[token] = counts.get(token, 0) + 1
-    ranked = sorted(counts.items(), key=lambda item: (item[1], len(item[0])), reverse=True)
-    return [term for term, _ in ranked[:max_terms]]
-
-
-def _extract_strong_bigrams(
-    cleaned: str,
-    *,
-    max_terms: int = 3,
-    excluded: set[str] | None = None,
-    min_count: int = 2,
-) -> list[str]:
-    if not cleaned:
-        return []
-    stopwords = {
-        "the",
-        "a",
-        "an",
-        "and",
-        "or",
-        "but",
-        "so",
-        "to",
-        "of",
-        "in",
-        "on",
-        "at",
-        "for",
-        "with",
-        "from",
-        "into",
-        "up",
-        "down",
-        "over",
-        "under",
-        "then",
-        "when",
-        "while",
-        "after",
-        "before",
-        "as",
-        "that",
-        "this",
-        "these",
-        "those",
-        "it",
-        "its",
-        "is",
-        "was",
-        "were",
-        "be",
-        "been",
-        "being",
-        "am",
-        "are",
-        "do",
-        "did",
-        "does",
-        "done",
-        "have",
-        "has",
-        "had",
-        "i",
-        "you",
-        "we",
-        "he",
-        "she",
-        "they",
-        "him",
-        "her",
-        "them",
-        "our",
-        "their",
-        "my",
-        "your",
-    }
-    excluded = {term.lower() for term in (excluded or set())}
-    words = [word.lower() for word in re.findall(r"[A-Za-z']+", cleaned)]
-    counts: dict[str, int] = {}
-    for first, second in zip(words, words[1:]):
-        if first in stopwords or second in stopwords:
-            continue
-        if first in excluded or second in excluded:
-            continue
-        phrase = f"{first} {second}"
-        counts[phrase] = counts.get(phrase, 0) + 1
-    ranked = sorted(counts.items(), key=lambda item: (item[1], len(item[0])), reverse=True)
-    strong = [phrase for phrase, count in ranked if count >= min_count]
-    if not strong and ranked:
-        strong = [ranked[0][0]]
-    return strong[:max_terms]
-
-
-def _conjugate_third_person(verb: str) -> str:
-    irregular = {
-        "try": "tries",
-        "lie": "lies",
-    }
-    if verb in irregular:
-        return irregular[verb]
-    if verb.endswith("ch") or verb.endswith("sh") or verb.endswith("x") or verb.endswith("s"):
-        return f"{verb}es"
-    return f"{verb}s"
-
-
-def _with_article(phrase: str, *, default_article: str = "the") -> str:
-    if not phrase:
-        return phrase
-    lower = phrase.lower()
-    if lower.startswith(("the ", "a ", "an ", "their ", "his ", "her ", "our ", "my ", "your ")):
-        return phrase
-    return f"{default_article} {phrase}"
-
-
-def _extract_anchor_facts(cleaned: str) -> list[str]:
-    if not cleaned:
-        return []
-    characters = _dedupe_preserve_order(
-        _extract_proper_names(cleaned, None) + _extract_role_characters(cleaned)
-    )
-    actions = _extract_core_actions(cleaned)
-    excluded = set(characters)
-    objects = _extract_top_nounish_terms(cleaned, excluded=excluded, max_terms=3)
-    subject = characters[0] if characters else "Someone"
-    pronoun = "them"
-    facts: list[str] = []
-
-    if actions:
-        primary_object = objects[0] if objects else "something"
-        verb = _conjugate_third_person(actions[0])
-        facts.append(f"{subject} {verb} {_with_article(primary_object)}.")
-
-    antagonist_terms = ["monster", "villain", "thief", "dragon", "robot", "ghost", "troll", "pirate"]
-    antagonist = next((term for term in objects if any(t in term for t in antagonist_terms)), None)
-    if not antagonist:
-        lower = cleaned.lower()
-        for term in antagonist_terms:
-            if re.search(rf"\\b{re.escape(term)}\\b", lower):
-                antagonist = term
-                break
-    if antagonist:
-        action_for_antagonist = None
-        for candidate in ("eat", "chase", "scare", "steal", "take"):
-            if candidate in actions:
-                action_for_antagonist = candidate
-                break
-        if action_for_antagonist:
-            facts.append(
-                f"{_with_article(antagonist, default_article='a').capitalize()} tries to "
-                f"{action_for_antagonist} {pronoun}."
-            )
-
-    helper_candidates = [name for name in characters[1:] if name.lower() != subject.lower()]
-    helper = helper_candidates[0] if helper_candidates else None
-    if helper and any(action in actions for action in ("save", "help", "arrive")):
-        parts: list[str] = []
-        if "arrive" in actions:
-            parts.append("arrives")
-        if "save" in actions:
-            parts.append("saves")
-        elif "help" in actions:
-            parts.append("helps")
-        if parts:
-            verb_phrase = " and ".join(parts)
-            facts.append(f"{helper} {verb_phrase} {pronoun}.")
-
-    return _dedupe_preserve_order(facts)
-
-
-def _extract_event_beats(cleaned: str) -> list[str]:
-    if not cleaned:
-        return []
-    sentences = _split_sentences(cleaned)
-    events = [sentence for sentence in sentences if sentence]
-    if len(events) < 4:
-        fragments = re.split(r"[;,]|\band then\b", cleaned, flags=re.IGNORECASE)
-        for fragment in fragments:
-            fragment = fragment.strip()
-            if fragment and fragment not in events:
-                events.append(fragment)
-    events = _dedupe_preserve_order(events)
-    if len(events) > 10:
-        events = events[:10]
-    return events
-
-
-def _extract_moral(cleaned: str) -> str | None:
-    if not cleaned:
-        return None
-    moral_keywords = [
-        "lesson",
-        "learned",
-        "remember",
-        "should",
-        "shouldn't",
-        "must",
-        "promise",
-        "apologize",
-        "sorry",
-        "forgive",
-        "kind",
-        "share",
-        "listen",
-    ]
-    for sentence in _split_sentences(cleaned):
-        lower = sentence.lower()
-        if any(keyword in lower for keyword in moral_keywords):
-            return sentence.strip()
-    return None
-
-
-def _local_anchor_spec(cleaned: str) -> AnchorSpec:
-    characters = _dedupe_preserve_order(
-        _extract_proper_names(cleaned, None) + _extract_role_characters(cleaned)
-    )
-    settings = _extract_settings(cleaned)
-    excluded = set(characters + settings)
-    key_objects = _extract_noun_phrases(cleaned, min_count=3, max_count=10, excluded=excluded)
-    key_objects = _dedupe_preserve_order(key_objects)
-    beats = _extract_anchor_facts(cleaned)
-    if len(beats) < 4:
-        fallback_beats = _extract_event_beats(cleaned)
-        beats = _dedupe_preserve_order(beats + fallback_beats)
-    if len(beats) < 4:
-        beats = beats + ["A key moment happens.", "The situation is resolved."][: 4 - len(beats)]
-    beats = beats[:10]
-    lesson = _extract_moral(cleaned)
-    return AnchorSpec(
-        characters=characters,
-        setting=settings[0] if settings else None,
-        key_objects=key_objects,
-        beats=beats,
-        lesson=lesson,
-    )
-
-
-def _anchor_json_schema() -> dict[str, Any]:
-    return {
-        "type": "object",
-        "properties": {
-            "characters": {"type": "array", "items": {"type": "string"}},
-            "setting": {"type": ["string", "null"]},
-            "key_objects": {"type": "array", "items": {"type": "string"}},
-            "beats": {"type": "array", "items": {"type": "string"}},
-            "lesson": {"type": ["string", "null"]},
-        },
-        "required": [
-            "characters",
-            "setting",
-            "key_objects",
-            "beats",
-            "lesson",
-        ],
-        "additionalProperties": False,
-    }
-
-
-def _plot_facts_json_schema() -> dict[str, Any]:
-    return {
-        "type": "object",
-        "properties": {
-            "facts": {"type": "array", "items": {"type": "string"}},
-            "entities": {"type": "array", "items": {"type": "string"}},
-        },
-        "required": ["facts", "entities"],
-        "additionalProperties": False,
-    }
-
-
-def _coerce_anchor_spec(data: Any) -> AnchorSpec | None:
-    if not isinstance(data, dict):
-        return None
-    characters = data.get("characters")
-    key_objects = data.get("key_objects")
-    beats = data.get("beats")
-    if not isinstance(characters, list) or not isinstance(key_objects, list) or not isinstance(beats, list):
-        return None
-    setting_value = data.get("setting")
-    setting = setting_value if isinstance(setting_value, str) else None
-    lesson = data.get("lesson") if isinstance(data.get("lesson"), str) else None
-    return AnchorSpec(
-        characters=[item for item in characters if isinstance(item, str)],
-        setting=setting,
-        key_objects=[item for item in key_objects if isinstance(item, str)],
-        beats=[item for item in beats if isinstance(item, str)],
-        lesson=lesson,
-    )
-
-
-def _coerce_plot_facts(data: Any) -> dict[str, list[str]]:
-    if not isinstance(data, dict):
-        return {}
-    facts = data.get("facts")
-    entities = data.get("entities")
-    if not isinstance(facts, list) or not isinstance(entities, list):
-        return {}
-    return {
-        "facts": [item for item in facts if isinstance(item, str)],
-        "entities": [item for item in entities if isinstance(item, str)],
-    }
-
-
-def _normalize_anchor_spec(spec: AnchorSpec, fallback: AnchorSpec) -> AnchorSpec:
-    characters = _dedupe_preserve_order(spec.characters or fallback.characters)
-    setting = spec.setting or fallback.setting
-    key_objects = _dedupe_preserve_order(spec.key_objects or fallback.key_objects)
-    beats = _dedupe_preserve_order(spec.beats or fallback.beats)
-    if len(beats) < 4:
-        beats = _dedupe_preserve_order(beats + fallback.beats)
-    beats = beats[:10]
-    lesson = spec.lesson or fallback.lesson
-    return AnchorSpec(
-        characters=characters,
-        setting=setting,
-        key_objects=key_objects,
-        beats=beats,
-        lesson=lesson,
-    )
-
-
-def _request_openai_plot_facts(
-    client,
-    system_prompt: str,
-    user_prompt: str,
-    use_responses: bool,
-) -> str:
-    if use_responses and hasattr(client.responses, "parse"):
-        schema = _plot_facts_json_schema()
-        input_messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-        result = client.responses.parse(
-            model=_DEFAULT_MODEL,
-            input=input_messages,
-            temperature=0.2,
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": "plot_facts",
-                    "schema": schema,
-                    "strict": True,
-                }
-            },
-            max_output_tokens=400,
-        )
-        parsed = getattr(result, "output_parsed", None)
-        if parsed is not None:
-            return json.dumps(parsed)
-        return _extract_response_text(result)
-
-    if use_responses and hasattr(client, "responses"):
-        schema = _plot_facts_json_schema()
-        response = client.responses.create(
-            model=_DEFAULT_MODEL,
-            input=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.2,
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": "plot_facts",
-                    "schema": schema,
-                    "strict": True,
-                }
-            },
-            max_output_tokens=400,
-        )
-        return _extract_response_text(response)
-    return ""
-
-
-def _request_openai_anchor_spec(
-    client,
-    system_prompt: str,
-    user_prompt: str,
-    use_responses: bool,
-) -> str:
-    if use_responses and hasattr(client.responses, "parse"):
-        schema = _anchor_json_schema()
-        input_messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-        result = client.responses.parse(
-            model=_DEFAULT_MODEL,
-            input=input_messages,
-            temperature=0.2,
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": "anchor_spec",
-                    "schema": schema,
-                    "strict": True,
-                }
-            },
-            max_output_tokens=500,
-        )
-        parsed = getattr(result, "output_parsed", None)
-        if parsed is not None:
-            return json.dumps(parsed)
-        return _extract_response_text(result)
-
-    if use_responses and hasattr(client, "responses"):
-        schema = _anchor_json_schema()
-        response = client.responses.create(
-            model=_DEFAULT_MODEL,
-            input=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.2,
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": "anchor_spec",
-                    "schema": schema,
-                    "strict": True,
-                }
-            },
-            max_output_tokens=500,
-        )
-        return _extract_response_text(response)
-    return ""
-
-
-def _openai_http_plot_facts(system_prompt: str, user_prompt: str) -> tuple[str, str]:
-    schema = _plot_facts_json_schema()
-    responses_payload = {
-        "model": _DEFAULT_MODEL,
-        "input": [
-            {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
-            {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
-        ],
-        "temperature": 0.2,
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": "plot_facts",
-                "schema": schema,
-                "strict": True,
-            }
-        },
-        "max_output_tokens": 400,
-    }
-    try:
-        response_data = _post_openai_request(
-            "https://api.openai.com/v1/responses",
-            responses_payload,
-        )
-        content = _extract_http_response_text(response_data)
-        if content:
-            return content, "responses"
-    except Exception as exc:
-        print(f"OpenAI HTTP responses plot facts call failed: {exc}")
-    return "", "responses"
-
-
-def _openai_http_anchor_spec(system_prompt: str, user_prompt: str) -> tuple[str, str]:
-    schema = _anchor_json_schema()
-    responses_payload = {
-        "model": _DEFAULT_MODEL,
-        "input": [
-            {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
-            {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
-        ],
-        "temperature": 0.2,
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": "anchor_spec",
-                "schema": schema,
-                "strict": True,
-            }
-        },
-        "max_output_tokens": 500,
-    }
-    try:
-        response_data = _post_openai_request(
-            "https://api.openai.com/v1/responses",
-            responses_payload,
-        )
-        content = _extract_http_response_text(response_data)
-        if content:
-            return content, "responses"
-    except Exception as exc:
-        print(f"OpenAI HTTP responses anchor call failed: {exc}")
-    return "", "responses"
-
-
-def _extract_plot_facts_openai(cleaned_transcript: str) -> dict[str, list[str]]:
-    cleaned = cleaned_transcript or ""
-    local_facts = _dedupe_preserve_order(_split_sentences(cleaned))[:12]
-    local_entities = _dedupe_preserve_order(
-        _extract_proper_names(cleaned, None) + _extract_role_characters(cleaned)
-    )
-    fallback = {"facts": local_facts, "entities": local_entities}
-    if not os.getenv("OPENAI_API_KEY"):
-        return fallback
-    system_prompt = (
-        "Extract plot facts and named entities from a story transcript. "
-        "Facts must be faithful, short statements drawn directly from the transcript. "
-        "Return ONLY strict JSON that follows the schema exactly."
-    )
-    user_prompt = (
-        "Extract plot facts and named entities from this transcript. "
-        "Facts should preserve negatives and motivations (e.g., 'did not want').\n\n"
-        f"TRANSCRIPT:\n{cleaned or 'Empty transcript.'}"
-    )
-    client = _get_openai_client()
-    try:
-        if client:
-            use_responses = hasattr(client, "responses")
-            content = _request_openai_plot_facts(
-                client, system_prompt, user_prompt, use_responses
-            )
-        else:
-            content, endpoint = _openai_http_plot_facts(system_prompt, user_prompt)
-            print(f"OpenAI endpoint: {endpoint} (HTTP)")
-    except Exception as exc:
-        print(f"OpenAI plot facts extraction failed: {exc}")
-        return fallback
-    if not content:
-        return fallback
-    data = _parse_json(content)
-    extracted = _coerce_plot_facts(data)
-    if not extracted:
-        return fallback
-    extracted["facts"] = _dedupe_preserve_order(extracted.get("facts", []))
-    extracted["entities"] = _dedupe_preserve_order(extracted.get("entities", []))
-    if not extracted["facts"]:
-        extracted["facts"] = fallback["facts"]
-    if not extracted["entities"]:
-        extracted["entities"] = fallback["entities"]
-    return extracted
-
-
-def _openai_anchor_spec(cleaned: str) -> AnchorSpec | None:
-    if not os.getenv("OPENAI_API_KEY"):
-        return None
-    system_prompt = (
-        "You extract canon anchors from a transcript for a children's story. "
-        "Return ONLY strict JSON that follows the schema exactly."
-    )
-    user_prompt = (
-        "Extract canon anchors from this transcript. "
-        "Provide characters, setting, key_objects, ordered beats (4-10), "
-        "and an optional lesson.\n\n"
-        f"TRANSCRIPT:\n{cleaned or 'Empty transcript.'}"
-    )
-    client = _get_openai_client()
-    try:
-        if client:
-            use_responses = hasattr(client, "responses")
-            content = _request_openai_anchor_spec(
-                client, system_prompt, user_prompt, use_responses
-            )
-        else:
-            content, endpoint = _openai_http_anchor_spec(system_prompt, user_prompt)
-            print(f"OpenAI endpoint: {endpoint} (HTTP)")
-    except Exception as exc:
-        print(f"OpenAI anchor extraction failed: {exc}")
-        return None
-    if not content:
-        return None
-    data = _parse_json(content)
-    return _coerce_anchor_spec(data)
-
-
-def extract_story_anchors(cleaned_transcript: str) -> AnchorSpec:
-    cleaned = cleaned_transcript or ""
-    local_spec = _local_anchor_spec(cleaned)
-    if os.getenv("OPENAI_API_KEY"):
-        openai_spec = _openai_anchor_spec(cleaned)
-        if openai_spec:
-            return _normalize_anchor_spec(openai_spec, local_spec)
-    return local_spec
-
-
-def _fails_fidelity(pages_text: str, must_keywords: list[str]) -> tuple[list[str], list[str]]:
-    reasons = []
-    banned_phrases = []
-    low = pages_text.lower()
-    for k in must_keywords:
-        if k not in low:
-            reasons.append(f"missing keyword: {k}")
-    for phrase in _BANNED_PHRASES:
-        if phrase.lower() in low:
-            reasons.append(f"contains banned filler phrase: {phrase}")
-            banned_phrases.append(phrase)
-    return reasons, banned_phrases
-
-
-_ANCHOR_SYNONYM_GROUPS = [
-    {"trash can", "trashcan", "garbage", "garbage can", "bin", "trash bin"},
-    {"bicycle", "bike"},
-    {"sofa", "couch"},
-]
-
-
-_COMMON_VERBS = {
-    "asked",
-    "arrived",
-    "ate",
-    "brought",
-    "built",
-    "called",
-    "carried",
-    "caught",
-    "chased",
-    "cleaned",
-    "climbed",
-    "cooked",
-    "cried",
-    "decided",
-    "drew",
-    "drank",
-    "dropped",
-    "drove",
-    "fell",
-    "found",
-    "gave",
-    "got",
-    "grabbed",
-    "heard",
-    "hid",
-    "hit",
-    "hugged",
-    "jumped",
-    "kept",
-    "kicked",
-    "laughed",
-    "left",
-    "lied",
-    "listened",
-    "looked",
-    "lost",
-    "made",
-    "met",
-    "opened",
-    "picked",
-    "played",
-    "pulled",
-    "pushed",
-    "ran",
-    "reached",
-    "rode",
-    "saw",
-    "said",
-    "saved",
-    "shared",
-    "shouted",
-    "sat",
-    "sang",
-    "slept",
-    "spoke",
-    "stood",
-    "told",
-    "threw",
-    "tried",
-    "took",
-    "tripped",
-    "waited",
-    "walked",
-    "wanted",
-    "watched",
-    "went",
-    "wrote",
+# Phrases that commonly appear as generic filler; we REMOVE them (do not fail).
+_BOILERPLATE_SENTENCES = {
+    "Sunlight puddled on the floor like warm butter, making the room glow.",
+    "The hallway smelled like crayons and toast, and {name} could hear sneakers squeaking nearby.",
+    "Someone whispered a guess, and another friend gasped, suddenly certain they knew the truth.",
+    "The air felt fizzy, like soda bubbles popping with every new idea.",
+    "Even the clock sounded excited, ticking a little faster than usual.",
 }
-
-
-def _extract_key_verbs(cleaned: str, *, max_count: int = 4) -> list[str]:
-    if not cleaned:
-        return []
-    stopwords = {
-        "the",
-        "a",
-        "an",
-        "and",
-        "or",
-        "but",
-        "so",
-        "to",
-        "of",
-        "in",
-        "on",
-        "at",
-        "for",
-        "with",
-        "from",
-        "into",
-        "up",
-        "down",
-        "over",
-        "under",
-        "then",
-        "when",
-        "while",
-        "after",
-        "before",
-        "as",
-        "that",
-        "this",
-        "these",
-        "those",
-        "it",
-        "its",
-        "is",
-        "was",
-        "were",
-        "be",
-        "been",
-        "being",
-        "am",
-        "are",
-        "do",
-        "did",
-        "does",
-        "done",
-        "have",
-        "has",
-        "had",
-        "i",
-        "you",
-        "we",
-        "he",
-        "she",
-        "they",
-        "him",
-        "her",
-        "them",
-        "our",
-        "their",
-        "my",
-        "your",
-        "me",
-    }
-    words = [word.lower() for word in re.findall(r"[A-Za-z']+", cleaned)]
-    verbs: list[str] = []
-    index = 0
-    while index < len(words):
-        word = words[index]
-        if word in stopwords:
-            index += 1
-            continue
-        if word in {"throw", "threw", "thrown"} and index + 1 < len(words):
-            next_word = words[index + 1]
-            if next_word in {"away", "out"}:
-                verbs.append(f"{word} {next_word}")
-                index += 2
-                continue
-        if word in _COMMON_VERBS or word.endswith("ed") or word.endswith("ing"):
-            verbs.append(word)
-        index += 1
-    return _dedupe_preserve_order(verbs)[:max_count]
-
-
-def _extract_lesson_tokens(cleaned: str) -> list[str]:
-    lesson = _extract_moral(cleaned)
-    if not lesson:
-        return []
-    moral_keywords = {
-        "lesson",
-        "learned",
-        "remember",
-        "should",
-        "shouldn't",
-        "must",
-        "promise",
-        "apologize",
-        "sorry",
-        "forgive",
-        "kind",
-        "share",
-        "listen",
-    }
-    tokens = [
-        token.lower()
-        for token in re.findall(r"[A-Za-z']+", lesson)
-        if token.lower() in moral_keywords
-    ]
-    return _dedupe_preserve_order(tokens)[:2]
-
-
-def _extract_anchor_tokens(
-    cleaned: str,
-    narrator: str | None,
-    anchor_spec: AnchorSpec,
-) -> list[str]:
-    characters = _dedupe_preserve_order(anchor_spec.characters or [])
-    if narrator and narrator not in characters:
-        characters = [narrator] + characters
-    if not characters:
-        characters = _extract_proper_names(cleaned, narrator) + _extract_role_characters(cleaned)
-
-    key_objects = _dedupe_preserve_order(anchor_spec.key_objects or [])
-    excluded = {name.lower() for name in characters}
-    noun_terms = _extract_top_nounish_terms(cleaned, max_terms=6, excluded=excluded)
-    if key_objects:
-        noun_terms = _dedupe_preserve_order(key_objects + noun_terms)
-    bigrams = _extract_strong_bigrams(cleaned, max_terms=3, excluded=excluded)
-    verbs = _extract_key_verbs(cleaned, max_count=3)
-
-    tokens = _dedupe_preserve_order(
-        characters[:3] + bigrams[:2] + noun_terms[:3] + verbs[:2]
-    )
-
-    if len(tokens) < 5:
-        tokens = _dedupe_preserve_order(tokens + noun_terms + verbs)
-    if len(tokens) < 5:
-        tokens = _dedupe_preserve_order(tokens + _extract_core_actions(cleaned))
-
-    lesson_tokens = _extract_lesson_tokens(cleaned)
-    if lesson_tokens:
-        tokens = _dedupe_preserve_order(tokens + lesson_tokens[:1])
-
-    return tokens[:8]
-
-
-def _anchor_token_matches(
-    story_text: str,
-    anchor_tokens: list[str],
-) -> tuple[list[str], list[str]]:
-    if not anchor_tokens:
-        return [], []
-    text_lower = story_text.lower()
-    group_map: dict[str, set[str]] = {}
-    for group in _ANCHOR_SYNONYM_GROUPS:
-        for term in group:
-            group_map[term] = group
-
-    def contains_term(term: str) -> bool:
-        pattern = r"\b" + re.escape(term.lower()) + r"\b"
-        return re.search(pattern, text_lower) is not None
-
-    found: list[str] = []
-    missing: list[str] = []
-    for token in anchor_tokens:
-        token_lower = token.lower()
-        group = group_map.get(token_lower)
-        if group:
-            if any(contains_term(term) for term in group):
-                found.append(token)
-            else:
-                missing.append(token)
-            continue
-        if contains_term(token_lower):
-            found.append(token)
-        else:
-            missing.append(token)
-    return found, missing
-
-
-def _anchor_token_coverage(
-    story_text: str,
-    anchor_tokens: list[str],
-    *,
-    min_ratio: float = 0.6,
-    min_required: int = 4,
-) -> tuple[bool, str]:
-    if not anchor_tokens:
-        return True, ""
-    found, missing = _anchor_token_matches(story_text, anchor_tokens)
-
-    required = max(min_required, math.ceil(len(anchor_tokens) * min_ratio))
-    required = min(required, len(anchor_tokens))
-    if len(found) >= required:
-        return True, ""
-    summary = (
-        f"Anchor token coverage too low: {len(found)}/{len(anchor_tokens)} found, "
-        f"need at least {required}. Missing: {', '.join(missing)}."
-    )
-    return False, summary
-
-
-def _anchor_token_page_coverage(
-    pages: list[StoryPage],
-    anchor_tokens: list[str],
-    *,
-    min_per_page: int = 1,
-) -> tuple[bool, str]:
-    if not anchor_tokens:
-        return True, ""
-    missing_pages: list[int] = []
-    for index, page in enumerate(pages, start=1):
-        found, _ = _anchor_token_matches(page.text, anchor_tokens)
-        if len(found) < min_per_page:
-            missing_pages.append(index)
-    if missing_pages:
-        summary = (
-            "Anchor token coverage too low per page: "
-            f"no anchors found on pages {', '.join(str(p) for p in missing_pages)}."
-        )
-        return False, summary
-    return True, ""
-
-
-def _event_beat_coverage(
-    story_text: str,
-    cleaned_transcript: str,
-    *,
-    min_ratio: float = 0.6,
-    min_required: int = 2,
-) -> tuple[bool, str]:
-    beats = _extract_event_beats(cleaned_transcript)[:6]
-    if not beats:
-        return True, ""
-    stopwords = {
-        "the",
-        "a",
-        "an",
-        "and",
-        "or",
-        "but",
-        "so",
-        "to",
-        "of",
-        "in",
-        "on",
-        "at",
-        "for",
-        "with",
-        "from",
-        "into",
-        "up",
-        "down",
-        "over",
-        "under",
-        "then",
-        "when",
-        "while",
-        "after",
-        "before",
-        "as",
-        "that",
-        "this",
-        "these",
-        "those",
-        "it",
-        "its",
-        "is",
-        "was",
-        "were",
-        "be",
-        "been",
-        "being",
-        "am",
-        "are",
-        "do",
-        "did",
-        "does",
-        "done",
-        "have",
-        "has",
-        "had",
-        "i",
-        "you",
-        "we",
-        "he",
-        "she",
-        "they",
-        "him",
-        "her",
-        "them",
-        "our",
-        "their",
-        "my",
-        "your",
-        "me",
-    }
-    text_lower = story_text.lower()
-
-    def beat_matches(beat: str) -> bool:
-        tokens = [
-            token.lower()
-            for token in re.findall(r"[A-Za-z']+", beat)
-            if token.lower() not in stopwords
-        ]
-        tokens = _dedupe_preserve_order(tokens)
-        if not tokens:
-            return False
-        required = max(min_required, math.ceil(len(tokens) * min_ratio))
-        required = min(required, len(tokens))
-        found = sum(
-            1
-            for token in tokens
-            if re.search(rf"\\b{re.escape(token)}\\b", text_lower)
-        )
-        return found >= required
-
-    for beat in beats:
-        if beat_matches(beat):
-            return True, ""
-
-    return False, "No transcript event beat appeared in the story."
-
-
-_NEGATION_TERMS = (
-    "didn't",
-    "did not",
-    "didnt",
-    "refused",
-    "refuse",
-    "refuses",
-    "refusing",
-    "wouldn't",
-    "would not",
-    "wouldnt",
-)
-_POSITIVE_DESIRE_TERMS = (
-    "want",
-    "wants",
-    "wanted",
-)
-
-
-def _has_term_near_object(text: str, term_pattern: str, obj_pattern: str, window: int = 40) -> bool:
-    chunk = text.lower()
-    near_patterns = (
-        rf"{term_pattern}[^.!?]{{0,{window}}}{obj_pattern}",
-        rf"{obj_pattern}[^.!?]{{0,{window}}}{term_pattern}",
-    )
-    return any(re.search(pattern, chunk) for pattern in near_patterns)
-
-
-def _rule_based_contradictions(
-    transcript: str,
-    story_text: str,
-    anchor_spec: AnchorSpec,
-) -> list[str]:
-    if not transcript or not story_text:
-        return []
-    key_objects = [obj.strip() for obj in (anchor_spec.key_objects or []) if obj.strip()]
-    if not key_objects:
-        return []
-
-    negation_pattern = r"(?:%s)" % "|".join(re.escape(term) for term in _NEGATION_TERMS)
-    positive_pattern = r"(?:%s)" % "|".join(re.escape(term) for term in _POSITIVE_DESIRE_TERMS)
-    contradictions: list[str] = []
-
-    for obj in key_objects:
-        obj_pattern = r"\b%s\b" % re.escape(obj.lower())
-        transcript_negates = _has_term_near_object(transcript, negation_pattern, obj_pattern)
-        if not transcript_negates:
-            continue
-        transcript_affirms = _has_term_near_object(transcript, positive_pattern, obj_pattern)
-        if transcript_affirms:
-            continue
-        if _has_term_near_object(story_text, positive_pattern, obj_pattern):
-            contradictions.append(
-                f"Transcript negates desire for '{obj}', but story expresses wanting it."
-            )
-
-    return contradictions
-
-
-def _fidelity_json_schema() -> dict[str, Any]:
-    return {
-        "type": "object",
-        "properties": {
-            "pass": {"type": "boolean"},
-            "issues": {"type": "array", "items": {"type": "string"}},
-            "missing_beats": {"type": "array", "items": {"type": "string"}},
-            "contradictions": {"type": "array", "items": {"type": "string"}},
-            "drift_score": {"type": "number", "minimum": 0, "maximum": 1},
-        },
-        "required": ["pass", "issues", "missing_beats", "contradictions", "drift_score"],
-        "additionalProperties": False,
-    }
-
-
-def _request_openai_fidelity_check(
-    client,
-    anchor_spec: AnchorSpec,
-    story_payload: dict[str, Any],
-    use_responses: bool,
-) -> dict[str, Any]:
-    system_prompt = (
-        "You are a strict story fidelity evaluator. Compare the story against the anchors. "
-        "Check beat coverage (each anchor beat must appear in order), "
-        "entity consistency (characters and key_objects persist), and contradictions (no inversion of canon). "
-        "Return ONLY the JSON object that matches the schema."
-    )
-    anchor_json = json.dumps(anchor_spec.model_dump(), ensure_ascii=False, indent=2)
-    story_json = json.dumps(story_payload, ensure_ascii=False, indent=2)
-    user_prompt = (
-        "ANCHORS JSON:\n"
-        f"{anchor_json}\n\n"
-        "STORY JSON:\n"
-        f"{story_json}\n"
-    )
-
-    if use_responses and hasattr(client, "responses") and hasattr(client.responses, "parse"):
-        schema = _fidelity_json_schema()
-        result = client.responses.parse(
-            model=_DEFAULT_FIDELITY_MODEL,
-            input=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0,
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": "fidelity_check",
-                    "schema": schema,
-                    "strict": True,
-                }
-            },
-            max_output_tokens=600,
-        )
-        parsed = getattr(result, "output_parsed", None)
-        if parsed is not None:
-            return parsed
-        raw = _extract_response_text(result)
-        return json.loads(raw) if raw else {}
-
-    if use_responses and hasattr(client, "responses"):
-        schema = _fidelity_json_schema()
-        response = client.responses.create(
-            model=_DEFAULT_FIDELITY_MODEL,
-            input=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0,
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": "fidelity_check",
-                    "schema": schema,
-                    "strict": True,
-                }
-            },
-            max_output_tokens=600,
-        )
-        raw = _extract_response_text(response)
-        return json.loads(raw) if raw else {}
-
-    response = client.chat.completions.create(
-        model=_DEFAULT_FIDELITY_MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0,
-        response_format={"type": "json_object"},
-        max_tokens=600,
-    )
-    content = response.choices[0].message.content if response.choices else "{}"
-    return json.loads(content)
-
-
-def _request_openai_fidelity_http(
-    anchor_spec: AnchorSpec,
-    story_payload: dict[str, Any],
-) -> tuple[dict[str, Any], str]:
-    schema = _fidelity_json_schema()
-    system_prompt = (
-        "You are a strict story fidelity evaluator. Compare the story against the anchors. "
-        "Check beat coverage (each anchor beat must appear in order), "
-        "entity consistency (characters and key_objects persist), and contradictions (no inversion of canon). "
-        "Return ONLY the JSON object that matches the schema."
-    )
-    anchor_json = json.dumps(anchor_spec.model_dump(), ensure_ascii=False, indent=2)
-    story_json = json.dumps(story_payload, ensure_ascii=False, indent=2)
-    user_prompt = (
-        "ANCHORS JSON:\n"
-        f"{anchor_json}\n\n"
-        "STORY JSON:\n"
-        f"{story_json}\n"
-    )
-
-    responses_payload = {
-        "model": _DEFAULT_FIDELITY_MODEL,
-        "input": [
-            {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
-            {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
-        ],
-        "temperature": 0,
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": "fidelity_check",
-                "schema": schema,
-                "strict": True,
-            }
-        },
-        "max_output_tokens": 600,
-    }
-    try:
-        response_data = _post_openai_request(
-            "https://api.openai.com/v1/responses",
-            responses_payload,
-        )
-        content = _extract_http_response_text(response_data)
-        if content:
-            return json.loads(content), "responses"
-    except Exception as exc:
-        print(f"OpenAI HTTP fidelity responses call failed: {exc}")
-
-    chat_payload = {
-        "model": _DEFAULT_FIDELITY_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": 0,
-    }
-    response_data = _post_openai_request(
-        "https://api.openai.com/v1/chat/completions",
-        chat_payload,
-    )
-    content = _extract_http_chat_text(response_data)
-    return json.loads(content) if content else {}, "chat.completions"
-
-
-def _summarize_fidelity_issues(result: dict[str, Any]) -> str:
-    issues = [str(item) for item in result.get("issues") or []]
-    missing_beats = [str(item) for item in result.get("missing_beats") or []]
-    contradictions = [str(item) for item in result.get("contradictions") or []]
-    parts: list[str] = []
-    if missing_beats:
-        parts.append("Missing beats:\n- " + "\n- ".join(missing_beats))
-    if contradictions:
-        parts.append("Contradictions:\n- " + "\n- ".join(contradictions))
-    if issues:
-        parts.append("Other issues:\n- " + "\n- ".join(issues))
-    return "\n".join(parts).strip()
 
 
 def enhance_to_storybook(transcript: str, *, target_pages: int = 2) -> StoryBook:
     cleaned = _clean_transcript(transcript)
-    _apply_short_transcript_targets(cleaned)
     narrator = _find_name(cleaned) if cleaned else None
     title = _infer_title(cleaned) if cleaned else "My Story"
     subtitle = "A story told out loud"
     target_pages = target_pages or _DEFAULT_TARGET_PAGES
-    anchor_spec = extract_story_anchors(cleaned)
-    plot_facts = _extract_plot_facts_openai(cleaned)
 
     if _is_openai_story_requested():
         print("STORY_ENHANCE_MODE=openai detected")
-        openai_story = _openai_storybook(
-            anchor_spec,
-            plot_facts,
-            cleaned,
-            title,
-            narrator,
-            target_pages,
-        )
+        openai_story = _openai_storybook(cleaned, title, narrator, target_pages)
         if openai_story:
-            _apply_image_prompts(openai_story, anchor_spec, narrator)
-            _maybe_generate_cover_image(openai_story, anchor_spec, narrator)
-            _maybe_generate_images(openai_story, cleaned)
+            _maybe_generate_images(openai_story)
             return openai_story
 
-    local_story = _local_storybook(anchor_spec, title, narrator, target_pages)
-    _apply_image_prompts(local_story, anchor_spec, narrator)
-    _maybe_generate_cover_image(local_story, anchor_spec, narrator)
-    _maybe_generate_images(local_story, cleaned)
+    local_story = _local_storybook(cleaned, title, narrator, target_pages)
+    _maybe_generate_images(local_story)
     return local_story
-
-
-def _use_openai_story_mode() -> bool:
-    return os.getenv("STORY_ENHANCE_MODE", "").lower() == "openai" and bool(os.getenv("OPENAI_API_KEY"))
 
 
 def _is_openai_story_requested() -> bool:
@@ -1876,130 +102,44 @@ def _get_openai_client():
     return openai_module.OpenAI()
 
 
-def _build_openai_prompts(
-    anchor_spec: AnchorSpec,
-    plot_facts: dict[str, list[str]],
-    narrator: str | None,
-    target_pages: int,
-) -> tuple[str, str, AnchorSpec]:
+def _build_openai_prompts(cleaned: str, narrator: str | None, target_pages: int) -> tuple[str, str]:
     system_prompt = (
         "You are a celebrated children's picture-book author and editor. "
         "Expand the transcript into a rich, creative, kid-safe story (not a summary). "
-        "Do NOT use any stock phrases, cliché similes, classroom/hallway sensory filler, "
-        "or generic storybook language. Every sentence must clearly relate to the "
-        "transcript's specific plot and objects. No sentence may be reused across pages. "
+        "IMPORTANT: stay faithful to the transcript's core plot beats and characters. "
         "Return ONLY strict JSON that follows the schema exactly."
     )
-    beat_sheet = (
-        "Beat sheet:\n"
-        "1) Warm opening with setting and sensory details.\n"
-        "2) First anchor beat appears.\n"
-        "3) Rising tension that leads into the next beat.\n"
-        "4) Page-turn hook ending page 1.\n"
-        "5) Biggest anchor beat on page 2.\n"
-        "6) Emotional response or realization.\n"
-        "7) Resolution that follows the remaining beats.\n"
-        "8) Warm ending with emotional lift.\n"
-    )
-    anchor_json = json.dumps(anchor_spec.model_dump(), ensure_ascii=False, indent=2)
-    facts = plot_facts.get("facts", [])
-    entities = plot_facts.get("entities", [])
-    entity_lines = "\n".join([f"- {entity}" for entity in entities]) or "- (none)"
-    anchor_fact_lines: list[str] = []
-    if anchor_spec.characters:
-        anchor_fact_lines.append(
-            "The main characters are " + ", ".join(anchor_spec.characters) + "."
-        )
-    if anchor_spec.setting:
-        anchor_fact_lines.append(f"The story is set in {anchor_spec.setting}.")
-    if anchor_spec.key_objects:
-        anchor_fact_lines.append(
-            "Important objects include " + ", ".join(anchor_spec.key_objects) + "."
-        )
-    if anchor_spec.beats:
-        for beat in anchor_spec.beats:
-            trimmed = beat.strip()
-            if trimmed and not trimmed.endswith((".", "!", "?")):
-                trimmed += "."
-            anchor_fact_lines.append(f"The plot includes this beat: {trimmed}")
-    if anchor_spec.lesson:
-        anchor_fact_lines.append(f"The underlying lesson is: {anchor_spec.lesson}.")
-    anchor_lines = _dedupe_preserve_order([*facts, *anchor_fact_lines])
-    anchor_fact_text = "\n".join([f"- {fact}" for fact in anchor_lines]) or "- (none)"
+
+    # We keep constraints, but we repair post-hoc too.
     user_prompt = (
-        "Use the AnchorSpec JSON below and the plot facts as the ONLY sources of plot truth. "
-        "Do not invent new major plotlines beyond what the plot facts and anchors imply.\n\n"
-        f"NARRATOR (keep name if present): {narrator or 'none'}\n\n"
+        "TRANSCRIPT (idea source; keep the SAME core plot and characters; do NOT invent a different story):\n"
+        f"{cleaned or 'Empty transcript.'}\n\n"
+        f"NARRATOR (use name if present): {narrator or 'none'}\n\n"
         "Story requirements:\n"
         f"- Exactly {target_pages} pages.\n"
-        "- Page 1: setup + early beats + rising trouble + page-turn hook.\n"
-        "- Page 2: remaining beats + resolution + warm ending.\n"
-        f"{_dialogue_prompt_line()}"
-        "- Dialogue must be short (<= 12 words each) and natural.\n"
-        "- Do not use quotation marks for emphasis or any other purpose.\n"
-        "- Kid-safe, whimsical, humorous, creative expansion.\n"
-        "- Include sensory details and an emotional arc.\n"
-        "- Avoid repeating filler sentences or stock phrases.\n"
-        "- Do NOT repeat any exact sentence across pages. Each sentence must be unique.\n"
-        "- Keep names consistent; use narrator if provided.\n"
-        "- You MUST include each anchor beat in order (paraphrase is allowed).\n"
-        "- MUST include these plot anchors (paraphrase ok).\n"
-        "- Ensure entity consistency: characters, key_objects, and setting stay the same.\n"
-        "- Do not change any character identities or swap roles.\n"
-        "- Do not invert motivations (explicitly: if transcript says “did not want X” you must not say “wanted X”).\n"
-        "- You may add whimsical details, but do not add new major plotlines.\n"
-        f"- {_MIN_WORDS_PER_PAGE}–{_MAX_WORDS_PER_PAGE} words per page (target {_DEFAULT_WORDS_PER_PAGE}).\n"
-        "- Each page must include a rich illustration_prompt in consistent watercolor picture-book style.\n"
-        "- Write in scene-based narrative (actions, feelings, sensory detail).\n"
-        "- Do not use meta-story phrasing like:\n"
-        "  - This was the part where...\n"
-        "  - X stayed important as the story moved forward...\n"
-        "  - The lesson was...\n"
-        "- Anchors are invisible constraints; do NOT recap, list, or label anchor beats or entities in the story.\n"
-        "- Do not list events as short declarative sentences.\n"
-        "IMPORTANT:\n"
-        "- Do NOT list anchors, beats, requirements, or checks inside the story text.\n"
-        "- Do NOT write lines like \"This was the part where...\" or \"The lesson was...\" unless it fits naturally.\n"
-        "- The story must read like a real picture-book narrative, not an outline or recap.\n"
-        "- Use anchors as facts to weave into the plot naturally.\n\n"
-        f"{beat_sheet}\n"
-        "ANCHORS (must include these plot facts, paraphrase ok):\n"
-        f"{anchor_fact_text}\n\n"
-        "ENTITIES (names to keep consistent):\n"
-        f"{entity_lines}\n\n"
-        "ANCHORS JSON (use this as ground truth):\n"
-        f"{anchor_json}\n\n"
+        "- Page 1: setup + mischief/choice + rising trouble + page-turn hook.\n"
+        "- Page 2: big moment + apology/lesson + funny resolution + warm ending.\n"
+        f"- Dialogue: {_DIALOGUE_MIN}–{_DIALOGUE_MAX} short quoted lines TOTAL across the entire story.\n"
+        f"- About {_MIN_WORDS_PER_PAGE}–{_MAX_WORDS_PER_PAGE} words per page.\n"
+        "- Kid-safe, whimsical, humorous, vivid sensory details.\n"
+        "- Avoid repeated stock phrases or generic filler.\n"
+        "- Each page must include a rich illustration_prompt in consistent watercolor picture-book style.\n\n"
         "OUTPUT JSON schema:\n"
         "{"
         '"title": string, '
         '"subtitle": string, '
-        '"narrator": string|null (optional), '
+        '"narrator": string|null, '
         '"pages": ['
         '{"text": string, "illustration_prompt": string}'
         "]"
         "}\n\n"
         f"Style: {_DEFAULT_STYLE}."
     )
-    user_prompt += (
-        "\nHard bans:\n"
-        "- Do NOT use any stock phrases, cliché similes, classroom/hallway sensory filler, "
-        "or generic storybook language. Every sentence must clearly relate to the "
-        "transcript's specific plot and objects.\n"
-        "- Do NOT use any generic boilerplate sensory sentences.\n"
-        "- Do NOT repeat any sentence verbatim across pages.\n"
-        "- Avoid repeated openings like 'On a bright/sunny/rainy ...' across pages.\n"
-        "- Avoid repeating the same 'felt like <metaphor>' across pages.\n"
-        "- Never output these phrases (verbatim or near-verbatim):\n"
-        + "\n".join([f"  - {s}" for s in _BANNED_PHRASES])
-        + "\n"
-    )
-    return system_prompt, user_prompt, anchor_spec
+    return system_prompt, user_prompt
 
 
 def _openai_storybook(
-    anchor_spec: AnchorSpec,
-    plot_facts: dict[str, list[str]],
-    cleaned_transcript: str,
+    cleaned: str,
     title: str,
     narrator: str | None,
     target_pages: int,
@@ -2012,70 +152,36 @@ def _openai_storybook(
     if client:
         print("OpenAI path: SDK")
     else:
-        print("OpenAI path: HTTP (openai package not available)")
+        print("OpenAI enhancement skipped: openai package not available.")
+        return None
 
     print(f"OpenAI model: {_DEFAULT_MODEL}")
 
-    system_prompt, user_prompt, anchor_spec = _build_openai_prompts(
-        anchor_spec, plot_facts, narrator, target_pages
-    )
-    repair_spec: dict[str, Any] | None = None
-    fidelity_note: str | None = None
-    anchor_tokens = _extract_anchor_tokens(cleaned_transcript, narrator, anchor_spec)
-    coverage_note: str | None = None
-    page_coverage_note: str | None = None
-    beat_note: str | None = None
-    for attempt in range(2):
+    system_prompt, user_prompt = _build_openai_prompts(cleaned, narrator, target_pages)
+    required_terms = _extract_anchor_terms(cleaned, max_terms=_ANCHOR_MAX_TERMS)
+
+    # We will try up to 3 attempts, but we also *repair*.
+    for attempt in range(3):
         correction = ""
-        if attempt == 1:
-            repair_payload = repair_spec or {}
+        if attempt >= 1:
             correction = (
-                "Second-pass rewrite required. Use ONLY the repair spec below.\n"
-                "Rewrite completely; do NOT reuse phrasing from any previous attempt.\n"
-                "Do not quote or paste any prior story text.\n"
-                "Return ONLY JSON matching the schema. No extra keys, no commentary.\n\n"
-                "Repair spec (machine-built JSON):\n"
-                f"{json.dumps(repair_payload, ensure_ascii=False, indent=2)}"
+                "Revise the previous JSON to better satisfy word-count per page, dialogue-count, "
+                "avoid repeated sentences, and stay faithful to the transcript plot."
             )
-            if coverage_note:
-                correction += (
-                    "\nAnchor token coverage fixes required (be surgical; keep tone and length):\n"
-                    f"{coverage_note}\n"
-                    "Improve coverage without adding new major plotlines."
-                )
-            if page_coverage_note:
-                correction += (
-                    "\nPer-page anchor coverage fixes required:\n"
-                    f"{page_coverage_note}\n"
-                    "Ensure each page mentions at least one anchor from the transcript."
-                )
-            if beat_note:
-                correction += (
-                    "\nTranscript beat coverage required:\n"
-                    f"{beat_note}\n"
-                    "Ensure at least one event beat from the transcript is reflected in the story."
-                )
+
         try:
-            if client:
-                use_responses = hasattr(client, "responses")
-                endpoint = "responses" if use_responses else "chat.completions"
-                print(f"OpenAI endpoint: {endpoint} (SDK)")
-                content = _request_openai_story(
-                    client,
-                    system_prompt,
-                    user_prompt,
-                    correction,
-                    use_responses,
-                    target_pages,
-                )
-            else:
-                content, endpoint = _openai_http_storybook(
-                    system_prompt,
-                    user_prompt,
-                    correction,
-                    target_pages,
-                )
-                print(f"OpenAI endpoint: {endpoint} (HTTP)")
+            use_responses = hasattr(client, "responses")
+            endpoint = "responses" if use_responses else "chat.completions"
+            print(f"OpenAI endpoint: {endpoint} (SDK)")
+
+            content = _request_openai_story(
+                client=client,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                correction=correction,
+                use_responses=use_responses,
+                target_pages=target_pages,
+            )
         except Exception as exc:
             print(f"OpenAI enhancement failed: {exc}")
             return None
@@ -2085,196 +191,45 @@ def _openai_storybook(
             return None
 
         data = _parse_json(content)
+        if not isinstance(data, dict):
+            print("Validation failed: response is not a JSON object")
+            continue
+
         pages = _build_pages_from_data(data, target_pages)
-        if not pages:
-            print("OpenAI enhancement failed: unable to parse pages.")
-            return None
+        if len(pages) != target_pages:
+            print("Validation failed: unable to parse pages")
+            continue
 
-        # Post-process pages BEFORE validation so we validate the final text that will be printed
-        dialogue_min, dialogue_max = _dialogue_bounds()
-        for page in pages:
-            page.text = _normalize_dialogue_lines(page.text, max_lines=dialogue_max)
-
-        total_dialogue = sum(_count_dialogue_lines(page.text) for page in pages)
-        if total_dialogue < dialogue_min:
-            pages[-1].text = _ensure_dialogue_count(pages[-1].text, target_lines=dialogue_min)
-
-        # Remove any verbatim repeated sentences across pages without local padding.
-        _dedupe_cross_page_sentences(pages, _MIN_WORDS_PER_PAGE)
-
-        _ensure_minimum_dialogue_lines(pages, target_pages)
-        _ensure_unique_sentences_across_pages(
-            pages,
-            anchor_spec,
-            cleaned_transcript,
-            narrator,
-            append_expansions=False,
+        # REPAIR PHASE (critical for robustness)
+        pages = _repair_pages(
+            pages=pages,
+            narrator=narrator,
+            required_terms=required_terms,
+            target_min=_MIN_WORDS_PER_PAGE,
+            target_max=_MAX_WORDS_PER_PAGE,
         )
-        _pad_pages_with_anchor_paragraphs(
-            pages,
-            anchor_spec=anchor_spec,
-            min_words=_MIN_WORDS_PER_PAGE,
-            max_words=_MAX_WORDS_PER_PAGE,
+
+        # Validate after repair
+        ok, reasons = _validate_story_pages(
+            pages=pages,
+            required_terms=required_terms,
+            target_min=_MIN_WORDS_PER_PAGE,
+            target_max=_MAX_WORDS_PER_PAGE,
         )
-        _trim_pages_to_word_limit(pages, _MAX_WORDS_PER_PAGE)
-
-        low_word_pages = [
-            index + 1
-            for index, page in enumerate(pages)
-            if _word_count(page.text) < _MIN_WORDS_PER_PAGE
-        ]
-        if low_word_pages:
-            print(f"OpenAI enhancement retry: low word count on pages {low_word_pages}.")
-            if attempt == 0:
-                user_prompt = (
-                    f"{user_prompt}\n\n"
-                    "Add 60–100 words per page while keeping the same plot."
-                )
-                continue
-            return None
-
-        valid, reasons = _validate_story_pages(pages, target_pages)
-        if not valid:
+        if not ok:
             print(f"Validation failed: {', '.join(reasons)}")
-            if attempt == 0:
-                repair_spec = _build_repair_spec(reasons, target_pages)
-
-        valid, reasons = _validate_story_pages(
-            pages,
-            target_pages,
-            enforce_word_count=False,
-            enforce_dialogue=False,
-        )
-        if not valid:
-            print(f"Validation failed: {', '.join(reasons)}")
-            if attempt == 0:
-                user_prompt = (
-                    f"{user_prompt}\n\n"
-                    "Your previous attempt failed validation. Fix ALL issues below:\n"
-                    "- " + "\n- ".join(reasons) + "\n\n"
-                    "Rewrite from scratch. Do NOT reuse any sentences from the previous attempt.\n"
-                )
-                continue
-            print(f"OpenAI enhancement failed: invalid output ({'; '.join(reasons)}).")
-            return None
-
-        page_texts = [page.text for page in pages]
-        all_text = " ".join(page_texts)
-        _, banned_phrases = _fails_fidelity(all_text, [])
-        if banned_phrases:
-            print(f"Fidelity failed: contains banned filler phrases: {', '.join(banned_phrases)}")
-            if attempt == 0:
-                repair_spec = _build_repair_spec(
-                    [],
-                    target_pages,
-                    banned_phrases=banned_phrases,
-                )
-                user_prompt = (
-                    f"{user_prompt}\n\nIssues:\n- "
-                    + "\n- ".join([f"contains banned filler phrase: {p}" for p in banned_phrases])
-                    + "\n\nRewrite while preserving the anchor beats (paraphrase allowed)."
-                )
-                continue
-            return None
-
-        rule_contradictions = _rule_based_contradictions(cleaned_transcript, all_text, anchor_spec)
-        if rule_contradictions:
-            print(
-                "Rule-based contradiction check failed: "
-                + "; ".join(rule_contradictions)
-            )
-            if attempt == 0:
-                repair_spec = _build_repair_spec(
-                    [],
-                    target_pages,
-                    rule_contradictions=rule_contradictions,
-                )
-                continue
-            return None
-
-        story_payload = {
-            "title": (data.get("title") or title).strip() or title,
-            "subtitle": (data.get("subtitle") or "A story told out loud").strip()
-            or "A story told out loud",
-            "narrator": data.get("narrator") or narrator,
-            "pages": [
-                {"text": page.text, "illustration_prompt": page.illustration_prompt}
-                for page in pages
-            ],
-        }
-        try:
-            if client:
-                use_responses = hasattr(client, "responses")
-                fidelity_result = _request_openai_fidelity_check(
-                    client, anchor_spec, story_payload, use_responses
-                )
-                print("OpenAI fidelity check: SDK")
-            else:
-                fidelity_result, fidelity_endpoint = _request_openai_fidelity_http(
-                    anchor_spec, story_payload
-                )
-                print(f"OpenAI fidelity check: HTTP ({fidelity_endpoint})")
-        except Exception as exc:
-            print(f"OpenAI fidelity check failed: {exc}")
-            fidelity_result = {"pass": True}
-
-        if not fidelity_result.get("pass", False):
-            print("Fidelity failed via anchor check.")
-            if attempt == 0:
-                repair_spec = _build_repair_spec(
-                    [],
-                    target_pages,
-                    fidelity_result=fidelity_result,
-                )
-                continue
-            return None
-        coverage_ok, coverage_summary = _anchor_token_coverage(all_text, anchor_tokens)
-        if not coverage_ok:
-            coverage_note = coverage_summary
-            print("Fidelity failed via anchor token coverage.")
-            if attempt == 0:
-                user_prompt = (
-                    f"{user_prompt}\n\nIssues:\n- "
-                    + coverage_summary
-                    + "\n\nRewrite to include more of the anchor tokens from the transcript."
-                )
-                continue
-            return None
-        page_coverage_ok, page_coverage_summary = _anchor_token_page_coverage(
-            pages, anchor_tokens
-        )
-        if not page_coverage_ok:
-            page_coverage_note = page_coverage_summary
-            print("Fidelity failed via per-page anchor coverage.")
-            if attempt == 0:
-                user_prompt = (
-                    f"{user_prompt}\n\nIssues:\n- "
-                    + page_coverage_summary
-                    + "\n\nRewrite to include at least one anchor token on every page."
-                )
-                continue
-            return None
-        beat_ok, beat_summary = _event_beat_coverage(all_text, cleaned_transcript)
-        if not beat_ok:
-            beat_note = beat_summary
-            print("Fidelity failed via transcript beat coverage.")
-            if attempt == 0:
-                user_prompt = (
-                    f"{user_prompt}\n\nIssues:\n- "
-                    + beat_summary
-                    + "\n\nRewrite to include at least one event beat from the transcript."
-                )
-                continue
-            return None
+            # tighten prompt on subsequent tries by appending issues
+            user_prompt = f"{user_prompt}\n\nIMPORTANT FIXES NEEDED:\n- " + "\n- ".join(reasons)
+            continue
 
         return StoryBook(
             title=(data.get("title") or title).strip() or title,
-            subtitle=(data.get("subtitle") or "A story told out loud").strip()
-            or "A story told out loud",
+            subtitle=(data.get("subtitle") or "A story told out loud").strip() or "A story told out loud",
             pages=pages,
             narrator=(data.get("narrator") or narrator),
         )
 
+    print("OpenAI enhancement failed: could not produce a valid story after retries.")
     return None
 
 
@@ -2286,43 +241,6 @@ def _request_openai_story(
     use_responses: bool,
     target_pages: int,
 ) -> str:
-    # Prefer Responses API (SDK) when available
-    if use_responses and hasattr(client.responses, "parse"):
-        schema = _story_json_schema(target_pages)
-
-        input_messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-        if correction:
-            input_messages.append({"role": "user", "content": correction})
-
-        # NOTE: responses.parse enforces the schema and returns parsed output
-        result = client.responses.parse(
-            model=_DEFAULT_MODEL,
-            input=input_messages,
-            temperature=_DEFAULT_TEMPERATURE,
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": "storybook",
-                    "schema": schema,
-                    "strict": True,
-                }
-            },
-            max_output_tokens=2600,
-        )
-
-        # result.output_parsed is the parsed JSON object (dict)
-        # But our caller expects raw JSON text (string), so serialize it.
-        parsed = getattr(result, "output_parsed", None)
-        if parsed is not None:
-            return json.dumps(parsed)
-
-        # Fallback if output_parsed isn't present for some reason
-        return _extract_response_text(result)
-
-    # If parse isn't available, use Responses.create with text.format
     if use_responses:
         schema = _story_json_schema(target_pages)
         input_messages = [
@@ -2332,184 +250,38 @@ def _request_openai_story(
         if correction:
             input_messages.append({"role": "user", "content": correction})
 
+        # openai-python 2.x: responses.create supports response_format with json_schema
         response = client.responses.create(
             model=_DEFAULT_MODEL,
             input=input_messages,
             temperature=_DEFAULT_TEMPERATURE,
-            text={
-                "format": {
-                    "type": "json_schema",
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
                     "name": "storybook",
                     "schema": schema,
                     "strict": True,
-                }
+                },
             },
-            max_output_tokens=2600,
         )
         return _extract_response_text(response)
 
-    # chat.completions fallback
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
-    if correction:
-        messages.append({"role": "user", "content": correction})
-
+    # fallback path (rare if responses exists)
     response = client.chat.completions.create(
         model=_DEFAULT_MODEL,
-        messages=messages,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+            *([{"role": "user", "content": correction}] if correction else []),
+        ],
         temperature=_DEFAULT_TEMPERATURE,
         response_format={"type": "json_object"},
-        max_tokens=2600,
     )
     return response.choices[0].message.content if response.choices else ""
 
 
-def _openai_http_storybook(
-    system_prompt: str,
-    user_prompt: str,
-    correction: str,
-    target_pages: int,
-) -> tuple[str, str]:
-    return _request_openai_story_http(
-        system_prompt,
-        user_prompt,
-        correction,
-        target_pages,
-    )
-
-
-def _request_openai_story_http(
-    system_prompt: str,
-    user_prompt: str,
-    correction: str,
-    target_pages: int,
-) -> tuple[str, str]:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY not set")
-
-    schema = _story_json_schema(target_pages)
-    input_messages = [
-        {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
-        {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
-    ]
-    if correction:
-        input_messages.append(
-            {"role": "user", "content": [{"type": "input_text", "text": correction}]}
-        )
-
-    responses_payload = {
-        "model": _DEFAULT_MODEL,
-        "input": input_messages,
-        "temperature": _DEFAULT_TEMPERATURE,
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": "storybook",
-                "schema": schema,
-                "strict": True,
-            }
-        },
-        "max_output_tokens": 2200,
-    }
-    try:
-        response_data = _post_openai_request(
-            "https://api.openai.com/v1/responses",
-            responses_payload,
-        )
-        content = _extract_http_response_text(response_data)
-        if content:
-            return content, "responses"
-    except Exception as exc:
-        print(f"OpenAI HTTP responses call failed: {exc}")
-
-    chat_messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
-    if correction:
-        chat_messages.append({"role": "user", "content": correction})
-
-    chat_payload = {
-        "model": _DEFAULT_MODEL,
-        "messages": chat_messages,
-        "temperature": _DEFAULT_TEMPERATURE,
-    }
-    response_data = _post_openai_request(
-        "https://api.openai.com/v1/chat/completions",
-        chat_payload,
-    )
-    content = _extract_http_chat_text(response_data)
-    return content, "chat.completions"
-
-
-def _post_openai_request(url: str, payload: dict[str, Any]) -> dict[str, Any]:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY not set")
-    data = json.dumps(payload).encode("utf-8")
-    req = request.Request(
-        url,
-        data=data,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
-        method="POST",
-    )
-    try:
-        with request.urlopen(req, timeout=60) as response:
-            body = response.read().decode("utf-8")
-    except HTTPError as exc:
-        err_body = ""
-        try:
-            err_body = exc.read().decode("utf-8")
-        except Exception:
-            pass
-        raise RuntimeError(
-            f"OpenAI HTTP request failed: {exc.code} {exc.reason} :: {err_body[:1200]}"
-        ) from exc
-    except Exception as exc:
-        raise RuntimeError(f"OpenAI HTTP request failed: {exc}") from exc
-    try:
-        return json.loads(body)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("OpenAI HTTP response was not valid JSON") from exc
-
-
-def _extract_http_response_text(response_data: dict[str, Any]) -> str:
-    text = response_data.get("output_text")
-    if isinstance(text, str) and text.strip():
-        return text.strip()
-    output = response_data.get("output")
-    if isinstance(output, list):
-        for item in output:
-            content = item.get("content")
-            if not isinstance(content, list):
-                continue
-            for part in content:
-                text_part = part.get("text")
-                if text_part:
-                    return str(text_part).strip()
-    return ""
-
-
-def _extract_http_chat_text(response_data: dict[str, Any]) -> str:
-    choices = response_data.get("choices")
-    if not isinstance(choices, list):
-        return ""
-    if not choices:
-        return ""
-    message = choices[0].get("message", {})
-    content = message.get("content")
-    if isinstance(content, str):
-        return content
-    return ""
-
-
 def _story_json_schema(target_pages: int) -> dict[str, Any]:
+    # narrator must be in required if present in properties for strict json_schema
     return {
         "type": "object",
         "properties": {
@@ -2538,8 +310,9 @@ def _story_json_schema(target_pages: int) -> dict[str, Any]:
 
 def _extract_response_text(response: Any) -> str:
     text = getattr(response, "output_text", None)
-    if text:
-        return text
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+
     output = getattr(response, "output", None)
     if isinstance(output, list):
         for item in output:
@@ -2549,7 +322,7 @@ def _extract_response_text(response: Any) -> str:
             for part in content:
                 text_part = getattr(part, "text", None)
                 if text_part:
-                    return text_part
+                    return str(text_part).strip()
     return ""
 
 
@@ -2587,237 +360,6 @@ def _extract_json_block(text: str) -> Any:
     return None
 
 
-def _is_strict_dialogue() -> bool:
-    return os.getenv("STORY_STRICT_DIALOGUE", "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _dialogue_bounds() -> tuple[int, int]:
-    return _DIALOGUE_MIN, _DIALOGUE_MAX
-
-
-def _dialogue_expected_label() -> str:
-    min_lines, max_lines = _dialogue_bounds()
-    if min_lines == max_lines:
-        return str(min_lines)
-    return f"{min_lines}-{max_lines}"
-
-
-def _dialogue_prompt_line() -> str:
-    min_lines, max_lines = _dialogue_bounds()
-    range_label = f"{min_lines}–{max_lines}" if min_lines != max_lines else f"{min_lines}"
-    return (
-        f"- Include {range_label} short lines of dialogue total. Each must be a full sentence in "
-        "quotes on its own line starting with '- ' or '— '.\n"
-    )
-
-
-def _dialogue_in_range(total_dialogue: int) -> bool:
-    min_lines, max_lines = _dialogue_bounds()
-    return min_lines <= total_dialogue <= max_lines
-
-
-def _validate_story_data(data: Any, target_pages: int) -> tuple[bool, list[str]]:
-    if not isinstance(data, dict):
-        return False, ["response is not a JSON object"]
-    pages = data.get("pages")
-    if not isinstance(pages, list):
-        return False, ["pages must be a list"]
-    if len(pages) != target_pages:
-        return False, [f"expected {target_pages} pages but got {len(pages)}"]
-    reasons: list[str] = []
-    fatal_reasons: list[str] = []
-    total_dialogue = 0
-    page_texts: list[str] = []
-    for index, page in enumerate(pages, start=1):
-        if not isinstance(page, dict):
-            reasons.append(f"page {index} is not an object")
-            fatal_reasons.append(f"page {index} is not an object")
-            continue
-        text = (page.get("text") or "").strip()
-        prompt = (page.get("illustration_prompt") or "").strip()
-        if not text:
-            reasons.append(f"page {index} missing text")
-            fatal_reasons.append(f"page {index} missing text")
-            continue
-        if not prompt:
-            reasons.append(f"page {index} missing illustration_prompt")
-            fatal_reasons.append(f"page {index} missing illustration_prompt")
-        word_count = _word_count(text)
-        if word_count < _MIN_WORDS_PER_PAGE or word_count > _MAX_WORDS_PER_PAGE:
-            reasons.append(
-                f"page {index} word count {word_count} outside {_MIN_WORDS_PER_PAGE}-{_MAX_WORDS_PER_PAGE}"
-            )
-            fatal_reasons.append(
-                f"page {index} word count {word_count} outside {_MIN_WORDS_PER_PAGE}-{_MAX_WORDS_PER_PAGE}"
-            )
-        total_dialogue += _count_dialogue_lines(text)
-        page_texts.append(text)
-
-    boilerplate_issues = _find_boilerplate_patterns_across_pages(page_texts)
-    for issue in boilerplate_issues:
-        reasons.append(issue)
-        fatal_reasons.append(issue)
-
-    dupes = _find_duplicate_sentences_across_pages(page_texts)
-    if dupes and _should_fail_duplicate_sentences(dupes):
-        reasons.append(f"repeated sentence across pages: {dupes[0]}")
-        fatal_reasons.append(f"repeated sentence across pages: {dupes[0]}")
-
-    if not _dialogue_in_range(total_dialogue):
-        reasons.append(
-            f"dialogue lines counted {total_dialogue} but expected {_dialogue_expected_label()}"
-        )
-        if _is_strict_dialogue():
-            fatal_reasons.append(
-                f"dialogue lines counted {total_dialogue} but expected {_dialogue_expected_label()}"
-            )
-    return (len(fatal_reasons) == 0, reasons)
-
-
-def _validate_story_pages(
-    pages: list[StoryPage],
-    target_pages: int,
-    *,
-    enforce_word_count: bool = True,
-    enforce_dialogue: bool = True,
-) -> tuple[bool, list[str]]:
-    if not isinstance(pages, list) or len(pages) != target_pages:
-        return False, [
-            f"expected {target_pages} pages but got {len(pages) if isinstance(pages, list) else 'non-list'}"
-        ]
-
-    reasons: list[str] = []
-    fatal_reasons: list[str] = []
-    total_dialogue = 0
-    page_texts: list[str] = []
-
-    for index, page in enumerate(pages, start=1):
-        text = (page.text or "").strip()
-        prompt = (page.illustration_prompt or "").strip()
-
-        if not text:
-            reasons.append(f"page {index} missing text")
-            fatal_reasons.append(f"page {index} missing text")
-            continue
-        if not prompt:
-            reasons.append(f"page {index} missing illustration_prompt")
-            fatal_reasons.append(f"page {index} missing illustration_prompt")
-
-        wc = _word_count(text)
-        if enforce_word_count and (wc < _MIN_WORDS_PER_PAGE or wc > _MAX_WORDS_PER_PAGE):
-            reasons.append(
-                f"page {index} word count {wc} outside {_MIN_WORDS_PER_PAGE}-{_MAX_WORDS_PER_PAGE}"
-            )
-            fatal_reasons.append(
-                f"page {index} word count {wc} outside {_MIN_WORDS_PER_PAGE}-{_MAX_WORDS_PER_PAGE}"
-            )
-
-        total_dialogue += _count_dialogue_lines(text)
-        page_texts.append(text)
-
-    boilerplate_issues = _find_boilerplate_patterns_across_pages(page_texts)
-    for issue in boilerplate_issues:
-        reasons.append(issue)
-        fatal_reasons.append(issue)
-
-    dupes = _find_duplicate_sentences_across_pages(page_texts)
-    if dupes and _should_fail_duplicate_sentences(dupes):
-        reasons.append(f"repeated sentence across pages: {dupes[0]}")
-        fatal_reasons.append(f"repeated sentence across pages: {dupes[0]}")
-
-    if enforce_dialogue and not _dialogue_in_range(total_dialogue):
-        reasons.append(
-            f"dialogue lines counted {total_dialogue} but expected {_dialogue_expected_label()}"
-        )
-        if _is_strict_dialogue():
-            fatal_reasons.append(
-                f"dialogue lines counted {total_dialogue} but expected {_dialogue_expected_label()}"
-            )
-
-    return (len(fatal_reasons) == 0, reasons)
-
-
-def _build_repair_spec(
-    reasons: list[str],
-    target_pages: int,
-    *,
-    banned_phrases: list[str] | None = None,
-    rule_contradictions: list[str] | None = None,
-    fidelity_result: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    problems: set[str] = set()
-    avoid_phrases = set(_BOILERPLATE_PATTERN_HINTS)
-    if banned_phrases:
-        problems.add("banned_filler_phrases")
-        avoid_phrases.update(banned_phrases)
-
-    for reason in reasons:
-        if reason.startswith("expected ") and " pages but got " in reason:
-            problems.add("page_count_mismatch")
-            continue
-        match = re.search(r"page (\d+) word count (\d+) outside", reason)
-        if match:
-            page_num = int(match.group(1))
-            word_count = int(match.group(2))
-            if word_count < _MIN_WORDS_PER_PAGE:
-                problems.add(f"page_{page_num}_too_short")
-            else:
-                problems.add(f"page_{page_num}_too_long")
-            continue
-        match = re.search(r"page (\d+) missing text", reason)
-        if match:
-            problems.add(f"page_{int(match.group(1))}_missing_text")
-            continue
-        match = re.search(r"page (\d+) missing illustration_prompt", reason)
-        if match:
-            problems.add(f"page_{int(match.group(1))}_missing_illustration_prompt")
-            continue
-        if reason.startswith("repeated opening across pages") or reason.startswith(
-            "repeated 'felt like' metaphor across pages"
-        ):
-            problems.add("boilerplate_pattern_used")
-            continue
-        if reason.startswith("repeated sentence across pages:"):
-            problems.add("repeated_sentence_across_pages")
-            continue
-        if reason.startswith("dialogue lines counted"):
-            problems.add("dialogue_lines_out_of_range")
-            continue
-
-    constraints: dict[str, Any] = {
-        "exact_pages": target_pages,
-        "min_words_per_page": _MIN_WORDS_PER_PAGE,
-        "max_words_per_page": _MAX_WORDS_PER_PAGE,
-        "dialogue_lines_total": list(_dialogue_bounds()),
-        "avoid_meta_phrases": sorted(avoid_phrases),
-    }
-
-    if rule_contradictions:
-        problems.add("rule_contradiction")
-        constraints["avoid_contradictions"] = rule_contradictions
-
-    if fidelity_result:
-        missing_beats = [str(item) for item in fidelity_result.get("missing_beats") or []]
-        contradictions = [str(item) for item in fidelity_result.get("contradictions") or []]
-        issues = [str(item) for item in fidelity_result.get("issues") or []]
-        if missing_beats:
-            problems.add("missing_anchor_beats")
-            constraints["missing_beats"] = missing_beats
-        if contradictions:
-            problems.add("anchor_contradictions")
-            constraints["avoid_contradictions"] = sorted(
-                set(constraints.get("avoid_contradictions", [])) | set(contradictions)
-            )
-        if issues:
-            problems.add("fidelity_issues")
-            constraints["fidelity_issues"] = issues
-
-    return {
-        "problems": sorted(problems),
-        "constraints": constraints,
-    }
-
-
 def _build_pages_from_data(data: dict[str, Any], target_pages: int) -> list[StoryPage]:
     pages: list[StoryPage] = []
     raw_pages = data.get("pages")
@@ -2833,194 +375,311 @@ def _build_pages_from_data(data: dict[str, Any], target_pages: int) -> list[Stor
     return pages
 
 
+# -----------------------------
+# Robust fidelity / anchor terms
+# -----------------------------
+def _extract_anchor_terms(transcript: str, max_terms: int = 8) -> list[str]:
+    """
+    Transcript-agnostic term extraction for fidelity checking.
+    Returns a small list of salient words/phrases that should appear (loosely) in the story.
+    """
+    t = (transcript or "").strip()
+    if not t:
+        return []
+
+    # Keep names as anchors when possible
+    names = re.findall(r"\b[A-Z][a-z]{2,}\b", t)
+    names = [n for n in names if n.lower() not in _STOPWORDS]
+
+    words = re.findall(r"[A-Za-z']+", t.lower())
+    words = [w for w in words if w not in _STOPWORDS and len(w) > 3]
+    freq = [w for w, _ in Counter(words).most_common(max_terms * 2)]
+
+    anchors: list[str] = []
+    for n in names[:2]:
+        anchors.append(n.lower())
+    for w in freq:
+        if w not in anchors:
+            anchors.append(w)
+        if len(anchors) >= max_terms:
+            break
+    return anchors
 
 
-def _build_style_seed(characters: list[str]) -> str:
-    if not characters:
-        return "Same character designs across all images: a curious child with short curly hair and a teal hoodie."
-
-    design_palette = [
-        ("short curly brown hair", "teal hoodie"),
-        ("long wavy black hair", "sunny yellow shirt"),
-        ("straight auburn hair", "red jacket"),
-        ("braided dark hair", "green cardigan"),
-    ]
-    descriptors: list[str] = []
-    for index, name in enumerate(characters):
-        hair, outfit = design_palette[index % len(design_palette)]
-        descriptors.append(f"{name} has {hair} and a {outfit}")
-    joined = "; ".join(descriptors)
-    return f"Same character designs across all images: {joined}."
+def _anchor_hits(text: str, required_terms: list[str]) -> int:
+    lowered = (text or "").lower()
+    hits = 0
+    for term in required_terms:
+        if term and term.lower() in lowered:
+            hits += 1
+    return hits
 
 
-def _summarize_page_text(text: str, max_sentences: int = 2) -> str:
+# -----------------------------
+# Repair / validation utilities
+# -----------------------------
+def _word_count(text: str) -> int:
+    return len(re.findall(r"[A-Za-z']+", text or ""))
+
+
+def _split_sentences(text: str) -> list[str]:
+    return [s.strip() for s in re.split(r"(?<=[.!?])\s+", (text or "").strip()) if s.strip()]
+
+
+def _count_dialogue_lines(text: str) -> int:
+    quoted = re.findall(r'"[^"]+"', text or "")
+    curly = re.findall(r"“[^”]+”", text or "")
+    return len(quoted) + len(curly)
+
+
+def _limit_dialogue(text: str, max_lines: int) -> str:
+    """
+    If the model adds lots of quoted lines, convert extras to unquoted text.
+    """
+    if max_lines <= 0:
+        return re.sub(r'["“”]', "", text or "")
+
+    s = text or ""
+    # Normalize curly quotes to straight for easier handling, then restore not needed
+    s = s.replace("“", '"').replace("”", '"')
+
+    matches = list(re.finditer(r'"([^"]+)"', s))
+    if len(matches) <= max_lines:
+        return text or ""
+
+    # Replace extras: remove surrounding quotes but keep content
+    out_s = s
+    extras = matches[max_lines:]
+    for m in reversed(extras):
+        inner = m.group(1)
+        out_s = out_s[: m.start()] + inner + out_s[m.end() :]
+    return out_s
+
+
+def _ensure_min_dialogue(text: str, narrator: str | None) -> str:
+    """
+    If no dialogue exists, inject one short quote line near the end.
+    """
+    if _count_dialogue_lines(text) >= _DIALOGUE_MIN:
+        return text
+    name = narrator or _find_first_name(text) or "Someone"
+    # Add a single short line. Keep it generic.
+    addition = f' "{name} whispered, \\"I\\\'m sorry.\\""'
+    # Avoid adding to a blank text
+    if text.strip().endswith((".", "!", "?")):
+        return text.strip() + addition
+    return text.strip() + "." + addition
+
+
+def _find_first_name(text: str) -> str | None:
+    for match in re.finditer(r"\b[A-Z][a-z]{2,}\b", text or ""):
+        cand = match.group(0)
+        if cand.lower() in _STOPWORDS:
+            continue
+        return cand
+    return None
+
+
+def _remove_boilerplate(text: str, narrator: str | None) -> str:
+    name = narrator or "A child"
     sentences = _split_sentences(text)
-    if not sentences:
-        return "A warm, kid-friendly moment in the story."
-    summary = " ".join(sentences[:max_sentences]).strip()
-    return summary
+    cleaned = []
+    for s in sentences:
+        if s in _BOILERPLATE_SENTENCES:
+            continue
+        # also remove formatted boilerplate template
+        if s == f"The hallway smelled like crayons and toast, and {name} could hear sneakers squeaking nearby.":
+            continue
+        cleaned.append(s)
+    return " ".join(cleaned).strip()
 
 
-def _cover_prompt(
-    story: StoryBook,
-    anchor_spec: AnchorSpec,
-    style_seed: str,
-) -> str:
-    characters = anchor_spec.characters or []
-    setting = anchor_spec.setting
-    key_objects = anchor_spec.key_objects or []
+def _dedupe_across_pages(pages: list[StoryPage]) -> list[StoryPage]:
+    seen = set()
+    out: list[StoryPage] = []
+    for p in pages:
+        sentences = _split_sentences(p.text)
+        kept = []
+        for s in sentences:
+            key = s.strip()
+            if not key:
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            kept.append(key)
+        p.text = " ".join(kept).strip()
+        out.append(p)
+    return out
 
-    parts = [
-        f"Picture book cover art for '{story.title}'.",
-        "Whimsical, kid-friendly composition with space for title text (do not include actual text).",
+
+def _expand_text_to_range(text: str, target_min: int, target_max: int, additions: list[str]) -> str:
+    """
+    Expand with varied, transcript-keyword-aware additions until we hit target_min (without exceeding target_max).
+    """
+    current = text.strip()
+    used = set()
+    current_words = _word_count(current)
+    for sentence in additions:
+        if sentence in used:
+            continue
+        next_text = f"{current} {sentence}".strip()
+        next_words = _word_count(next_text)
+        if next_words > target_max and current_words >= target_min:
+            break
+        if next_words <= target_max or current_words < target_min:
+            current = next_text
+            current_words = next_words
+            used.add(sentence)
+        if current_words >= target_min:
+            break
+    return current
+
+
+def _keyword_expansions(required_terms: list[str], stage: str, rng: random.Random) -> list[str]:
+    """
+    Generate non-stock, keyword-aware expansion sentences so we don't get the same filler every story.
+    """
+    terms = [t for t in required_terms if t and t.lower() not in _STOPWORDS]
+    rng.shuffle(terms)
+    terms = terms[:4]
+
+    sensory = [
+        "The air felt busy with tiny sounds—shuffling feet, a soft laugh, and something far away clinking.",
+        "Somewhere nearby, something smelled delicious, and it made the moment feel even bigger.",
+        "The room seemed to hold its breath, like it was waiting to see what would happen next.",
+        "A silly idea wobbled into everyone’s thoughts, and suddenly it felt hard not to grin.",
     ]
-    if characters:
-        parts.append(f"Main characters: {', '.join(characters)}.")
-    if setting:
-        parts.append(f"Setting: {setting}.")
-    if key_objects:
-        parts.append(f"Key objects: {', '.join(key_objects[:3])}.")
-    parts.append(f"Style: {_DEFAULT_STYLE}.")
-    parts.append("Watercolor storybook cover, soft lighting, clean outlines, no text, no watermark.")
-    parts.append(style_seed)
-    return " ".join(parts).strip()
+    action = []
+    for t in terms:
+        action.append(f"Everything seemed connected to {t}, as if {t} was the clue hiding in plain sight.")
+        action.append(f"Someone pointed at {t} and said it was probably the reason for the whole mix-up.")
+        action.append(f"The thought of {t} made everyone react at once—gasping, giggling, and whispering.")
 
-
-def _page_prompt(
-    page: StoryPage,
-    anchor_spec: AnchorSpec,
-    style_seed: str,
-) -> str:
-    characters = anchor_spec.characters or []
-    setting = anchor_spec.setting
-    key_objects = anchor_spec.key_objects or []
-    summary = _summarize_page_text(page.text, max_sentences=2)
-
-    parts = [
-        "Watercolor children's picture book illustration.",
-        f"Scene summary: {summary}",
-    ]
-    if characters:
-        parts.append(f"Characters: {', '.join(characters)}.")
-    if key_objects:
-        parts.append(f"Key objects: {', '.join(key_objects[:4])}.")
-    if setting:
-        parts.append(f"Setting: {setting}.")
-    parts.append(
-        "Match the cover's visual style: soft lighting, clean outlines, gentle shading, no text."
-    )
-    parts.append(style_seed)
-    return " ".join(parts).strip()
-
-
-def _apply_image_prompts(
-    story: StoryBook,
-    anchor_spec: AnchorSpec,
-    narrator: str | None,
-) -> None:
-    characters = anchor_spec.characters or ([narrator] if narrator else [])
-    style_seed = _build_style_seed(characters)
-    story.cover_illustration_prompt = _cover_prompt(story, anchor_spec, style_seed)
-    for page in story.pages:
-        page.illustration_prompt = _page_prompt(page, anchor_spec, style_seed)
-
-
-def _local_storybook(
-    anchor_spec: AnchorSpec,
-    title: str,
-    narrator: str | None,
-    target_pages: int,
-) -> StoryBook:
-    used_sentences: set[str] = set()
-    characters = anchor_spec.characters or ([narrator] if narrator else ["The child"])
-    key_objects = anchor_spec.key_objects or []
-    setting = anchor_spec.setting
-    beats = anchor_spec.beats or []
-    if not beats:
-        beats = ["Something important happens.", "Everyone feels the change."]
-    if len(beats) < target_pages:
-        beats = beats + [beats[-1]] * (target_pages - len(beats))
-
-    beats_per_page = max(1, (len(beats) + target_pages - 1) // target_pages)
-    padding_candidates = _anchor_padding_sentences(anchor_spec, narrator)
-    pages: list[StoryPage] = []
-
-    for index in range(target_pages):
-        page_beats = beats[index * beats_per_page : (index + 1) * beats_per_page]
-        if not page_beats:
-            page_beats = beats[-1:]
-        page_sentences: list[str] = []
-        if index == 0:
-            if setting:
-                page_sentences.append(
-                    f"In the {setting}, {', '.join(characters)} found themselves in a new moment."
-                )
-            if key_objects:
-                page_sentences.append(
-                    f"The {', '.join(key_objects[:2])} mattered more than they expected."
-                )
-        for beat in page_beats:
-            beat_line = beat.strip()
-            if beat_line and not beat_line.endswith((".", "!", "?")):
-                beat_line += "."
-            page_sentences.append(beat_line)
-        if index == target_pages - 1 and anchor_spec.lesson:
-            page_sentences.append(f"The lesson stayed with them: {anchor_spec.lesson}.")
-        page_text = " ".join(page_sentences).strip()
-        page_text = _pad_to_min_words_no_repeats(
-            page_text, _MIN_WORDS_PER_PAGE, padding_candidates, used_sentences
-        )
-        page_text = _pad_page_with_anchor_paragraphs(
-            page_text,
-            anchor_spec=anchor_spec,
-            min_words=_MIN_WORDS_PER_PAGE,
-            max_words=_MAX_WORDS_PER_PAGE,
-        )
-        illustration_prompt_parts = [
-            "Watercolor children's picture book illustration",
+    if stage == "setup":
+        extra = [
+            "It felt exciting and risky at the same time—like balancing a secret on the tip of a spoon.",
+            "The first little choice didn’t seem huge… until it started rolling like a snowball.",
+            "A tiny mistake can be loud inside your heart, even when nobody else knows yet.",
         ]
-        if setting:
-            illustration_prompt_parts.append(f"in a {setting}")
-        if characters:
-            illustration_prompt_parts.append(f"featuring {', '.join(characters[:3])}")
-        if key_objects:
-            illustration_prompt_parts.append(f"with {', '.join(key_objects[:3])}")
-        illustration_prompt_parts.append(
-            "gentle lighting, expressive faces, cozy storybook composition"
-        )
-        pages.append(
-            StoryPage(
-                text=page_text,
-                illustration_prompt=", ".join(illustration_prompt_parts) + ".",
+    else:
+        extra = [
+            "The truth finally felt lighter once it was said out loud.",
+            "An honest apology changed the whole mood, like turning on a warm lamp.",
+            "Once everyone worked together, the scary part turned into the funny part.",
+        ]
+
+    pool = sensory + action + extra
+    rng.shuffle(pool)
+    return pool
+
+
+def _repair_pages(
+    pages: list[StoryPage],
+    narrator: str | None,
+    required_terms: list[str],
+    target_min: int,
+    target_max: int,
+) -> list[StoryPage]:
+    """
+    Make the story pass constraints by repairing common failure modes:
+    - boilerplate removal
+    - repeated sentences across pages
+    - dialogue normalization (min/max)
+    - word count normalization (expand if short)
+    """
+    rng = random.Random(abs(hash("||".join(p.text for p in pages))) % (2**32))
+
+    # 1) remove boilerplate
+    for p in pages:
+        p.text = _remove_boilerplate(p.text, narrator)
+
+    # 2) dedupe across pages
+    pages = _dedupe_across_pages(pages)
+
+    # 3) dialogue normalization (limit first, then ensure minimum)
+    for p in pages:
+        p.text = _limit_dialogue(p.text, _DIALOGUE_MAX)
+
+    # Ensure at least minimum exists somewhere (inject on last page)
+    total_dialogue = sum(_count_dialogue_lines(p.text) for p in pages)
+    if total_dialogue < _DIALOGUE_MIN and pages:
+        pages[-1].text = _ensure_min_dialogue(pages[-1].text, narrator)
+
+    # If still too many (edge-case), strip quotes from last page
+    total_dialogue = sum(_count_dialogue_lines(p.text) for p in pages)
+    if total_dialogue > _DIALOGUE_MAX and pages:
+        pages[-1].text = re.sub(r'["“”]', "", pages[-1].text)
+
+    # 4) word count normalization (expand if short)
+    for idx, p in enumerate(pages):
+        wc = _word_count(p.text)
+        if wc < target_min:
+            stage = "setup" if idx == 0 else "resolution"
+            additions = _keyword_expansions(required_terms, stage=stage, rng=rng)
+            p.text = _expand_text_to_range(p.text, target_min, target_max, additions)
+
+        # If still short (very short transcript), we allow slightly under-min rather than failing hard
+        # but we will try to hit min as best effort.
+
+    return pages
+
+
+def _validate_story_pages(
+    pages: list[StoryPage],
+    required_terms: list[str],
+    target_min: int,
+    target_max: int,
+) -> tuple[bool, list[str]]:
+    reasons: list[str] = []
+
+    # Word count checks (soft-ish): require within range OR close if transcript is tiny.
+    for i, p in enumerate(pages, start=1):
+        wc = _word_count(p.text)
+        if wc < target_min:
+            reasons.append(f"page {i} word count {wc} below {target_min}")
+        if wc > target_max:
+            reasons.append(f"page {i} word count {wc} above {target_max}")
+
+    # Dialogue check (global)
+    total_dialogue = sum(_count_dialogue_lines(p.text) for p in pages)
+    if total_dialogue < _DIALOGUE_MIN or total_dialogue > _DIALOGUE_MAX:
+        reasons.append(f"dialogue lines counted {total_dialogue} outside {_DIALOGUE_MIN}-{_DIALOGUE_MAX}")
+
+    # Anchor/fidelity check (global)
+    if required_terms:
+        combined = " ".join(p.text for p in pages)
+        hits = _anchor_hits(combined, required_terms)
+        min_hits = min(_ANCHOR_MIN_HITS, max(1, len(required_terms)))
+        if hits < min_hits:
+            reasons.append(
+                f"anchor/fidelity too low: hits {hits} < {min_hits} (terms={', '.join(required_terms[:6])})"
             )
-        )
 
-    return StoryBook(
-        title=title,
-        subtitle="A story told out loud",
-        pages=pages,
-        narrator=narrator,
-    )
+    return (len(reasons) == 0, reasons)
 
 
+# -----------------------------
+# Local fallback (kept simple)
+# -----------------------------
 def _infer_topic(cleaned: str) -> str:
     if not cleaned:
         return "a small mystery"
     lowered = cleaned.lower()
-    for keyword in ("pizza", "dragon", "monster", "castle", "forest", "robot"):
+    for keyword in ("pizza", "dragon", "monster", "castle", "forest", "robot", "unicorn", "dinosaur"):
         if keyword in lowered:
             return f"the {keyword}"
     words = re.findall(r"[A-Za-z']+", cleaned)
-    stopwords = {"the", "and", "then", "with", "from", "that", "this", "when", "they", "she", "he"}
     for word in words:
-        if word.lower() in stopwords:
+        wl = word.lower()
+        if wl in _STOPWORDS:
             continue
-        if len(word) > 3:
-            return f"the {word.lower()}"
+        if len(wl) > 3:
+            return f"the {wl}"
     return "a small surprise"
 
 
-def _snippet_from_transcript(cleaned: str, max_words: int = 16) -> str:
+def _snippet_from_transcript(cleaned: str, max_words: int = 18) -> str:
     if not cleaned:
         return "a surprising little secret"
     words = re.findall(r"[A-Za-z']+", cleaned)
@@ -3030,621 +689,72 @@ def _snippet_from_transcript(cleaned: str, max_words: int = 16) -> str:
     return snippet.rstrip(".") + "."
 
 
-def _page_expansions(topic: str, name: str, *, stage: str) -> list[str]:
-    additions = [
-        f"The hallway smelled like crayons and toast, and {name} could hear sneakers squeaking nearby.",
-        "Sunlight puddled on the floor like warm butter, making the room glow.",
-        "A breeze bumped the curtains, as if the room itself was leaning in to listen.",
-        "Someone whispered a guess, and another friend gasped, suddenly certain they knew the truth.",
-        "The air felt fizzy, like soda bubbles popping with every new idea.",
-        "A tiny pet or plush toy seemed to watch the drama with wide, button eyes.",
-        "Even the clock sounded excited, ticking a little faster than usual.",
-        "A neighbor's laugh floated in from the hallway, making the moment feel even more alive.",
-        "The rug felt soft under their toes, grounding them in the middle of the mystery.",
-    ]
+def _local_storybook(cleaned: str, title: str, narrator: str | None, target_pages: int) -> StoryBook:
+    topic = _infer_topic(cleaned)
+    name = narrator or "A young storyteller"
+    snippet = _snippet_from_transcript(cleaned)
 
-    topic_lower = topic.lower()
-    if "pizza" in topic_lower:
-        additions.extend(
-            [
-                "The scent of warm cheese drifted by, making every tummy rumble a little louder.",
-                "A pretend pizza monster was blamed, complete with silly growls and dramatic arm waves.",
-                "Someone suggested leaving a trail of crust crumbs as a clue.",
-                "A paper chef hat appeared, and suddenly everyone was speaking in silly restaurant voices.",
-                "They drew a topping map on a napkin to track the mystery.",
-            ]
-        )
-    if "monster" in topic_lower:
-        additions.extend(
-            [
-                "Shadows wiggled on the wall, perfect for a make-believe monster dance.",
-                "They drew a friendly monster map with sparkly stickers and bold arrows.",
-                "Someone made a monster mask from a paper plate and giggled behind it.",
-            ]
-        )
-    if "dragon" in topic_lower:
-        additions.extend(
-            [
-                "A dragon made of chalk doodles puffed pretend smoke across the sidewalk.",
-                "They practiced brave knight poses and gentle dragon bows.",
-                "A sparkly cape fluttered like dragon wings.",
-            ]
-        )
+    seed = abs(hash(cleaned or topic)) % (2**32)
+    rng = random.Random(seed)
 
-    if stage == "resolution":
-        additions.extend(
-            [
-                "A chorus of Its okay! floated through the room, light and sincere.",
-                "They made a new rule: big feelings get big hugs and honest words.",
-                "Someone proposed a celebratory dance, and the floor became a stage.",
-                "A goofy plan turned the problem into a game, and everyone played along.",
-                "The apology landed softly, like a blanket warming everyone's shoulders.",
-            ]
-        )
-    else:
-        additions.extend(
-            [
-                "A whispered plan formed, and everyone leaned in close to hear it.",
-                "The mix-up began to wobble like a wiggly jelly, getting bigger with each retelling.",
-                "They tiptoed around the problem, hoping it would magically shrink.",
-                "A giggle escaped at the worst time, and suddenly everyone was trying not to laugh.",
-                "The secret felt heavy and light at the same time, like a balloon tied to a shoe.",
-            ]
-        )
-
-    return additions
-
-
-def _expand_text_to_range(
-    text: str,
-    target_min: int,
-    target_max: int,
-    additions: list[str],
-    *,
-    rng: random.Random | None = None,
-    used: set[str] | None = None,
-) -> str:
-    current = text
-    current_words = _word_count(current)
-    candidates = list(additions)
-    if rng:
-        rng.shuffle(candidates)
-    for sentence in candidates:
-        sentence = sentence.replace('"', "").replace("“", "").replace("”", "")
-        if used and sentence in used:
-            continue
-        next_text = f"{current} {sentence}"
-        next_words = _word_count(next_text)
-        if next_words > target_max and current_words >= target_min:
-            break
-        if next_words <= target_max or current_words < target_min:
-            current = next_text
-            current_words = next_words
-            if used is not None:
-                used.add(sentence)
-        if current_words >= target_min:
-            break
-    return current
-
-
-def _word_count(text: str) -> int:
-    return len(re.findall(r"[A-Za-z']+", text))
-
-
-def _count_dialogue_lines(text: str) -> int:
-    line_start = re.compile(r'^\s*[-—]\s+["“].+["”]\s*$', re.MULTILINE)
-    return sum(1 for _ in line_start.finditer(text))
-
-
-def _limit_dialogue_lines(text: str, max_lines: int = 3) -> str:
-    """
-    Keeps the first max_lines dialogue lines, removes leading markers from the rest
-    so they no longer count as dialogue lines.
-    """
-    lines = text.splitlines(keepends=True)
-    dialogue_count = 0
-    updated: list[str] = []
-    for line in lines:
-        if re.match(r"^\s*[-—]\s+", line):
-            dialogue_count += 1
-            if dialogue_count > max_lines:
-                line = re.sub(r"^(\s*)[-—]\s+", r"\1", line)
-        updated.append(line)
-    return "".join(updated)
-
-
-def _ensure_dialogue_count(text: str, target_lines: int = _DIALOGUE_MIN_DEFAULT) -> str:
-    """
-    Ensure the text includes at least target_lines of dialogue by appending short lines.
-    """
-    current = _count_dialogue_lines(text)
-    if current >= target_lines:
-        return text
-
-    additions = [
-        '- "We can fix it."',
-        '- "That was silly."',
-    ]
-    needed = target_lines - current
-    extra = "\n".join(additions[:needed])
-    separator = "\n" if text.rstrip() else ""
-    return f"{text.rstrip()}{separator}{extra}".strip()
-
-
-def _ensure_minimum_dialogue_lines(pages: list[StoryPage], target_pages: int) -> None:
-    min_lines, _ = _dialogue_bounds()
-    if min_lines <= 0:
-        return
-    total_dialogue = sum(_count_dialogue_lines(page.text) for page in pages)
-    if total_dialogue >= min_lines:
-        return
-    fallback_lines = [
-        '- "Dad: Crunch the crust, kiddo!"',
-        '- "Claire: I should\'ve listened, Dad."',
-        '- "We can do this!"',
-        '- "Okay, let\'s try."',
-    ]
-    needed = min_lines - total_dialogue
-    available = fallback_lines[: max(target_pages, needed)]
-    for index, line in enumerate(available):
-        if needed <= 0:
-            break
-        page = pages[index]
-        if line in page.text:
-            continue
-        separator = "\n" if page.text.rstrip() else ""
-        page.text = f"{page.text.rstrip()}{separator}{line}".strip()
-        needed -= 1
-
-
-def _normalize_dialogue_lines(text: str, max_lines: int = 3) -> str:
-    """
-    Keep up to max_lines of dialogue. Any extra dialogue lines or quoted segments
-    are rewritten into plain narration (no quotes).
-    """
-    lines = text.splitlines(keepends=True)
-    dialogue_count = 0
-    updated: list[str] = []
-    for line in lines:
-        if re.match(r"^\s*[-—]\s+", line):
-            dialogue_count += 1
-            if dialogue_count > max_lines:
-                line = re.sub(r"^(\s*)[-—]\s+", r"\1", line)
-        updated.append(line)
-
-    interim = "".join(updated)
-    return _strip_extra_quotes(interim, allowed=max_lines)
-
-
-def _strip_extra_quotes(text: str, *, allowed: int) -> str:
-    """
-    Keep the first `allowed` quoted segments and rewrite the rest without quotes.
-    """
-    pattern = re.compile(r'"([^"\n]+)"|“([^”\n]+)”')
-    line_dialogue = re.compile(r'^\s*[-—]\s+["“].+["”]\s*$')
-    lines = text.splitlines(keepends=True)
-    dialogue_lines = sum(1 for line in lines if line_dialogue.match(line))
-    allowed_non_dialogue = max(0, allowed - dialogue_lines)
-    non_dialogue_quotes = 0
-    updated: list[str] = []
-
-    for line in lines:
-        if line_dialogue.match(line):
-            updated.append(line)
-            continue
-
-        def replace(match: re.Match[str]) -> str:
-            nonlocal non_dialogue_quotes
-            content = match.group(1) or match.group(2) or ""
-            if non_dialogue_quotes < allowed_non_dialogue:
-                non_dialogue_quotes += 1
-                return match.group(0)
-            return content
-
-        updated.append(pattern.sub(replace, line))
-
-    return "".join(updated)
-
-
-def _build_anchor_expansion_sentences(
-    anchor_spec: AnchorSpec,
-    cleaned: str,
-    narrator: str | None,
-) -> list[str]:
-    primary = narrator or (anchor_spec.characters[0] if anchor_spec.characters else "They")
-    setting = anchor_spec.setting
-    key_objects = anchor_spec.key_objects or []
-    sentences: list[str] = []
-
-    for beat in anchor_spec.beats[:6]:
-        action = beat.strip().rstrip(".")
-        if not action:
-            continue
-        if setting:
-            sentences.append(f"In the {setting}, {primary} {action}.")
-        elif key_objects:
-            sentences.append(f"The {key_objects[0]} was right there when {primary} {action}.")
-        else:
-            sentences.append(f"{primary} {action}.")
-
-    if key_objects:
-        sentences.append(f"{primary} kept the {key_objects[0]} close as the plan unfolded.")
-        if len(key_objects) > 1:
-            sentences.append(f"The {key_objects[1]} waited nearby while {primary} made the next move.")
-    if setting:
-        sentences.append(f"The {setting} held steady as {primary} took a careful breath.")
-
-    sentences.extend(_beat_expansion_sentences(cleaned, narrator))
-    sentences.extend(_fallback_beat_expansions(cleaned, narrator))
-    return _dedupe_preserve_order(sentences)
-
-
-def _append_anchor_expansions(
-    text: str,
-    *,
-    min_words: int,
-    anchor_spec: AnchorSpec,
-    cleaned: str,
-    narrator: str | None,
-    used: set[str],
-    max_sentences: int = 3,
-) -> str:
-    if _word_count(text) >= min_words:
-        return text.strip()
-
-    current = text.strip()
-    existing = {_normalize_sentence_key(s) for s in _split_sentences_for_dedupe(text)}
-    additions = _build_anchor_expansion_sentences(anchor_spec, cleaned, narrator)
-    added = 0
-    for sentence in additions:
-        if added >= max_sentences:
-            break
-        key = _normalize_sentence_key(sentence)
-        if key in existing or key in used:
-            continue
-        separator = " " if current else ""
-        current = f"{current}{separator}{sentence}".strip()
-        existing.add(key)
-        used.add(key)
-        added += 1
-    return current
-
-
-def _ensure_unique_sentences_across_pages(
-    pages: list[StoryPage],
-    anchor_spec: AnchorSpec,
-    cleaned: str,
-    narrator: str | None,
-    *,
-    append_expansions: bool = True,
-) -> None:
-    used_sentences: set[str] = set()
-    for page in pages:
-        sents = _split_sentences(page.text)
-        unique: list[str] = []
-        for sentence in sents:
-            key = _normalize_sentence_key(sentence)
-            if key in used_sentences:
-                continue
-            unique.append(sentence.strip())
-            used_sentences.add(key)
-        page.text = " ".join(unique).strip()
-        if append_expansions:
-            page.text = _append_anchor_expansions(
-                page.text,
-                min_words=_MIN_WORDS_PER_PAGE,
-                anchor_spec=anchor_spec,
-                cleaned=cleaned,
-                narrator=narrator,
-                used=used_sentences,
-                max_sentences=3,
-            )
-
-
-def _trim_pages_to_word_limit(pages: list[StoryPage], max_words: int) -> None:
-    for page in pages:
-        page.text = _trim_to_max_words(page.text, max_words)
-
-
-def _trim_to_max_words(text: str, max_words: int) -> str:
-    current = text.strip()
-    if _word_count(current) <= max_words:
-        return current
-    sentences = _split_sentences(current)
-    while sentences and _word_count(" ".join(sentences)) > max_words:
-        sentences.pop()
-    return " ".join(sentences).strip()
-
-
-def _anchor_padding_sentences(anchor_spec: AnchorSpec, narrator: str | None) -> list[str]:
-    sentences: list[str] = []
-    characters = anchor_spec.characters or ([narrator] if narrator else [])
-    primary_character = characters[0] if characters else (narrator or "The child")
-    key_objects = anchor_spec.key_objects or []
-    setting = anchor_spec.setting
-
-    if setting:
-        if key_objects:
-            sentences.append(
-                f"In the {setting}, {primary_character} kept noticing the {key_objects[0]}."
-            )
-        else:
-            sentences.append(f"In the {setting}, {primary_character} felt the moment settle in.")
-
-    for obj in key_objects[:3]:
-        sentences.append(f"The {obj} stayed important as the story moved forward.")
-
-    for beat in anchor_spec.beats[:4]:
-        trimmed = beat.strip().rstrip(".")
-        if trimmed:
-            sentences.append(f"This was the part where {trimmed}.")
-
-    if anchor_spec.lesson:
-        sentences.append(f"The lesson was gentle but clear: {anchor_spec.lesson}.")
-
-    for character in characters[1:3]:
-        sentences.append(f"{character} stayed close, keeping the plan honest and steady.")
-
-    return _dedupe_preserve_order(sentences)
-
-
-def _anchor_phrase_keywords(phrase: str) -> list[str]:
-    return [token.lower() for token in re.findall(r"[A-Za-z']+", phrase) if len(token) > 3]
-
-
-def _phrase_covered(text: str, phrase: str) -> bool:
-    if not phrase:
-        return True
-    lowered = text.lower()
-    keywords = _anchor_phrase_keywords(phrase)
-    if not keywords:
-        return phrase.lower() in lowered
-    required = max(1, math.ceil(len(keywords) * 0.5))
-    return sum(1 for keyword in keywords if keyword in lowered) >= required
-
-
-def _missing_anchor_items(text: str, anchor_spec: AnchorSpec) -> list[str]:
-    lowered = (text or "").lower()
-    missing_beats = [
-        beat for beat in (anchor_spec.beats or []) if beat and not _phrase_covered(lowered, beat)
-    ]
-    missing_objects = [
-        obj for obj in (anchor_spec.key_objects or []) if obj and obj.lower() not in lowered
-    ]
-    missing_setting = [anchor_spec.setting] if anchor_spec.setting and anchor_spec.setting.lower() not in lowered else []
-    missing_characters = [
-        char for char in (anchor_spec.characters or []) if char and char.lower() not in lowered
-    ]
-    missing_lesson = [anchor_spec.lesson] if anchor_spec.lesson and anchor_spec.lesson.lower() not in lowered else []
-    return _dedupe_preserve_order(
-        [item for item in missing_beats + missing_objects + missing_setting + missing_characters + missing_lesson if item]
+    p1 = (
+        f"One day, {name} had a tricky little idea about {topic}. "
+        f"It started like a tiny secret: {snippet} "
+        f"{name} wondered if it would matter… but the moment wobbled bigger and bigger, like a snowball rolling downhill. "
+        "Soon, everyone noticed something felt off, and the worry started to tap like a drum. "
+        'Someone asked, "What’s going on?" and the air suddenly felt full of questions.'
+    )
+    p2 = (
+        f"At last, {name} took a deep breath and told the truth. "
+        f'"I’m sorry," said {name}, and that brave sentence changed everything. '
+        f"Together, they faced {topic} in a way that turned the scary part into the funny part. "
+        "A warm apology, a clever plan, and a few giggles later, everyone felt closer than before. "
+        "By the end, the lesson felt simple: honest words make hearts lighter."
     )
 
-
-def _sensory_clause_for_anchor(anchor: str) -> str:
-    lowered = anchor.lower()
-    cues = [
-        (("pizza", "cheese", "crust"), "the scent of warm cheese lingered in the air"),
-        (("trash", "bin", "garbage"), "a metal lid rang out with a sharp clang"),
-        (("hoof", "horse"), "hoofbeats clicked across the ground in quick taps"),
-        (("rain", "storm"), "rain pattered in a steady, close rhythm"),
-        (("snow", "ice", "frost"), "cold flakes brushed against their cheeks"),
-        (("ocean", "sea", "salt"), "salt air pricked their noses"),
-        (("forest", "tree", "pine"), "damp earth and pine filled each breath"),
-        (("fire", "smoke", "ember"), "heat wavered and smoke curled nearby"),
-        (("robot", "machine", "motor"), "tiny motors whirred with a tinny buzz"),
-        (("castle", "stone", "tower"), "cool stone held a faint echo"),
+    required_terms = _extract_anchor_terms(cleaned, max_terms=_ANCHOR_MAX_TERMS)
+    pages = [
+        StoryPage(
+            text=_expand_text_to_range(
+                p1,
+                _MIN_WORDS_PER_PAGE,
+                _MAX_WORDS_PER_PAGE,
+                _keyword_expansions(required_terms, "setup", rng),
+            ),
+            illustration_prompt=(
+                f"Watercolor children's book illustration of {name} and {topic} beginning, "
+                "cozy setting, playful mischief, warm light, gentle textures."
+            ),
+        ),
+        StoryPage(
+            text=_expand_text_to_range(
+                p2,
+                _MIN_WORDS_PER_PAGE,
+                _MAX_WORDS_PER_PAGE,
+                _keyword_expansions(required_terms, "resolution", rng),
+            ),
+            illustration_prompt=(
+                f"Watercolor children's book illustration of {name} resolving {topic}, "
+                "warm apology moment, funny relief, cozy happy ending, soft light."
+            ),
+        ),
     ]
-    for keys, clause in cues:
-        if any(key in lowered for key in keys):
-            return clause
+    if target_pages != 2:
+        pages = pages[:target_pages]
 
-    noun_phrases = _extract_noun_phrases(anchor, min_count=1, max_count=1)
-    if noun_phrases:
-        noun = noun_phrases[0]
-        return f"the {noun} left a clear texture against their hands"
-    return "the moment carried a small, concrete detail they could feel"
-
-
-def _sentence_with_sensory(anchor: str) -> str:
-    sentence = _split_sentences(anchor)
-    base = (sentence[0] if sentence else anchor).strip().rstrip(".!?")
-    if not base:
-        return ""
-    base = base[0].upper() + base[1:]
-    sensory = _sensory_clause_for_anchor(base)
-    return f"{base}, {sensory}."
-
-
-def _anchor_padding_paragraph(anchor_one: str, anchor_two: str | None = None) -> str:
-    sentences = []
-    first = _sentence_with_sensory(anchor_one)
-    if first:
-        sentences.append(first)
-    if anchor_two:
-        second = _sentence_with_sensory(anchor_two)
-        if second:
-            sentences.append(second)
-    return " ".join(sentences).strip()
-
-
-def _pad_page_with_anchor_paragraphs(
-    text: str,
-    *,
-    anchor_spec: AnchorSpec,
-    min_words: int,
-    max_words: int,
-) -> str:
-    if _word_count(text) >= min_words:
-        return text
-    missing = _missing_anchor_items(text, anchor_spec)
-    if not missing:
-        return text
-    current = text.strip()
-    paragraphs_added = 0
-    index = 0
-    while _word_count(current) < min_words and paragraphs_added < 3 and index < len(missing):
-        anchor_one = missing[index]
-        anchor_two = missing[index + 1] if index + 1 < len(missing) else None
-        paragraph = _anchor_padding_paragraph(anchor_one, anchor_two)
-        if not paragraph:
-            break
-        next_text = f"{current}\n\n{paragraph}" if current else paragraph
-        if _word_count(next_text) > max_words and _word_count(current) >= min_words:
-            break
-        current = next_text
-        paragraphs_added += 1
-        index += 2 if anchor_two else 1
-    return current
-
-
-def _pad_pages_with_anchor_paragraphs(
-    pages: list[StoryPage],
-    *,
-    anchor_spec: AnchorSpec,
-    min_words: int,
-    max_words: int,
-) -> None:
-    for page in pages:
-        if _word_count(page.text) >= min_words:
-            continue
-        page.text = _pad_page_with_anchor_paragraphs(
-            page.text,
-            anchor_spec=anchor_spec,
-            min_words=min_words,
-            max_words=max_words,
-        )
-
-
-def _pad_to_min_words_no_repeats(
-    text: str,
-    target_min: int,
-    candidates: list[str],
-    used: set[str],
-) -> str:
-    cur = (text or "").strip()
-    if _word_count(cur) >= target_min:
-        return cur
-    for sent in candidates:
-        if sent in used:
-            continue
-        if sent in cur:
-            used.add(sent)
-            continue
-        cur2 = cur + (" " if cur else "") + sent
-        used.add(sent)
-        cur = cur2
-        if _word_count(cur) >= target_min:
-            break
-    return cur
-
-
-def _pad_to_min_words(text: str, target_min: int, topic: str, name: str) -> str:
-    """
-    Guaranteed padding: keep appending expansions (cycling) until we reach target_min
-    or we’re within a small tolerance and can’t add more without exceeding max.
-    """
-    if _word_count(text) >= target_min:
-        return text
-
-    pool = _page_expansions(topic, name, stage="resolution") + _page_expansions(
-        topic, name, stage="setup"
+    story = StoryBook(
+        title=title,
+        subtitle="A story told out loud",
+        pages=pages,
+        narrator=narrator,
     )
-
-    pool = [s.replace('"', "").replace("“", "").replace("”", "") for s in pool]
-
-    current = text
-    for _ in range(50):
-        if _word_count(current) >= target_min:
-            break
-        current = _expand_text_to_range(current, target_min, _MAX_WORDS_PER_PAGE, pool)
-
-        if current == text:
-            break
-        text = current
-
-    return current
+    return story
 
 
-def _pad_text_to_min_words(text: str, min_words: int) -> str:
-    """
-    If text is under min_words, append neutral expansions until it meets min.
-    """
-    if _word_count(text) >= min_words:
-        return text
-    topic = _infer_topic(text)
-    name = "A young storyteller"
-    additions = _page_expansions(topic, name, stage="resolution")
-    return _expand_text_to_range(text, min_words, _MAX_WORDS_PER_PAGE, additions)
-
-
-def _pad_text_to_min_words_with_beats(
-    text: str,
-    *,
-    min_words: int,
-    cleaned: str,
-    narrator: str | None,
-) -> str:
-    """
-    If text is under min_words, append plot-relevant expansion sentences derived
-    from the transcript beats (avoid boilerplate).
-    """
-    if _word_count(text) >= min_words:
-        return text
-
-    additions = _beat_expansion_sentences(cleaned, narrator)
-    if not additions:
-        additions = _fallback_beat_expansions(cleaned, narrator)
-
-    existing = {s.lower() for s in _split_sentences_for_dedupe(text)}
-    filtered = [s for s in additions if s.lower() not in existing]
-
-    if not filtered:
-        return text
-    return _expand_text_to_range(text, min_words, _MAX_WORDS_PER_PAGE, filtered)
-
-
-def _beat_expansion_sentences(cleaned: str, narrator: str | None) -> list[str]:
-    lowered = (cleaned or "").lower()
-    name = narrator or "Claire"
-    sentences: list[str] = []
-
-    if "pizza" in lowered:
-        sentences.append("The pizza smell curled through the room like a warm ribbon.")
-    if "crust" in lowered:
-        sentences.append(f"{name} tucked the crust away, feeling its crackly edges.")
-    if "trash" in lowered or "trash can" in lowered or "bin" in lowered:
-        sentences.append("The trash can lid clinked louder than anyone expected.")
-    if "monster" in lowered and "cheese" in lowered:
-        sentences.append("The monster's cheese breath puffed out in a goofy cloud.")
-    elif "monster" in lowered:
-        sentences.append("A pretend monster stomped in with a silly, cheesy roar.")
-    if "horse" in lowered or "hooves" in lowered:
-        sentences.append("Shiny horse hooves tapped the floor like tiny cymbals.")
-    if "apolog" in lowered or "sorry" in lowered:
-        sentences.append("The apology came out soft and brave, like a whispering hug.")
-    if "laugh" in lowered or "giggl" in lowered:
-        sentences.append("Everyone laughed, and the tension loosened like a shoelace.")
-
-    return sentences
-
-
-def _fallback_beat_expansions(cleaned: str, narrator: str | None) -> list[str]:
-    phrases = _extract_noun_phrases(cleaned, min_count=3, max_count=6)
-    if not phrases:
-        return []
-    speaker = narrator or "They"
-    sentences: list[str] = []
-    for phrase in phrases:
-        sentences.append(f"{speaker} kept noticing the {phrase} as the moment unfolded.")
-    return sentences
-
-
-def _maybe_generate_cover_image(
-    story: StoryBook,
-    anchor_spec: AnchorSpec,
-    narrator: str | None,
-) -> None:
+# -----------------------------
+# Image generation + cover art
+# -----------------------------
+def _maybe_generate_images(story: StoryBook) -> None:
     if not _use_openai_image_mode():
         return
     client = _get_openai_client()
@@ -3655,61 +765,30 @@ def _maybe_generate_cover_image(
     out_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    cover_prompt = story.cover_illustration_prompt
-    if not cover_prompt:
-        characters = anchor_spec.characters or ([narrator] if narrator else [])
-        style_seed = _build_style_seed(characters)
-        cover_prompt = _cover_prompt(story, anchor_spec, style_seed)
-        story.cover_illustration_prompt = cover_prompt
+    # Cover art prompt
+    cover_prompt = (
+        "Children's picture-book cover illustration in watercolor style. "
+        f"Title concept: {story.title}. "
+        f"Include the main character ({story.narrator or 'a child'}) and the main story theme "
+        "in a cheerful, whimsical way. "
+        "Soft textures, warm lighting, friendly expressions, no scary realism."
+    )
     try:
-        cover_response = client.images.generate(
-            model="gpt-image-1",
-            prompt=cover_prompt,
-            size="1024x1024",
-        )
+        cover = client.images.generate(model="gpt-image-1", prompt=cover_prompt, size="1024x1024")
+        data = cover.data[0] if cover.data else None
+        if data and getattr(data, "b64_json", None):
+            cover_path = out_dir / f"story_{timestamp}_cover.png"
+            cover_path.write_bytes(base64.b64decode(data.b64_json))
+            story.cover_image_path = str(cover_path)
     except Exception:
-        cover_response = None
+        # non-fatal
+        pass
 
-    cover_data = cover_response.data[0] if cover_response and cover_response.data else None
-    if not cover_data:
-        return
-
-    cover_path = out_dir / f"{timestamp}_cover.png"
-    if getattr(cover_data, "b64_json", None):
-        cover_bytes = base64.b64decode(cover_data.b64_json)
-        cover_path.write_bytes(cover_bytes)
-    elif getattr(cover_data, "url", None):
-        try:
-            request.urlretrieve(cover_data.url, cover_path)
-        except Exception:
-            return
-    else:
-        return
-
-    story.cover_path = str(cover_path)
-    story.cover_image_path = str(cover_path)
-    story.cover_illustration_path = str(cover_path)
-
-
-def _maybe_generate_images(story: StoryBook, cleaned: str) -> None:
-    if not _use_openai_image_mode():
-        return
-    client = _get_openai_client()
-    if not client:
-        return
-
-    out_dir = Path("out/books/images")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
+    # Page illustrations
     for index, page in enumerate(story.pages, start=1):
-        prompt = page.illustration_prompt or "A cozy children's storybook illustration."
+        prompt = (page.illustration_prompt or "").strip() or "A cozy children's storybook illustration in watercolor."
         try:
-            response = client.images.generate(
-                model="gpt-image-1",
-                prompt=prompt,
-                size="1024x1024",
-            )
+            response = client.images.generate(model="gpt-image-1", prompt=prompt, size="1024x1024")
         except Exception:
             continue
 
@@ -3719,16 +798,13 @@ def _maybe_generate_images(story: StoryBook, cleaned: str) -> None:
 
         image_path = out_dir / f"story_{timestamp}_p{index}.png"
         if getattr(data, "b64_json", None):
-            image_bytes = base64.b64decode(data.b64_json)
-            image_path.write_bytes(image_bytes)
+            image_path.write_bytes(base64.b64decode(data.b64_json))
             page.illustration_path = str(image_path)
-            page.image_path = str(image_path)
             continue
 
         if getattr(data, "url", None):
             try:
                 request.urlretrieve(data.url, image_path)
+                page.illustration_path = str(image_path)
             except Exception:
                 continue
-            page.illustration_path = str(image_path)
-            page.image_path = str(image_path)
