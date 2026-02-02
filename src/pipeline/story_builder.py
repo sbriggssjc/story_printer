@@ -9,8 +9,13 @@ from collections import Counter
 class StoryPage:
     text: str
     illustration_prompt: str
+    # Back-compat: older code used illustration_path; newer code sometimes uses image_path.
     illustration_path: str | None = None
     image_path: str | None = None
+
+    def get_image_path(self) -> str | None:
+        # Prefer image_path if provided, else illustration_path
+        return self.image_path or self.illustration_path
 
     def __post_init__(self) -> None:
         if self.image_path is None and self.illustration_path:
@@ -25,6 +30,7 @@ class StoryBook:
     subtitle: str
     pages: list[StoryPage]
     narrator: str | None = None
+    # Optional cover image (for PDF cover art)
     cover_image_path: str | None = None
     cover_prompt: str | None = None
 
