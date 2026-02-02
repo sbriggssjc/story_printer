@@ -25,6 +25,7 @@ import os
 import random
 import re
 from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -47,11 +48,30 @@ _DIALOGUE_MAX = int(os.getenv("STORY_DIALOGUE_MAX", "3"))
 
 _ANCHOR_MIN_HITS = int(os.getenv("STORY_ANCHOR_MIN_HITS", "3"))
 _ANCHOR_MAX_TERMS = int(os.getenv("STORY_ANCHOR_MAX_TERMS", "8"))
+_SHORT_TRANSCRIPT_WORDS = 40
 
 _STOPWORDS = {
     "the", "and", "then", "with", "from", "that", "this", "when", "they", "she", "he",
     "a", "an", "to", "of", "in", "on", "at", "for", "as", "is", "was", "were", "be",
     "it", "its", "their", "his", "her", "we", "i", "you", "my", "our", "your",
+    "mom", "mother", "mommy", "mum", "momma", "dad", "father", "daddy", "papa", "pa",
+    "parent", "parents",
+}
+
+_CREATURE_KEYWORDS = {
+    "monster",
+    "dragon",
+    "dinosaur",
+    "creature",
+    "beast",
+    "ogre",
+    "troll",
+    "goblin",
+    "alien",
+    "ghost",
+    "vampire",
+    "werewolf",
+    "unicorn",
 }
 
 # Phrases that commonly appear as generic filler; we REMOVE them (do not fail).
@@ -181,7 +201,8 @@ def _openai_storybook(
     print(f"OpenAI model: {_DEFAULT_MODEL}")
 
     system_prompt, user_prompt = _build_openai_prompts(cleaned, narrator, target_pages)
-    required_terms = _extract_anchor_terms(cleaned, max_terms=_ANCHOR_MAX_TERMS)
+    anchor_spec = _extract_anchor_spec(cleaned, max_terms=_ANCHOR_MAX_TERMS)
+    required_terms = _anchor_terms_for_expansion(anchor_spec, max_terms=_ANCHOR_MAX_TERMS)
 
     # We will try up to 3 attempts, but we also *repair*.
     for attempt in range(3):
@@ -235,7 +256,7 @@ def _openai_storybook(
         # Validate after repair
         ok, reasons = _validate_story_pages(
             pages=pages,
-            required_terms=required_terms,
+            anchor_spec=anchor_spec,
             target_min=_MIN_WORDS_PER_PAGE,
             target_max=_MAX_WORDS_PER_PAGE,
         )
@@ -399,42 +420,85 @@ def _build_pages_from_data(data: dict[str, Any], target_pages: int) -> list[Stor
     return pages
 
 
+@dataclass(frozen=True)
+class AnchorSpec:
+    names: list[str]
+    keywords: list[str]
+    creature_keywords: list[str]
+    transcript_word_count: int
+
+
 # -----------------------------
 # Robust fidelity / anchor terms
 # -----------------------------
-def _extract_anchor_terms(transcript: str, max_terms: int = 8) -> list[str]:
+def _extract_anchor_spec(transcript: str, max_terms: int = 8) -> AnchorSpec:
     """
     Transcript-agnostic term extraction for fidelity checking.
-    Returns a small list of salient words/phrases that should appear (loosely) in the story.
+    Extracts proper names + high-signal keywords for loose matching in the story.
     """
     t = (transcript or "").strip()
     if not t:
-        return []
+        return AnchorSpec(names=[], keywords=[], creature_keywords=[], transcript_word_count=0)
 
-    # Keep names as anchors when possible
-    names = re.findall(r"\b[A-Z][a-z]{2,}\b", t)
-    names = [n for n in names if n.lower() not in _STOPWORDS]
+    # Keep names as anchors when possible, but avoid generic family labels.
+    raw_names = re.findall(r"\b[A-Z][a-z]{2,}\b", t)
+    names: list[str] = []
+    for name in raw_names:
+        lowered = name.lower()
+        if lowered in _STOPWORDS:
+            continue
+        if lowered not in names:
+            names.append(lowered)
 
-    words = re.findall(r"[A-Za-z']+", t.lower())
-    words = [w for w in words if w not in _STOPWORDS and len(w) > 3]
+    words_all = re.findall(r"[A-Za-z']+", t.lower())
+    transcript_word_count = len(words_all)
+    words = [w for w in words_all if w not in _STOPWORDS and len(w) > 3]
     freq = [w for w, _ in Counter(words).most_common(max_terms * 2)]
 
-    anchors: list[str] = []
-    for n in names[:2]:
-        anchors.append(n.lower())
+    keywords: list[str] = []
     for w in freq:
-        if w not in anchors:
-            anchors.append(w)
+        if w in names:
+            continue
+        if w not in keywords:
+            keywords.append(w)
+        if len(keywords) >= max_terms:
+            break
+
+    creature_hits: list[str] = []
+    for creature in sorted(_CREATURE_KEYWORDS):
+        if re.search(rf"\\b{re.escape(creature)}s?\\b", t.lower()):
+            creature_hits.append(creature)
+
+    return AnchorSpec(
+        names=names,
+        keywords=keywords,
+        creature_keywords=creature_hits,
+        transcript_word_count=transcript_word_count,
+    )
+
+
+def _anchor_terms_for_expansion(anchor_spec: AnchorSpec, max_terms: int) -> list[str]:
+    anchors: list[str] = []
+    for name in anchor_spec.names:
+        if name not in anchors:
+            anchors.append(name)
+        if len(anchors) >= max_terms:
+            return anchors
+    for keyword in anchor_spec.keywords:
+        if keyword not in anchors:
+            anchors.append(keyword)
         if len(anchors) >= max_terms:
             break
     return anchors
 
 
-def _anchor_hits(text: str, required_terms: list[str]) -> int:
+def _count_term_hits(text: str, terms: list[str]) -> int:
     lowered = (text or "").lower()
     hits = 0
-    for term in required_terms:
-        if term and term.lower() in lowered:
+    for term in terms:
+        if not term:
+            continue
+        if re.search(rf"\\b{re.escape(term.lower())}s?\\b", lowered):
             hits += 1
     return hits
 
@@ -651,7 +715,7 @@ def _repair_pages(
 
 def _validate_story_pages(
     pages: list[StoryPage],
-    required_terms: list[str],
+    anchor_spec: AnchorSpec,
     target_min: int,
     target_max: int,
 ) -> tuple[bool, list[str]]:
@@ -671,13 +735,28 @@ def _validate_story_pages(
         reasons.append(f"dialogue lines counted {total_dialogue} outside {_DIALOGUE_MIN}-{_DIALOGUE_MAX}")
 
     # Anchor/fidelity check (global)
-    if required_terms:
-        combined = " ".join(p.text for p in pages)
-        hits = _anchor_hits(combined, required_terms)
-        min_hits = min(_ANCHOR_MIN_HITS, max(1, len(required_terms)))
-        if hits < min_hits:
+    combined = " ".join(p.text for p in pages)
+    if anchor_spec.names:
+        name_hits = _count_term_hits(combined, anchor_spec.names)
+        if name_hits < 1:
+            reasons.append("anchor/fidelity missing proper-name match")
+
+    if anchor_spec.keywords:
+        required_keyword_hits = 2 if anchor_spec.transcript_word_count < _SHORT_TRANSCRIPT_WORDS else _ANCHOR_MIN_HITS
+        required_keyword_hits = min(required_keyword_hits, len(anchor_spec.keywords))
+        keyword_hits = _count_term_hits(combined, anchor_spec.keywords)
+        if keyword_hits < required_keyword_hits:
             reasons.append(
-                f"anchor/fidelity too low: hits {hits} < {min_hits} (terms={', '.join(required_terms[:6])})"
+                "anchor/fidelity too low: keyword hits "
+                f"{keyword_hits} < {required_keyword_hits} (terms={', '.join(anchor_spec.keywords[:6])})"
+            )
+
+    if anchor_spec.creature_keywords:
+        creature_hits = _count_term_hits(combined, anchor_spec.creature_keywords)
+        if creature_hits < 1:
+            reasons.append(
+                "anchor/fidelity missing creature keyword match "
+                f"(terms={', '.join(anchor_spec.creature_keywords[:4])})"
             )
 
     return (len(reasons) == 0, reasons)
@@ -736,7 +815,8 @@ def _local_storybook(cleaned: str, title: str, narrator: str | None, target_page
         "By the end, the lesson felt simple: honest words make hearts lighter."
     )
 
-    required_terms = _extract_anchor_terms(cleaned, max_terms=_ANCHOR_MAX_TERMS)
+    anchor_spec = _extract_anchor_spec(cleaned, max_terms=_ANCHOR_MAX_TERMS)
+    required_terms = _anchor_terms_for_expansion(anchor_spec, max_terms=_ANCHOR_MAX_TERMS)
     pages = [
         StoryPage(
             text=_expand_text_to_range(
