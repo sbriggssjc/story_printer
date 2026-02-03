@@ -158,6 +158,12 @@ _CREATURE_KEYWORDS = {
     "unicorn",
 }
 
+_WATERCOLOR_PROMPT_PREFIX = (
+    "Watercolor children's picture-book illustration, warm lighting, soft textures, "
+    "whimsical, hand-painted. NOT photorealistic. "
+    "no photo, no DSLR, no cinematic still, no 3D render, no realistic photography. "
+)
+
 # Phrases that commonly appear as generic filler; we REMOVE them (do not fail).
 _BOILERPLATE_SENTENCES = {
     "Sunlight puddled on the floor like warm butter, making the room glow.",
@@ -211,6 +217,24 @@ def _clean_transcript_for_story(text: str) -> str:
         flags=re.IGNORECASE,
     )
     return cleaned.strip()
+
+
+def _truncate_after_the_end(text: str) -> str:
+    if not text:
+        return text
+    match = re.search(r"(the end\b[.!?…]*[\"”']?)", text, flags=re.IGNORECASE)
+    if not match:
+        return text
+    return text[: match.end()].rstrip()
+
+
+def _ensure_watercolor_prompt(prompt: str) -> str:
+    cleaned = (prompt or "").strip()
+    if not cleaned:
+        return _WATERCOLOR_PROMPT_PREFIX.rstrip()
+    if cleaned.startswith(_WATERCOLOR_PROMPT_PREFIX):
+        return cleaned
+    return f"{_WATERCOLOR_PROMPT_PREFIX}{cleaned}"
 
 
 def _extract_proper_names(cleaned: str, narrator: str | None) -> list[str]:
@@ -602,7 +626,7 @@ def _build_openai_prompts(
         f"{voice_notes}"
         f"{fidelity_notes}"
         "- Avoid repeated stock phrases or generic filler.\n"
-        "- Each page must include a rich illustration_prompt in consistent watercolor picture-book style.\n\n"
+        "- Each illustration_prompt must be watercolor picture-book style and explicitly NOT photorealistic.\n\n"
         "OUTPUT JSON schema:\n"
         "{"
         '"title": string, '
@@ -704,7 +728,9 @@ def _openai_storybook(
             target_max=_MAX_WORDS_PER_PAGE,
         )
         for page in pages:
+            page.text = _truncate_after_the_end(page.text)
             page.text = _strip_generic_filler(page.text)
+            page.text = _truncate_after_the_end(page.text)
             page.text = _ensure_min_words(
                 page.text,
                 min_words,
@@ -713,6 +739,7 @@ def _openai_storybook(
                 display_name=display_name,
             )
             page.text = _fix_display_name_case(page.text, display_name or narrator)
+            page.illustration_prompt = _ensure_watercolor_prompt(page.illustration_prompt)
 
         anchors = _build_anchor_list(cleaned, display_name or narrator)
         page_texts = [page.text for page in pages]
@@ -730,6 +757,9 @@ def _openai_storybook(
                 )
                 continue
             return None
+
+        for page in pages:
+            page.text = _truncate_after_the_end(page.text)
 
         # Validate after repair
         ok, reasons = _validate_story_pages(
@@ -895,7 +925,12 @@ def _build_pages_from_data(data: dict[str, Any], target_pages: int) -> list[Stor
         text = (page.get("text") or "").strip()
         prompt = (page.get("illustration_prompt") or "").strip()
         if text and prompt:
-            pages.append(StoryPage(text=text, illustration_prompt=prompt))
+            pages.append(
+                StoryPage(
+                    text=text,
+                    illustration_prompt=_ensure_watercolor_prompt(prompt),
+                )
+            )
     return pages
 
 
@@ -1488,6 +1523,7 @@ def _local_storybook(
 
     for page in pages:
         page.text = _strip_generic_filler(page.text)
+        page.text = _truncate_after_the_end(page.text)
         page.text = _ensure_min_words(
             page.text,
             min_words,
@@ -1496,6 +1532,7 @@ def _local_storybook(
             display_name=display_name,
         )
         page.text = _fix_display_name_case(page.text, display_name or narrator)
+        page.illustration_prompt = _ensure_watercolor_prompt(page.illustration_prompt)
 
     story = StoryBook(
         title=title,
