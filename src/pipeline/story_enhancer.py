@@ -1279,7 +1279,6 @@ def _keyword_expansions(
         sensory = [
             "I heard tiny sounds all around me.",
             "I noticed a warm, cozy smell nearby.",
-            "I felt a quiet pause, like I was waiting for the next brave move.",
             "I heard shoes scuffing, and I held still for a beat.",
             "I felt a little breeze and a little surprise.",
         ]
@@ -1334,6 +1333,7 @@ def _strip_generic_filler(text: str) -> str:
         r"\bshoes scuffing\b",
         r"\bshoes scuffed\b",
         r"\bshoes scuffed the floor\b",
+        r"\bquiet pause\b",
         r"\broom held a quiet (pause|hush|silence|stillness)\b",
         r"\broom held a quiet pause\b",
         r"\btruth finally felt lighter\b",
