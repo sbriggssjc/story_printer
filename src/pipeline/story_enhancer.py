@@ -345,6 +345,14 @@ def _anchor_required_count(anchor_count: int) -> int:
     return min(required, 4)
 
 
+def _effective_min_words_per_page() -> int:
+    if _VOICE_MODE == "kid" and _FIDELITY_MODE == "fun":
+        return 170
+    if _VOICE_MODE == "kid" and _FIDELITY_MODE == "strict":
+        return 160
+    return _MIN_WORDS_PER_PAGE
+
+
 def _anchor_coverage(page_texts: list[str], anchors: list[str]) -> tuple[bool, str, list[str]]:
     """
     Don't require EVERY anchor. Require a reasonable coverage threshold.
@@ -687,11 +695,12 @@ def _openai_storybook(
             continue
 
         # REPAIR PHASE (critical for robustness)
+        min_words = _effective_min_words_per_page()
         pages = _repair_pages(
             pages=pages,
             narrator=display_name or narrator,
             required_terms=required_terms,
-            target_min=_MIN_WORDS_PER_PAGE,
+            target_min=min_words,
             target_max=_MAX_WORDS_PER_PAGE,
         )
 
@@ -715,7 +724,7 @@ def _openai_storybook(
         # Validate after repair
         ok, reasons = _validate_story_pages(
             pages=pages,
-            target_min=_MIN_WORDS_PER_PAGE,
+            target_min=min_words,
             target_max=_MAX_WORDS_PER_PAGE,
         )
         if not ok:
@@ -1105,6 +1114,7 @@ def _keyword_expansions(
     """
     Generate non-stock, keyword-aware expansion sentences so we don't get the same filler every story.
     """
+    display_name = narrator or ""
     terms = []
     for t in required_terms:
         if not t:
@@ -1114,7 +1124,10 @@ def _keyword_expansions(
             continue
         if len(low) < 4 and low not in {"dad", "mom"}:
             continue
-        terms.append(t.strip())
+        formatted = t.strip()
+        if display_name and formatted.lower() == display_name.lower():
+            formatted = display_name
+        terms.append(formatted)
 
     rng.shuffle(terms)
 
@@ -1196,20 +1209,29 @@ def _keyword_expansions(
 
 def _strip_generic_filler(text: str) -> str:
     bad_patterns = [
-        r"\btraded quick glances\b",
-        r"\broom held a quiet pause\b",
+        r"\btraded (a )?quick glances?\b",
+        r"\btraded quick glance\b",
+        r"\bshoes scuffing\b",
+        r"\bshoes scuffed\b",
         r"\bshoes scuffed the floor\b",
+        r"\broom held a quiet (pause|hush|silence|stillness)\b",
+        r"\broom held a quiet pause\b",
         r"\btruth finally felt lighter\b",
         r"\bmoment when a story decides to turn a corner\b",
     ]
     sentences = _split_sentences(text)
     cleaned: list[str] = []
     for sentence in sentences:
-        lowered = sentence.lower()
-        if any(re.search(pattern, lowered) for pattern in bad_patterns):
+        if any(re.search(pattern, sentence, flags=re.IGNORECASE) for pattern in bad_patterns):
             continue
         cleaned.append(sentence)
     return " ".join(cleaned).strip()
+
+
+def _fix_display_name_case(text: str, display_name: str | None) -> str:
+    if display_name == "Claire":
+        return re.sub(r"\bclaire\b", "Claire", text)
+    return text
 
 
 def _repair_pages(
@@ -1275,6 +1297,7 @@ def _repair_pages(
 
     for p in pages:
         p.text = _strip_generic_filler(p.text)
+        p.text = _fix_display_name_case(p.text, narrator)
 
     return pages
 
@@ -1364,11 +1387,12 @@ def _local_storybook(
     anchor_spec = _extract_anchor_spec(cleaned, max_terms=_ANCHOR_MAX_TERMS)
     required_terms = _anchor_terms_for_expansion(anchor_spec, max_terms=_ANCHOR_MAX_TERMS)
     used_sentences: set[str] = set()
+    min_words = _effective_min_words_per_page()
     pages = [
         StoryPage(
             text=_expand_text_to_range(
                 p1,
-                _MIN_WORDS_PER_PAGE,
+                min_words,
                 _MAX_WORDS_PER_PAGE,
                 _keyword_expansions(required_terms, "setup", rng, narrator=display_name or narrator),
                 used_sentences=used_sentences,
@@ -1381,7 +1405,7 @@ def _local_storybook(
         StoryPage(
             text=_expand_text_to_range(
                 p2,
-                _MIN_WORDS_PER_PAGE,
+                min_words,
                 _MAX_WORDS_PER_PAGE,
                 _keyword_expansions(required_terms, "resolution", rng, narrator=display_name or narrator),
                 used_sentences=used_sentences,
@@ -1397,6 +1421,7 @@ def _local_storybook(
 
     for page in pages:
         page.text = _strip_generic_filler(page.text)
+        page.text = _fix_display_name_case(page.text, display_name or narrator)
 
     story = StoryBook(
         title=title,
