@@ -1089,7 +1089,12 @@ def _expand_text_to_range(
     return current
 
 
-def _keyword_expansions(required_terms: list[str], stage: str, rng: random.Random) -> list[str]:
+def _keyword_expansions(
+    required_terms: list[str],
+    stage: str,
+    rng: random.Random,
+    narrator: str | None,
+) -> list[str]:
     """
     Generate non-stock, keyword-aware expansion sentences so we don't get the same filler every story.
     """
@@ -1105,37 +1110,99 @@ def _keyword_expansions(required_terms: list[str], stage: str, rng: random.Rando
         terms.append(t.strip())
 
     rng.shuffle(terms)
+
+    use_first_person = _VOICE_MODE == "kid" and bool(narrator)
     anchor_lines: list[str] = []
     for term in terms[:2]:
-        anchor_lines.append(f"{term} lingered in everyone’s thoughts for a moment.")
+        if _FIDELITY_MODE == "strict" or use_first_person:
+            anchor_lines.append(f"I kept thinking about {term}.")
+        else:
+            anchor_lines.append(f"{term} lingered in everyone’s thoughts for a moment.")
 
-    sensory = [
-        "The air felt busy with tiny sounds—shuffling feet, a soft laugh, and something far away clinking.",
-        "Something nearby smelled warm and cozy, like the promise of a good idea.",
-        "The room held a quiet pause, as if waiting for the next brave move.",
-        "Shoes scuffed the floor and a gentle hush settled in.",
-        "A soft breeze drifted through, carrying a hint of surprise.",
-    ]
-    action = [
-        "They traded quick glances, deciding to be brave even if their voices were small.",
-        "A quiet plan formed, and everyone leaned in as if sharing a secret.",
-        "Someone took a careful step, and the whole mood tipped toward action.",
-        "It felt like the moment when a story decides to turn a corner.",
-    ]
-    if stage == "setup":
-        extra = [
-            "It felt exciting and risky at the same time—like balancing a secret on the tip of a spoon.",
-            "The first little choice didn’t seem huge… until it started rolling like a snowball.",
+    if _FIDELITY_MODE == "strict":
+        strict_pool = [
+            "I felt a tiny flutter in my tummy.",
+            "My heart went thump-thump.",
+            "I took a slow breath.",
+            "I felt brave for a moment.",
+            "I felt nervous and then a little steadier.",
+        ]
+        if stage == "setup":
+            strict_pool += ["I could tell something big was starting."]
+        else:
+            strict_pool += ["I felt lighter after the honest words."]
+        pool = strict_pool + anchor_lines
+        rng.shuffle(pool)
+        return pool[:6]
+
+    if use_first_person:
+        sensory = [
+            "I heard tiny sounds all around me.",
+            "I noticed a warm, cozy smell nearby.",
+            "I felt a quiet pause, like I was waiting for the next brave move.",
+            "I heard shoes scuffing, and I held still for a beat.",
+            "I felt a little breeze and a little surprise.",
+        ]
+        action = [
+            "I traded a quick glance with someone and decided to be brave.",
+            "I made a quiet plan and leaned in close.",
+            "I took a careful step, and the moment turned toward action.",
+            "I could feel the story turning a corner.",
         ]
     else:
-        extra = [
-            "The truth finally felt lighter once it was said out loud.",
-            "An honest apology changed the whole mood, like turning on a warm lamp.",
+        sensory = [
+            "The air felt busy with tiny sounds—shuffling feet, a soft laugh, and something far away clinking.",
+            "Something nearby smelled warm and cozy, like the promise of a good idea.",
+            "A soft breeze drifted through, carrying a hint of surprise.",
         ]
+        action = [
+            "A quiet plan formed, and everyone leaned in as if sharing a secret.",
+            "Someone took a careful step, and the mood tipped toward action.",
+            "It felt like the moment when a story decides to turn a corner.",
+        ]
+
+    if stage == "setup":
+        if use_first_person:
+            extra = [
+                "I felt excited and a little risky at the same time.",
+                "My first little choice didn’t seem huge… until it started rolling like a snowball.",
+            ]
+        else:
+            extra = [
+                "It felt exciting and risky at the same time—like balancing a secret on the tip of a spoon.",
+                "The first little choice didn’t seem huge… until it started rolling like a snowball.",
+            ]
+    else:
+        if use_first_person:
+            extra = [
+                "My honest apology changed the whole mood, like turning on a warm lamp.",
+            ]
+        else:
+            extra = [
+                "An honest apology changed the whole mood, like turning on a warm lamp.",
+            ]
 
     pool = sensory + action + extra + anchor_lines
     rng.shuffle(pool)
     return pool[:8]
+
+
+def _strip_generic_filler(text: str) -> str:
+    bad_patterns = [
+        r"\btraded quick glances\b",
+        r"\broom held a quiet pause\b",
+        r"\bshoes scuffed the floor\b",
+        r"\btruth finally felt lighter\b",
+        r"\bmoment when a story decides to turn a corner\b",
+    ]
+    sentences = _split_sentences(text)
+    cleaned: list[str] = []
+    for sentence in sentences:
+        lowered = sentence.lower()
+        if any(re.search(pattern, lowered) for pattern in bad_patterns):
+            continue
+        cleaned.append(sentence)
+    return " ".join(cleaned).strip()
 
 
 def _repair_pages(
@@ -1187,7 +1254,7 @@ def _repair_pages(
         wc = _word_count(p.text)
         if wc < target_min:
             stage = "setup" if idx == 0 else "resolution"
-            additions = _keyword_expansions(required_terms, stage=stage, rng=rng)
+            additions = _keyword_expansions(required_terms, stage=stage, rng=rng, narrator=narrator)
             p.text = _expand_text_to_range(
                 p.text,
                 target_min,
@@ -1198,6 +1265,9 @@ def _repair_pages(
 
         # If still short (very short transcript), we allow slightly under-min rather than failing hard
         # but we will try to hit min as best effort.
+
+    for p in pages:
+        p.text = _strip_generic_filler(p.text)
 
     return pages
 
@@ -1293,7 +1363,7 @@ def _local_storybook(
                 p1,
                 _MIN_WORDS_PER_PAGE,
                 _MAX_WORDS_PER_PAGE,
-                _keyword_expansions(required_terms, "setup", rng),
+                _keyword_expansions(required_terms, "setup", rng, narrator=display_name or narrator),
                 used_sentences=used_sentences,
             ),
             illustration_prompt=(
@@ -1306,7 +1376,7 @@ def _local_storybook(
                 p2,
                 _MIN_WORDS_PER_PAGE,
                 _MAX_WORDS_PER_PAGE,
-                _keyword_expansions(required_terms, "resolution", rng),
+                _keyword_expansions(required_terms, "resolution", rng, narrator=display_name or narrator),
                 used_sentences=used_sentences,
             ),
             illustration_prompt=(
@@ -1317,6 +1387,9 @@ def _local_storybook(
     ]
     if target_pages != 2:
         pages = pages[:target_pages]
+
+    for page in pages:
+        page.text = _strip_generic_filler(page.text)
 
     story = StoryBook(
         title=title,
