@@ -54,7 +54,7 @@ if _VOICE_MODE == "kid" and _FIDELITY_MODE == "strict":
 elif _VOICE_MODE == "kid":
     _BASE_MIN_WORDS_PER_PAGE = 170
 else:
-    _BASE_MIN_WORDS_PER_PAGE = 200
+    _BASE_MIN_WORDS_PER_PAGE = 180
 
 _MIN_WORDS_PER_PAGE = max(_BASE_MIN_WORDS_PER_PAGE, _DEFAULT_WORDS_PER_PAGE - 60)
 _MAX_WORDS_PER_PAGE = min(340, _DEFAULT_WORDS_PER_PAGE + 80)
@@ -1366,6 +1366,23 @@ def _ensure_min_words(
     wc = _word_count(text)
     if wc >= min_words:
         return text
+
+    if voice_mode == "standard":
+        lowered = (text or "").lower()
+        is_first_person = bool(re.search(r"\b(i|my|me|mine|we|our|us)\b", lowered))
+        if is_first_person:
+            sentence = "I paused for a moment and kept going."
+        else:
+            if re.search(r"\bhe\b", lowered):
+                sentence = "He paused for a moment and kept going."
+            elif re.search(r"\bshe\b", lowered):
+                sentence = "She paused for a moment and kept going."
+            else:
+                sentence = "They paused for a moment and kept going."
+        updated = f"{text.rstrip()} {sentence}".strip()
+        if display_name == "Claire":
+            updated = re.sub(r"\bclaire\b", "Claire", updated)
+        return updated
 
     base_sentences = [
         "I took a deep breath.",
