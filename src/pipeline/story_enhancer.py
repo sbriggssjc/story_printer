@@ -703,6 +703,16 @@ def _openai_storybook(
             target_min=min_words,
             target_max=_MAX_WORDS_PER_PAGE,
         )
+        for page in pages:
+            page.text = _strip_generic_filler(page.text)
+            page.text = _ensure_min_words(
+                page.text,
+                min_words,
+                voice_mode=_VOICE_MODE,
+                fidelity_mode=_FIDELITY_MODE,
+                display_name=display_name,
+            )
+            page.text = _fix_display_name_case(page.text, display_name or narrator)
 
         anchors = _build_anchor_list(cleaned, display_name or narrator)
         page_texts = [page.text for page in pages]
@@ -1218,6 +1228,7 @@ def _strip_generic_filler(text: str) -> str:
         r"\broom held a quiet pause\b",
         r"\btruth finally felt lighter\b",
         r"\bmoment when a story decides to turn a corner\b",
+        r"^\s*i felt brave for a moment\.?\s*$",
     ]
     sentences = _split_sentences(text)
     cleaned: list[str] = []
@@ -1232,6 +1243,66 @@ def _fix_display_name_case(text: str, display_name: str | None) -> str:
     if display_name == "Claire":
         return re.sub(r"\bclaire\b", "Claire", text)
     return text
+
+
+def _ensure_min_words(
+    text: str,
+    min_words: int,
+    *,
+    voice_mode: str,
+    fidelity_mode: str,
+    display_name: str | None,
+) -> str:
+    wc = _word_count(text)
+    if wc >= min_words:
+        return text
+
+    base_sentences = [
+        "I took a deep breath.",
+        "I felt sorry.",
+        "I decided to listen next time.",
+        "I tried again.",
+        "I wanted to do better.",
+    ]
+    strict_extra = [
+        "I stayed calm.",
+        "I made a small promise.",
+        "I felt ready to learn.",
+    ]
+    fun_extra = [
+        "I felt a tiny spark of courage.",
+        "I giggled at myself.",
+        "I felt lighter inside.",
+    ]
+
+    if fidelity_mode == "strict":
+        pool = base_sentences + strict_extra
+    else:
+        pool = base_sentences + fun_extra
+
+    if voice_mode == "standard":
+        pool = base_sentences + (strict_extra if fidelity_mode == "strict" else fun_extra)
+
+    additions: list[str] = []
+    existing = (text or "").lower()
+    for sentence in pool:
+        if len(additions) >= 3:
+            break
+        if sentence.lower() in existing:
+            continue
+        additions.append(sentence)
+        existing += " " + sentence.lower()
+        updated = f"{text.rstrip()} {' '.join(additions)}".strip()
+        if _word_count(updated) >= min_words:
+            return updated
+
+    if not additions:
+        additions.append("I took a deep breath.")
+
+    updated = f"{text.rstrip()} {' '.join(additions)}".strip()
+    if display_name == "Claire":
+        updated = re.sub(r"\bclaire\b", "Claire", updated)
+    return updated
 
 
 def _repair_pages(
@@ -1294,10 +1365,6 @@ def _repair_pages(
 
         # If still short (very short transcript), we allow slightly under-min rather than failing hard
         # but we will try to hit min as best effort.
-
-    for p in pages:
-        p.text = _strip_generic_filler(p.text)
-        p.text = _fix_display_name_case(p.text, narrator)
 
     return pages
 
@@ -1421,6 +1488,13 @@ def _local_storybook(
 
     for page in pages:
         page.text = _strip_generic_filler(page.text)
+        page.text = _ensure_min_words(
+            page.text,
+            min_words,
+            voice_mode=_VOICE_MODE,
+            fidelity_mode=_FIDELITY_MODE,
+            display_name=display_name,
+        )
         page.text = _fix_display_name_case(page.text, display_name or narrator)
 
     story = StoryBook(
