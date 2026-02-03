@@ -49,7 +49,14 @@ if _FIDELITY_MODE not in {"fun", "strict"}:
     _FIDELITY_MODE = "fun"
 
 # Keep ranges forgiving; enforce via postprocessing.
-_MIN_WORDS_PER_PAGE = max(200, _DEFAULT_WORDS_PER_PAGE - 60)
+if _VOICE_MODE == "kid" and _FIDELITY_MODE == "strict":
+    _BASE_MIN_WORDS_PER_PAGE = 160
+elif _VOICE_MODE == "kid":
+    _BASE_MIN_WORDS_PER_PAGE = 170
+else:
+    _BASE_MIN_WORDS_PER_PAGE = 200
+
+_MIN_WORDS_PER_PAGE = max(_BASE_MIN_WORDS_PER_PAGE, _DEFAULT_WORDS_PER_PAGE - 60)
 _MAX_WORDS_PER_PAGE = min(340, _DEFAULT_WORDS_PER_PAGE + 80)
 
 _DIALOGUE_MIN = int(os.getenv("STORY_DIALOGUE_MIN", "1"))
