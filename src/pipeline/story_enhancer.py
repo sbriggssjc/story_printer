@@ -1373,12 +1373,14 @@ def _ensure_min_words(
         if is_first_person:
             sentence = "I paused for a moment and kept going."
         else:
-            if re.search(r"\bhe\b", lowered):
+            if re.search(r"\b(he|his)\b", lowered):
                 sentence = "He paused for a moment and kept going."
-            elif re.search(r"\bshe\b", lowered):
+            elif re.search(r"\b(she|her)\b", lowered):
                 sentence = "She paused for a moment and kept going."
             else:
                 sentence = "They paused for a moment and kept going."
+        if (text or "").strip().lower().endswith(sentence.lower()):
+            return text
         updated = f"{text.rstrip()} {sentence}".strip()
         if display_name == "Claire":
             updated = re.sub(r"\bclaire\b", "Claire", updated)
