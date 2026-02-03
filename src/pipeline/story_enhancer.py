@@ -307,6 +307,69 @@ def _extract_fidelity_keywords(cleaned: str, anchors: list[str]) -> list[str]:
     return must[:4]
 
 
+def _strict_novelty_violations(page_texts: list[str], anchors: list[str]) -> list[str]:
+    def _normalize_term(value: str) -> str:
+        cleaned = re.sub(r"[^a-z0-9'\s-]+", " ", (value or "").lower())
+        return re.sub(r"\s+", " ", cleaned).strip()
+
+    anchor_allowlist: set[str] = set()
+    for anchor in anchors:
+        normalized = _normalize_term(anchor)
+        if not normalized:
+            continue
+        anchor_allowlist.add(normalized)
+        anchor_allowlist.update(normalized.split())
+
+    common_allowlist = {
+        "a",
+        "an",
+        "the",
+        "and",
+        "or",
+        "but",
+        "so",
+        "then",
+        "when",
+        "dad",
+        "mom",
+        "pizza",
+        "monster",
+        "house",
+        "bed",
+        "window",
+        "room",
+        "door",
+        "school",
+        "friend",
+        "family",
+        "kid",
+        "child",
+        "toy",
+        "ball",
+        "book",
+        "dog",
+        "cat",
+        "park",
+        "tree",
+        "flower",
+        "sun",
+        "moon",
+        "star",
+    }
+
+    allowlist = anchor_allowlist | common_allowlist
+
+    big_nouns = ["horse", "sword", "armor", "knight", "castle", "dragon", "spaceship", "robot"]
+    combined = " ".join(page_texts).lower()
+    violations: list[str] = []
+    for noun in big_nouns:
+        if noun in allowlist:
+            continue
+        if re.search(rf"\b{re.escape(noun)}s?\b", combined):
+            violations.append(noun)
+    return violations
+
+
 def _build_anchor_list(cleaned: str, narrator: str | None) -> list[str]:
     anchors: list[str] = []
     seen: set[str] = set()
@@ -743,6 +806,18 @@ def _openai_storybook(
 
         anchors = _build_anchor_list(cleaned, display_name or narrator)
         page_texts = [page.text for page in pages]
+
+        if _FIDELITY_MODE == "strict":
+            violations = _strict_novelty_violations(page_texts, anchors)
+            if violations:
+                retry_instruction = (
+                    "Strict fidelity check failed. Remove these invented elements unless they appear in the "
+                    f"transcript: {', '.join(violations)}. Rewrite the SAME story without adding new ones."
+                )
+                if attempt < 2:
+                    continue
+                return None
+
         coverage_ok, coverage_summary, missing = _anchor_coverage(page_texts, anchors)
 
         if not coverage_ok:
