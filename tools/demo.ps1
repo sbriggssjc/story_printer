@@ -1,7 +1,3 @@
-# Force UTF-8 output
-$OutputEncoding = [System.Text.UTF8Encoding]::new()
-[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
-
 param(
   [string]$AudioPath = "";
   [switch]$NoImages;
@@ -10,6 +6,10 @@ param(
   [switch]$Print;
   [bool]$Open = $true
 )
+
+# Force UTF-8 output (must come AFTER param)
+$OutputEncoding = [System.Text.UTF8Encoding]::new()
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
 
 $ErrorActionPreference = "Stop"
 
