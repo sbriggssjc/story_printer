@@ -4,6 +4,9 @@ $OutputEncoding = [System.Text.UTF8Encoding]::new()
 
 Param(
     [string]$AudioPath,
+    [string]$Name = "Claire",
+    [string]$Title = "Story",
+    [switch]$Print = $false,
     [switch]$Open = $true,
     [switch]$NoImages
 )
@@ -45,6 +48,19 @@ if ($LASTEXITCODE -ne 0) {
     throw "Demo run failed with exit code $LASTEXITCODE."
 }
 
+function New-SafeSlug {
+    param(
+        [string]$Text
+    )
+    $clean = $Text -replace "[^A-Za-z0-9 _-]", ""
+    $clean = $clean -replace "\s+", "_"
+    $clean = $clean.Trim("_")
+    if ($clean.Length -gt 40) {
+        $clean = $clean.Substring(0, 40)
+    }
+    return $clean
+}
+
 $pdfPath = $null
 foreach ($line in ($output -split "`r?`n")) {
     if ($line -match "out[\\/]books[\\/].+\.pdf") {
@@ -57,8 +73,23 @@ if (-not $pdfPath) {
     throw "Could not find generated PDF path in output."
 }
 
-Write-Output "✅ Book generated: $pdfPath"
+$nameSlug = New-SafeSlug -Text $Name
+$titleSlug = New-SafeSlug -Text $Title
+$stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$friendly = "out\books\${nameSlug}_${titleSlug}_${stamp}.pdf"
+$latest = "out\books\LATEST.pdf"
+
+Copy-Item -Path $pdfPath -Destination $friendly -Force
+Copy-Item -Path $friendly -Destination $latest -Force
+
+Write-Output "OK: Generated: $pdfPath"
+Write-Output "OK: Friendly: $friendly"
+Write-Output "OK: Latest: $latest"
 
 if ($Open) {
-    Start-Process $pdfPath
+    Start-Process $friendly
+}
+
+if ($Print) {
+    Start-Process -FilePath $friendly -Verb Print
 }
