@@ -434,6 +434,8 @@ def _anchor_required_count(anchor_count: int) -> int:
 
 
 def _effective_min_words_per_page() -> int:
+    if _VOICE_MODE == "standard":
+        return max(_VALIDATION_MIN_WORDS_PER_PAGE, _DEFAULT_WORDS_PER_PAGE - 90)
     return _MIN_WORDS_PER_PAGE
 
 
