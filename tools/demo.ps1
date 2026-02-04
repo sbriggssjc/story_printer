@@ -1,3 +1,7 @@
+# Force UTF-8 so emojis render correctly
+$OutputEncoding = [System.Text.UTF8Encoding]::new()
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
+
 Param(
     [string]$AudioPath,
     [switch]$Open = $true,
