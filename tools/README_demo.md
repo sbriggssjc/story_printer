@@ -8,6 +8,12 @@ Run from the repo root:
 powershell -ExecutionPolicy Bypass -File .\tools\demo.ps1
 ```
 
+Custom output naming and print:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\demo.ps1 -Name "Claire" -Title "Pizza Monster" -Print
+```
+
 Pass a specific audio file:
 
 ```powershell
@@ -18,11 +24,18 @@ Defaults:
 - If `-AudioPath` is omitted, the most recent `./out/audio/*.wav` file is used.
 - `-Open` defaults to enabled (open the generated PDF).
 - `-NoImages` disables image generation.
+- `-Name` and `-Title` default to `Claire` and `Story`.
 
 ## Python (cross-platform)
 
 ```bash
 python tools/demo.py
+```
+
+Custom output naming and print (Windows only):
+
+```bash
+python tools/demo.py --name "Claire" --title "Pizza Monster" --print
 ```
 
 Pass a specific audio file:
@@ -35,6 +48,7 @@ Defaults:
 - If `--audio` is omitted, the most recent `./out/audio/*.wav` file is used.
 - The PDF is opened automatically unless `--no-open` is set.
 - `--no-images` disables image generation.
+- `--name` and `--title` default to `Claire` and `Story`.
 
 ## Golden path settings
 
