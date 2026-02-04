@@ -843,7 +843,8 @@ def _openai_storybook(
             target_max=_MAX_WORDS_PER_PAGE,
         )
         if not ok:
-            print(f"Validation failed: {', '.join(reasons)}")
+            if attempt < 2:
+                print(f"Attempt {attempt + 1}: validation failed ({', '.join(reasons)}); retrying.")
             retry_instruction = (
                 "Your last output failed validation. Fix the following issues while keeping the SAME story:\n- "
                 + "\n- ".join(reasons)
@@ -1328,6 +1329,11 @@ def _keyword_expansions(
 
 def _strip_generic_filler(text: str) -> str:
     bad_patterns = [
+        r"\bi heard tiny sounds\b",
+        r"\bi kept thinking about\b",
+        r"\bi felt a little breeze\b",
+        r"\bi made a quiet plan\b",
+        r"\bthe moment turned toward action\b",
         r"\btraded (a )?quick glances?\b",
         r"\btraded quick glance\b",
         r"\bshoes scuffing\b",
@@ -1387,21 +1393,22 @@ def _ensure_min_words(
         return updated
 
     base_sentences = [
-        "I took a deep breath.",
-        "I felt sorry.",
-        "I decided to listen next time.",
-        "I tried again.",
-        "I wanted to do better.",
+        "My cheeks got hot because I knew I had messed up.",
+        "I felt sorry and wanted to make it right.",
+        "I decided to listen and be honest next time.",
+        "I tried to fix it and try again.",
+        "I wished I could undo it, but I could say I was sorry.",
+        'I whispered, "I\'m sorry," even if they could not hear me yet.',
     ]
     strict_extra = [
-        "I stayed calm.",
-        "I made a small promise.",
-        "I felt ready to learn.",
+        "I stayed calm and told the truth.",
+        "I made a small promise to do better.",
+        "I felt ready to learn and try again.",
     ]
     fun_extra = [
-        "I felt a tiny spark of courage.",
-        "I giggled at myself.",
-        "I felt lighter inside.",
+        "I wanted to fix the mistake right away.",
+        "I knew the best choice was the honest one.",
+        "I told myself I could be brave and say the true thing.",
     ]
 
     if fidelity_mode == "strict":
@@ -1426,7 +1433,7 @@ def _ensure_min_words(
             return updated
 
     if not additions:
-        additions.append("I took a deep breath.")
+        additions.append("I wanted to make it right.")
 
     updated = f"{text.rstrip()} {' '.join(additions)}".strip()
     if display_name == "Claire":
