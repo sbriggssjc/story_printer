@@ -56,6 +56,7 @@ elif _VOICE_MODE == "kid":
 else:
     _BASE_MIN_WORDS_PER_PAGE = 180
 
+_VALIDATION_MIN_WORDS_PER_PAGE = _BASE_MIN_WORDS_PER_PAGE
 _MIN_WORDS_PER_PAGE = max(_BASE_MIN_WORDS_PER_PAGE, _DEFAULT_WORDS_PER_PAGE - 60)
 _MAX_WORDS_PER_PAGE = min(340, _DEFAULT_WORDS_PER_PAGE + 80)
 
@@ -433,10 +434,6 @@ def _anchor_required_count(anchor_count: int) -> int:
 
 
 def _effective_min_words_per_page() -> int:
-    if _VOICE_MODE == "kid" and _FIDELITY_MODE == "fun":
-        return 170
-    if _VOICE_MODE == "kid" and _FIDELITY_MODE == "strict":
-        return 160
     return _MIN_WORDS_PER_PAGE
 
 
@@ -782,26 +779,19 @@ def _openai_storybook(
             continue
 
         # REPAIR PHASE (critical for robustness)
-        min_words = _effective_min_words_per_page()
+        target_min = _effective_min_words_per_page()
+        validation_min = _VALIDATION_MIN_WORDS_PER_PAGE
         pages = _repair_pages(
             pages=pages,
             narrator=display_name or narrator,
             required_terms=required_terms,
-            target_min=min_words,
+            target_min=target_min,
             target_max=_MAX_WORDS_PER_PAGE,
         )
         for page in pages:
             page.text = _truncate_after_the_end(page.text)
             page.text = _strip_generic_filler(page.text)
             page.text = _truncate_after_the_end(page.text)
-            page.text = _ensure_min_words(
-                page.text,
-                min_words,
-                voice_mode=_VOICE_MODE,
-                fidelity_mode=_FIDELITY_MODE,
-                display_name=display_name,
-            )
-            page.text = _fix_display_name_case(page.text, display_name or narrator)
             page.illustration_prompt = _ensure_watercolor_prompt(page.illustration_prompt)
 
         anchors = _build_anchor_list(cleaned, display_name or narrator)
@@ -835,11 +825,19 @@ def _openai_storybook(
 
         for page in pages:
             page.text = _truncate_after_the_end(page.text)
+            page.text = _ensure_min_words(
+                page.text,
+                validation_min,
+                voice_mode=_VOICE_MODE,
+                fidelity_mode=_FIDELITY_MODE,
+                display_name=display_name,
+            )
+            page.text = _fix_display_name_case(page.text, display_name or narrator)
 
         # Validate after repair
         ok, reasons = _validate_story_pages(
             pages=pages,
-            target_min=min_words,
+            target_min=validation_min,
             target_max=_MAX_WORDS_PER_PAGE,
         )
         if not ok:
@@ -1583,12 +1581,13 @@ def _local_storybook(
     anchor_spec = _extract_anchor_spec(cleaned, max_terms=_ANCHOR_MAX_TERMS)
     required_terms = _anchor_terms_for_expansion(anchor_spec, max_terms=_ANCHOR_MAX_TERMS)
     used_sentences: set[str] = set()
-    min_words = _effective_min_words_per_page()
+    target_min = _effective_min_words_per_page()
+    validation_min = _VALIDATION_MIN_WORDS_PER_PAGE
     pages = [
         StoryPage(
             text=_expand_text_to_range(
                 p1,
-                min_words,
+                target_min,
                 _MAX_WORDS_PER_PAGE,
                 _keyword_expansions(required_terms, "setup", rng, narrator=display_name or narrator),
                 used_sentences=used_sentences,
@@ -1601,7 +1600,7 @@ def _local_storybook(
         StoryPage(
             text=_expand_text_to_range(
                 p2,
-                min_words,
+                target_min,
                 _MAX_WORDS_PER_PAGE,
                 _keyword_expansions(required_terms, "resolution", rng, narrator=display_name or narrator),
                 used_sentences=used_sentences,
@@ -1620,7 +1619,7 @@ def _local_storybook(
         page.text = _truncate_after_the_end(page.text)
         page.text = _ensure_min_words(
             page.text,
-            min_words,
+            validation_min,
             voice_mode=_VOICE_MODE,
             fidelity_mode=_FIDELITY_MODE,
             display_name=display_name,
