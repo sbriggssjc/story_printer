@@ -1,4 +1,4 @@
-# Force UTF-8 output (so symbols render correctly)
+# Force UTF-8 output
 $OutputEncoding = [System.Text.UTF8Encoding]::new()
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
 
