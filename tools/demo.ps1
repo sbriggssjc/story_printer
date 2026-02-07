@@ -1,15 +1,15 @@
-﻿param(
-  [string]$AudioPath = "",
-  [switch]$NoImages,
-  [string]$Name = "Claire",
-  [string]$Title = "Story",
-  [switch]$Print,
-  [bool]$Open = $true
-)
-
-# Force UTF-8 output (must be AFTER param in Windows PowerShell)
+# Force UTF-8 output
 $OutputEncoding = [System.Text.UTF8Encoding]::new()
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
+
+param(
+  [string]$AudioPath = "";
+  [switch]$NoImages;
+  [string]$Name = "Claire";
+  [string]$Title = "Story";
+  [switch]$Print;
+  [bool]$Open = $true
+)
 
 $ErrorActionPreference = "Stop"
 
@@ -47,9 +47,45 @@ if (-not $AudioPath -or $AudioPath.Trim() -eq "") {
   $AudioPath = $latestAudio.FullName
 }
 
-$out = python -c "from src.pipeline.orchestrator import run_once_from_audio; print(run_once_from_audio(r'$AudioPath'))" 2>&1
-$pdf = ($out | Select-String -Pattern "out\\books\\.*\.pdf" | Select-Object -Last 1).ToString()
-if (-not $pdf) { Write-Host $out; throw "Could not find generated PDF path in output." }
+$env:STORY_ENHANCE_MODE = "openai"
+$env:STORY_IMAGE_MODE = if ($NoImages) { "none" } else { "openai" }
+$env:STORY_TARGET_PAGES = "2"
+$env:STORY_WORDS_PER_PAGE = "260"
+$env:STORY_VOICE_MODE = "kid"
+$env:STORY_FIDELITY_MODE = "fun"
+
+$escapedAudioPath = $AudioPath.Replace("'", "''")
+$command = "from src.pipeline.orchestrator import run_once_from_audio; print(run_once_from_audio(r'$escapedAudioPath'))"
+
+$output = & python -c $command
+if ($LASTEXITCODE -ne 0) {
+    throw "Demo run failed with exit code $LASTEXITCODE."
+}
+
+function New-SafeSlug {
+    param(
+        [string]$Text
+    )
+    $clean = $Text -replace "[^A-Za-z0-9 _-]", ""
+    $clean = $clean -replace "\s+", "_"
+    $clean = $clean.Trim("_")
+    if ($clean.Length -gt 40) {
+        $clean = $clean.Substring(0, 40)
+    }
+    return $clean
+}
+
+$pdfPath = $null
+foreach ($line in ($output -split "`r?`n")) {
+    if ($line -match "out[\\/]books[\\/].+\.pdf") {
+        $pdfPath = $line
+        break
+    }
+}
+
+if (-not $pdfPath) {
+    throw "Could not find generated PDF path in output."
+}
 
 $nameSlug  = Slugify $Name 40
 $titleSlug = Slugify $Title 40
