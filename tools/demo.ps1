@@ -36,13 +36,6 @@ if (Test-Path $venvActivate) {
   Write-Warning "Virtual environment not found at .\.venv\Scripts\Activate.ps1. Continuing without activation."
 }
 
-$env:STORY_ENHANCE_MODE="openai"
-$env:STORY_TARGET_PAGES="2"
-$env:STORY_WORDS_PER_PAGE="260"
-$env:STORY_VOICE_MODE="kid"
-$env:STORY_FIDELITY_MODE="fun"
-if ($NoImages) { $env:STORY_IMAGE_MODE="none" } else { $env:STORY_IMAGE_MODE="openai" }
-
 if (-not $AudioPath -or $AudioPath.Trim() -eq "") {
   $latestAudio = Get-ChildItem -Path ".\out\audio\*.wav" -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending |
@@ -59,28 +52,12 @@ $env:STORY_VOICE_MODE = "kid"
 $env:STORY_FIDELITY_MODE = "fun"
 
 $env:STORY_AUDIO_PATH = $AudioPath
-$out = & $py -c "from src.pipeline.orchestrator import run_once_from_audio; print(run_once_from_audio(r'$AudioPath'))" 2>&1
-if ($LASTEXITCODE -ne 0) {
-    Write-Output $out
 $escapedAudioPath = $AudioPath.Replace("'", "''")
 $command = "from src.pipeline.orchestrator import run_once_from_audio; print(run_once_from_audio(r'$escapedAudioPath'))"
-
-$output = & python -c $command
+$out = & $py -c $command 2>&1
 if ($LASTEXITCODE -ne 0) {
+    Write-Output $out
     throw "Demo run failed with exit code $LASTEXITCODE."
-}
-
-function New-SafeSlug {
-    param(
-        [string]$Text
-    )
-    $clean = $Text -replace "[^A-Za-z0-9 _-]", ""
-    $clean = $clean -replace "\s+", "_"
-    $clean = $clean.Trim("_")
-    if ($clean.Length -gt 40) {
-        $clean = $clean.Substring(0, 40)
-    }
-    return $clean
 }
 
 $pdfPath = $null
@@ -101,10 +78,10 @@ $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $friendly = Join-Path "out\books" ("{0}_{1}_{2}.pdf" -f $nameSlug, $titleSlug, $stamp)
 $latest = Join-Path "out\books" "LATEST.pdf"
 
-Copy-Item -Force $pdf $friendly
+Copy-Item -Force $pdfPath $friendly
 Copy-Item -Force $friendly $latest
 
-Write-Host ("OK: Generated: {0}" -f $pdf)
+Write-Host ("OK: Generated: {0}" -f $pdfPath)
 Write-Host ("OK: Friendly:  {0}" -f $friendly)
 Write-Host ("OK: Latest:    {0}" -f $latest)
 
