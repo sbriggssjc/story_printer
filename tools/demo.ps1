@@ -16,6 +16,10 @@ $ErrorActionPreference = "Stop"
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $repoRoot
 
+$py = Join-Path $repoRoot ".venv\Scripts\python.exe"
+if (-not (Test-Path $py)) { $py = "python" }
+Write-Host "Using Python: $py"
+
 $venvActivate = Join-Path $repoRoot ".venv\Scripts\Activate.ps1"
 if (Test-Path $venvActivate) {
     . $venvActivate
@@ -41,16 +45,9 @@ $env:STORY_VOICE_MODE = "kid"
 $env:STORY_FIDELITY_MODE = "fun"
 
 $env:STORY_AUDIO_PATH = $AudioPath
-$command = @'
-from src.pipeline.orchestrator import run_once_from_audio
-import os
-p=os.environ.get("STORY_AUDIO_PATH","")
-print(run_once_from_audio(p))
-'@
-
-$output = & python -c $command 2>&1
+$out = & $py -c "from src.pipeline.orchestrator import run_once_from_audio; print(run_once_from_audio(r'$AudioPath'))" 2>&1
 if ($LASTEXITCODE -ne 0) {
-    Write-Output $output
+    Write-Output $out
     throw "Demo run failed with exit code $LASTEXITCODE."
 }
 
@@ -68,7 +65,7 @@ function New-SafeSlug {
 }
 
 $pdfPath = $null
-foreach ($line in ($output -split "`r?`n")) {
+foreach ($line in ($out -split "`r?`n")) {
     if ($line -match "out[\\/]books[\\/].+\.pdf") {
         $pdfPath = $line
         break
