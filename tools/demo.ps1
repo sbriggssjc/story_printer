@@ -25,6 +25,10 @@ function Slugify([string]$s, [int]$maxLen = 40) {
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $repoRoot
 
+$py = Join-Path $repoRoot ".venv\Scripts\python.exe"
+if (-not (Test-Path $py)) { $py = "python" }
+Write-Host "Using Python: $py"
+
 $venvActivate = Join-Path $repoRoot ".venv\Scripts\Activate.ps1"
 if (Test-Path $venvActivate) {
   . $venvActivate
@@ -54,6 +58,10 @@ $env:STORY_WORDS_PER_PAGE = "260"
 $env:STORY_VOICE_MODE = "kid"
 $env:STORY_FIDELITY_MODE = "fun"
 
+$env:STORY_AUDIO_PATH = $AudioPath
+$out = & $py -c "from src.pipeline.orchestrator import run_once_from_audio; print(run_once_from_audio(r'$AudioPath'))" 2>&1
+if ($LASTEXITCODE -ne 0) {
+    Write-Output $out
 $escapedAudioPath = $AudioPath.Replace("'", "''")
 $command = "from src.pipeline.orchestrator import run_once_from_audio; print(run_once_from_audio(r'$escapedAudioPath'))"
 
@@ -76,7 +84,7 @@ function New-SafeSlug {
 }
 
 $pdfPath = $null
-foreach ($line in ($output -split "`r?`n")) {
+foreach ($line in ($out -split "`r?`n")) {
     if ($line -match "out[\\/]books[\\/].+\.pdf") {
         $pdfPath = $line
         break
