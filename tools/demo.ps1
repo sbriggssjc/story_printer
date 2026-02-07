@@ -40,11 +40,17 @@ $env:STORY_WORDS_PER_PAGE = "260"
 $env:STORY_VOICE_MODE = "kid"
 $env:STORY_FIDELITY_MODE = "fun"
 
-$escapedAudioPath = $AudioPath.Replace("'", "''")
-$command = "from src.pipeline.orchestrator import run_once_from_audio; print(run_once_from_audio(r'$escapedAudioPath'))"
+$env:STORY_AUDIO_PATH = $AudioPath
+$command = @'
+from src.pipeline.orchestrator import run_once_from_audio
+import os
+p=os.environ.get("STORY_AUDIO_PATH","")
+print(run_once_from_audio(p))
+'@
 
-$output = & python -c $command
+$output = & python -c $command 2>&1
 if ($LASTEXITCODE -ne 0) {
+    Write-Output $output
     throw "Demo run failed with exit code $LASTEXITCODE."
 }
 
