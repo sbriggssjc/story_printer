@@ -3,12 +3,12 @@ $OutputEncoding = [System.Text.UTF8Encoding]::new()
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
 
 param(
-  [string]$AudioPath = "";
-  [switch]$NoImages;
-  [string]$Name = "Claire";
-  [string]$Title = "Story";
-  [switch]$Print;
-  [bool]$Open = $true;
+  [string]$AudioPath = "",
+  [switch]$NoImages,
+  [string]$Name = "Claire",
+  [string]$Title = "Story",
+  [switch]$Print,
+  [bool]$Open = $true
 )
 
 $ErrorActionPreference = "Stop"
