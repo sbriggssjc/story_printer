@@ -8,7 +8,7 @@ param(
   [string]$Name = "Claire";
   [string]$Title = "Story";
   [switch]$Print;
-  [bool]$Open = $true
+  [bool]$Open = $true;
 )
 
 $ErrorActionPreference = "Stop"
