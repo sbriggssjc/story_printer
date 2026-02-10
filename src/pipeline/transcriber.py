@@ -17,9 +17,17 @@ def transcribe_audio(wav_path: Path) -> str:
             f"Original error: {repr(e)}"
         )
 
-    # CPU mode for Windows desktop (fast enough for short clips).
-    # On Jetson later, we'll switch device='cuda' if available.
-    model = WhisperModel("base", device="cpu", compute_type="int8")
+    # Auto-detect CUDA (Jetson Orin Nano has GPU); fall back to CPU.
+    try:
+        import torch
+        has_cuda = torch.cuda.is_available()
+    except ImportError:
+        has_cuda = False
+
+    if has_cuda:
+        model = WhisperModel("base", device="cuda", compute_type="float16")
+    else:
+        model = WhisperModel("base", device="cpu", compute_type="int8")
 
     segments, info = model.transcribe(
         str(wav_path),

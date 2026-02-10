@@ -71,7 +71,17 @@ def main() -> int:
         if sys.platform.startswith("win"):
             os.startfile(friendly, "print")  # type: ignore[attr-defined]
         else:
-            print("Printing not implemented")
+            import subprocess as _sp
+            printer = os.getenv("PRINTER_NAME")
+            cmd = ["lp"]
+            if printer:
+                cmd += ["-d", printer]
+            cmd.append(str(friendly))
+            result = _sp.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                print(f"Sent to printer: {friendly.name}")
+            else:
+                print(f"Print failed: {result.stderr.strip()}")
 
     return 0
 

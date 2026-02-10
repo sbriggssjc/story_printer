@@ -6,6 +6,8 @@ from pathlib import Path
 from src.pipeline.pdf_builder import render_story_pdf
 from src.pipeline.story_builder import StoryPage
 
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
 
 def make_book_pdf(
     title: str,
@@ -13,7 +15,7 @@ def make_book_pdf(
     pages: list[str] | list[StoryPage],
     narrator: str | None = None,
     cover_image_path: str | None = None,
-    out_dir: Path = Path("out/books"),
+    out_dir: Path = _PROJECT_ROOT / "out" / "books",
 ) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

@@ -1142,9 +1142,7 @@ def _ensure_min_dialogue(text: str, narrator: str | None) -> str:
     if _count_dialogue_lines(text) >= _DIALOGUE_MIN:
         return text
     name = narrator or _find_first_name(text) or "Someone"
-    # Add a single short line. Keep it generic.
-    addition = f' "{name} whispered, \\"I\\\'m sorry.\\""'
-    # Avoid adding to a blank text
+    addition = f' {name} whispered, "I\'m sorry."'
     if text.strip().endswith((".", "!", "?")):
         return text.strip() + addition
     return text.strip() + "." + addition
