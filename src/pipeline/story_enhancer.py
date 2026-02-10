@@ -579,7 +579,8 @@ def _get_openai_client():
     openai_module = importlib.import_module("openai")
     if not hasattr(openai_module, "OpenAI"):
         return None
-    return openai_module.OpenAI()
+    timeout = float(os.getenv("OPENAI_TIMEOUT", "120"))
+    return openai_module.OpenAI(timeout=timeout)
 
 
 def _build_cover_prompt(title: str, narrator: str | None, cleaned: str) -> str:
@@ -1655,11 +1656,17 @@ def _maybe_generate_images(story: StoryBook) -> None:
     if not client:
         return
 
-    out_dir = Path("out/books/images")
+    _project_root = Path(__file__).resolve().parents[2]
+    out_dir = _project_root / "out" / "books" / "images"
     out_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+    total_images = 1 + len(story.pages)
+    current_image = 0
+
     # 1) Cover art (no text rendered; leave space for title)
+    current_image += 1
+    print(f"  Drawing illustration {current_image}/{total_images} (cover)...", flush=True)
     try:
         cover_prompt = (
             "Watercolor children's picture book cover illustration. "
@@ -1679,9 +1686,11 @@ def _maybe_generate_images(story: StoryBook) -> None:
             cover_path = out_dir / f"cover_{timestamp}.png"
             cover_path.write_bytes(base64.b64decode(cover_data.b64_json))
             story.cover_image_path = str(cover_path)
-    except Exception:
-        # Cover art is optional; don't fail the run if it errors.
-        pass
+            print(f"  Cover done.", flush=True)
+        else:
+            print(f"  Cover skipped (no image data).", flush=True)
+    except Exception as e:
+        print(f"  Cover art skipped ({e})", flush=True)
 
     # 2) Page images
     for index, page in enumerate(story.pages, start=1):
@@ -1689,6 +1698,8 @@ def _maybe_generate_images(story: StoryBook) -> None:
         if not prompt:
             continue
 
+        current_image += 1
+        print(f"  Drawing illustration {current_image}/{total_images} (page {index})...", flush=True)
         try:
             resp = client.images.generate(
                 model="gpt-image-1",
@@ -1697,6 +1708,7 @@ def _maybe_generate_images(story: StoryBook) -> None:
             )
             data = resp.data[0] if resp.data else None
             if not data:
+                print(f"  Page {index} illustration skipped (no data).", flush=True)
                 continue
 
             image_path = out_dir / f"story_{timestamp}_p{index}.png"
@@ -1711,5 +1723,7 @@ def _maybe_generate_images(story: StoryBook) -> None:
             page.illustration_path = saved_path
             page.image_path = saved_path
             setattr(page, "image_path", saved_path)  # back-compat
-        except Exception:
+            print(f"  Page {index} illustration done.", flush=True)
+        except Exception as e:
+            print(f"  Page {index} illustration skipped ({e})", flush=True)
             continue

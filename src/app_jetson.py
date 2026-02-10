@@ -4,6 +4,7 @@ Story Printer — Jetson Orin Nano entry point.
 Hardware: Jetson Orin Nano, Rode II mic, mini monitor, USB printer, Anker power brick.
 Usage:   python -m src.app_jetson
          Press SPACE to start recording, SPACE again to stop and generate + print.
+         Recording auto-stops after MAX_SECONDS if you forget.
          Press Q or ESC to quit.
 
 Environment:
@@ -14,11 +15,13 @@ Environment:
     STORY_ENHANCE_MODE — "openai" for GPT story expansion (default: "openai")
     STORY_IMAGE_MODE   — "openai" for DALL-E illustrations (default: "openai")
     OPENAI_API_KEY     — required for OpenAI features
+    MAX_OLD_RECORDINGS — number of old WAV files to keep (default: "20")
 """
 
 from __future__ import annotations
 
 import os
+import select
 import subprocess
 import sys
 import termios
@@ -37,41 +40,56 @@ from src.io.audio_windows import Recorder, find_input_device, get_default_input_
 from src.pipeline.constraints import MAX_SECONDS
 
 
-def _get_key() -> str:
-    """Read a single keypress from stdin (Linux). Returns the character."""
+# ---------------------------------------------------------------------------
+# Non-blocking keyboard input (Linux)
+# ---------------------------------------------------------------------------
+def _key_available(timeout: float = 0.0) -> str | None:
+    """Check for a keypress with timeout. Returns the character or None."""
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
     try:
         tty.setraw(fd)
-        ch = sys.stdin.read(1)
+        ready, _, _ = select.select([sys.stdin], [], [], timeout)
+        if ready:
+            return sys.stdin.read(1)
+        return None
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-    return ch
 
 
+def _wait_for_key() -> str:
+    """Block until a key is pressed. Returns the character."""
+    while True:
+        ch = _key_available(timeout=0.5)
+        if ch is not None:
+            return ch
+
+
+# ---------------------------------------------------------------------------
+# Hardware detection
+# ---------------------------------------------------------------------------
 def _detect_mic() -> int | None:
     """Find the Rode II mic (or fall back to any input device)."""
-    # Explicit index from env overrides everything
     explicit = os.getenv("INPUT_DEVICE_INDEX")
     if explicit is not None:
         return int(explicit)
 
-    # Search by name hint
     name_hint = os.getenv("INPUT_DEVICE_NAME", "rode")
     idx = find_input_device(name_hint)
     if idx is not None:
         return idx
 
-    # Try common fallbacks
     for fallback in ["usb", "mic", "audio"]:
         idx = find_input_device(fallback)
         if idx is not None:
             return idx
 
-    # Let sounddevice pick the system default
     return None
 
 
+# ---------------------------------------------------------------------------
+# Printing
+# ---------------------------------------------------------------------------
 def _print_pdf(pdf_path: Path) -> bool:
     """Print a PDF using CUPS (lp command). Returns True on success."""
     printer = os.getenv("PRINTER_NAME")
@@ -93,11 +111,38 @@ def _print_pdf(pdf_path: Path) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# Disk cleanup
+# ---------------------------------------------------------------------------
+def _cleanup_old_files(directory: Path, pattern: str, keep: int) -> None:
+    """Remove oldest files matching pattern, keeping only the newest `keep`."""
+    if not directory.is_dir():
+        return
+    files = sorted(directory.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+    for old_file in files[keep:]:
+        try:
+            old_file.unlink()
+        except Exception:
+            pass
+
+
+def _cleanup_old_recordings() -> None:
+    keep = int(os.getenv("MAX_OLD_RECORDINGS", "20"))
+    audio_dir = _PROJECT_ROOT / "out" / "audio"
+    _cleanup_old_files(audio_dir, "*.wav", keep)
+
+    images_dir = _PROJECT_ROOT / "out" / "books" / "images"
+    _cleanup_old_files(images_dir, "*.png", keep * 3)
+
+
+# ---------------------------------------------------------------------------
+# Display
+# ---------------------------------------------------------------------------
 def _status(msg: str) -> None:
     """Print a large status line visible on the mini monitor."""
     print(f"\n{'=' * 44}")
     print(f"  {msg}")
-    print(f"{'=' * 44}\n")
+    print(f"{'=' * 44}\n", flush=True)
 
 
 def _safe_stop(rec: Recorder) -> None:
@@ -111,6 +156,60 @@ def _safe_stop(rec: Recorder) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# Recording with auto-stop
+# ---------------------------------------------------------------------------
+def _record_with_autostop(rec: Recorder) -> tuple[Path, dict] | None:
+    """
+    Record audio. Auto-stops after MAX_SECONDS or when SPACE is pressed.
+    Returns (wav_path, stats) or None on failure.
+    """
+    try:
+        meta = rec.start()
+    except Exception as e:
+        print(f"  Could not start recording: {e}")
+        print("  Check mic connection. Press SPACE to retry.")
+        return None
+
+    _status("RECORDING... Tell your story!")
+    print(f"  (auto-stops after {MAX_SECONDS}s, or press SPACE to stop)")
+
+    start_time = time.monotonic()
+    while True:
+        elapsed = time.monotonic() - start_time
+        remaining = MAX_SECONDS - elapsed
+
+        if remaining <= 0:
+            print("\n  Time's up! Saving your story...")
+            break
+
+        # Check for keypress every 0.5s
+        ch = _key_available(timeout=0.5)
+        if ch == ' ':
+            break
+        if ch in ('\x1b', 'q', 'Q', '\x03'):
+            _safe_stop(rec)
+            return None
+
+        # Show a countdown every 10 seconds
+        secs = int(elapsed)
+        if secs > 0 and secs % 10 == 0 and elapsed - secs < 0.5:
+            print(f"  {secs}s recorded... ({int(remaining)}s remaining)", flush=True)
+
+    _status("SAVING AUDIO...")
+    try:
+        wav_path, stats = rec.stop_and_save(max_seconds=MAX_SECONDS)
+        print(f"  Audio saved: {wav_path.name}")
+        print(f"  Peak: {stats['peak']:.4f}  RMS: {stats['rms']:.4f}")
+        return wav_path, stats
+    except Exception as e:
+        print(f"  Audio save failed: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
 def main() -> int:
     _status("STORY PRINTER")
     print("  Press SPACE to record a story.")
@@ -139,91 +238,87 @@ def main() -> int:
     except Exception:
         pass
 
+    # Pre-warm the Whisper model on startup so first recording is fast
+    print("  Loading speech recognition model...", flush=True)
+    try:
+        from src.pipeline.transcriber import _get_model
+        _get_model()
+        print("  Model ready.")
+    except Exception as e:
+        print(f"  Model pre-load failed (will retry later): {e}")
+
     rec = Recorder(device=dev_index, samplerate=None, channels=1)
-    recording = False
+
+    # Clean up old files from previous sessions
+    _cleanup_old_recordings()
 
     print("\n  Ready! Press SPACE to start recording...\n")
 
     try:
         while True:
-            ch = _get_key()
+            ch = _wait_for_key()
 
             # Quit keys
             if ch in ('\x1b', 'q', 'Q', '\x03'):
-                if recording:
-                    _safe_stop(rec)
                 _status("GOODBYE!")
                 return 0
 
-            # SPACE toggles recording
-            if ch == ' ':
-                if not recording:
-                    # START recording
-                    try:
-                        meta = rec.start()
-                        recording = True
-                        _status("RECORDING... Tell your story!")
-                        print(f"  (max {MAX_SECONDS}s, press SPACE to stop)")
-                    except Exception as e:
-                        print(f"  Could not start recording: {e}")
-                        print("  Check mic connection. Press SPACE to retry.")
-                    continue
+            # SPACE starts the full pipeline
+            if ch != ' ':
+                continue
 
-                # STOP recording and run the pipeline
-                recording = False
-                _status("SAVING AUDIO...")
-                try:
-                    wav_path, stats = rec.stop_and_save(max_seconds=MAX_SECONDS)
-                    print(f"  Audio saved: {wav_path}")
-                    print(f"  Peak: {stats['peak']:.4f}  RMS: {stats['rms']:.4f}")
-                except Exception as e:
-                    print(f"  Audio save failed: {e}")
-                    print("  Press SPACE to try again.")
-                    continue
+            # --- RECORD ---
+            result = _record_with_autostop(rec)
+            if result is None:
+                print("  Press SPACE to try again.\n")
+                continue
+            wav_path, stats = result
 
-                # Transcribe
-                _status("LISTENING TO YOUR STORY...")
-                try:
-                    transcript = transcribe_audio(wav_path)
-                except Exception as e:
-                    print(f"  Transcription failed: {e}")
-                    print("  Press SPACE to try again.")
-                    continue
+            # --- TRANSCRIBE ---
+            _status("LISTENING TO YOUR STORY...")
+            try:
+                transcript = transcribe_audio(wav_path)
+            except Exception as e:
+                print(f"  Transcription failed: {e}")
+                print("  Press SPACE to try again.\n")
+                continue
 
-                if not transcript or not transcript.strip():
-                    print("  No speech detected. Try speaking louder.")
-                    print("  Press SPACE to try again.")
-                    continue
+            if not transcript or not transcript.strip():
+                print("  No speech detected. Try speaking louder next time!")
+                print("  Press SPACE to try again.\n")
+                continue
 
-                print(f"  Heard: \"{transcript[:100]}{'...' if len(transcript) > 100 else ''}\"")
+            print(f"  Heard: \"{transcript[:120]}{'...' if len(transcript) > 120 else ''}\"")
 
-                # Generate story + PDF
-                _status("MAKING YOUR STORYBOOK...")
-                try:
-                    out_pdf = run_once(transcript=transcript)
-                    print(f"  Book created: {out_pdf}")
-                except Exception as e:
-                    print(f"  Book creation failed: {e}")
-                    print("  Press SPACE to try again.")
-                    continue
+            # --- GENERATE STORY + PDF ---
+            _status("MAKING YOUR STORYBOOK...")
+            print("  (writing story + drawing pictures, this takes a minute)")
+            try:
+                out_pdf = run_once(transcript=transcript)
+                print(f"  Book created: {out_pdf.name}")
+            except Exception as e:
+                print(f"  Book creation failed: {e}")
+                print("  Press SPACE to try again.\n")
+                continue
 
-                # Auto-print
-                if auto_print:
-                    _status("PRINTING YOUR STORY!")
-                    if _print_pdf(out_pdf):
-                        _status("ALL DONE! Your story is printing!")
-                    else:
-                        _status("DONE! (Printing failed -- check printer)")
-                        print(f"  PDF is at: {out_pdf}")
+            # --- PRINT ---
+            if auto_print:
+                _status("PRINTING YOUR STORY!")
+                if _print_pdf(out_pdf):
+                    _status("ALL DONE! Your story is printing!")
                 else:
-                    _status("ALL DONE!")
+                    _status("DONE! (Printing failed -- check printer)")
                     print(f"  PDF is at: {out_pdf}")
+            else:
+                _status("ALL DONE!")
+                print(f"  PDF is at: {out_pdf}")
 
-                print("\n  Press SPACE to make another story, or Q to quit.\n")
+            # Cleanup after each run
+            _cleanup_old_recordings()
+
+            print("\n  Press SPACE to make another story, or Q to quit.\n")
 
     except KeyboardInterrupt:
-        if recording:
-            _safe_stop(rec)
         _status("GOODBYE!")
         return 0
 
