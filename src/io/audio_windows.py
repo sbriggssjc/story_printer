@@ -1,11 +1,13 @@
-﻿from pathlib import Path
+from pathlib import Path
 from datetime import datetime
 import queue
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
 
-OUT_AUDIO = Path('out') / 'audio'
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+OUT_AUDIO = _PROJECT_ROOT / 'out' / 'audio'
+
 
 class Recorder:
     def __init__(self, device=None, samplerate=None, channels=1):
@@ -25,7 +27,7 @@ class Recorder:
         rms = float(np.sqrt(np.mean(np.square(chunk)))) if len(chunk) else 0.0
         self._printed += 1
         if self._printed % 40 == 0:
-            print(f'   level(rms)={rms:.6f}', end='\\r')
+            print(f'   level(rms)={rms:.6f}', end='\r')
 
     def start(self):
         self._frames = []
@@ -73,7 +75,7 @@ class Recorder:
             self._stream.close()
             self._stream = None
 
-        print(' ' * 50, end='\\r')
+        print(' ' * 50, end='\r')
 
         if not self._frames:
             raise RuntimeError('No audio captured. Check mic permissions / input device.')
@@ -92,5 +94,18 @@ class Recorder:
         stats = {'peak': peak, 'rms': rms, 'samplerate': self.samplerate, 'channels': self.channels, 'device': self.device}
         return out_wav, stats
 
+
 def get_default_input_info():
     return sd.query_devices(kind='input')
+
+
+def find_input_device(name_hint: str | None = None) -> int | None:
+    """Search for an input device by name substring (e.g. 'Rode', 'Yeti').
+    Returns the device index or None if not found."""
+    if not name_hint:
+        return None
+    devices = sd.query_devices()
+    for i, dev in enumerate(devices):
+        if dev['max_input_channels'] > 0 and name_hint.lower() in dev['name'].lower():
+            return i
+    return None

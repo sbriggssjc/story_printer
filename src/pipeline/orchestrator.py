@@ -1,11 +1,12 @@
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+
 from src.pipeline.book_builder import make_book_pdf
 from src.pipeline.story_enhancer import enhance_to_storybook
 from src.pipeline.story_builder import build_storybook
-
-# ADD THIS IMPORT
 from src.pipeline.audio_transcriber import transcribe_audio
 
 __all__ = ["run_once", "run_once_from_audio"]
