@@ -41,6 +41,12 @@ _STOPWORDS = {
     "and", "but", "or", "in", "on", "at", "with", "from", "to",
     "of", "for", "as", "is", "was", "were", "be", "been", "being",
     "this", "that", "these", "those", "there", "here",
+    "one", "two", "three", "four", "five", "six", "seven", "eight",
+    "nine", "ten", "all", "some", "every", "each", "any", "many",
+    "much", "more", "most", "other", "another", "such", "what",
+    "which", "who", "how", "where", "why", "not", "only", "very",
+    "just", "also", "still", "even", "now", "new", "old", "good",
+    "big", "little", "long", "great", "small", "own",
 }
 
 

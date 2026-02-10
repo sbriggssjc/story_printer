@@ -5,7 +5,7 @@
     """
     words = (text or "").split()
     if len(words) <= max_words:
-        return text.strip()
+        return (text or "").strip()
 
     clipped = " ".join(words[:max_words]).strip()
     return clipped + " ..."
