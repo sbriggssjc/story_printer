@@ -7,6 +7,9 @@ from datetime import datetime
 from pathlib import Path
 from shutil import copyfile
 
+# Ensure the project root is on sys.path so "from src..." imports work
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from src.pipeline.orchestrator import run_once_from_audio
 
 
