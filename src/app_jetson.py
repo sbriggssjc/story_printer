@@ -29,9 +29,12 @@ import time
 import tty
 from pathlib import Path
 
+# Ensure the project root is on sys.path so "from src..." imports work
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_PROJECT_ROOT))
+
 # Load .env before any pipeline imports so env vars are available at module load time
 from dotenv import load_dotenv
-_PROJECT_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(_PROJECT_ROOT / ".env")
 
 from src.pipeline.orchestrator import run_once
